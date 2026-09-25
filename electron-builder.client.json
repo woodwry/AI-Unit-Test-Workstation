@@ -1,0 +1,70 @@
+{
+  "appId": "com.aiunittest.workstation",
+  "productName": "AI Unit Test Workstation",
+  "asar": true,
+  "publish": null,
+  "directories": {
+    "output": "release/client"
+  },
+  "files": [
+    "out/**",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "packaging/client/external-backend-client.json",
+      "to": "external-backend-client.json"
+    },
+    {
+      "from": "assets/branding/ai-unit-test-workstation.ico",
+      "to": "branding/ai-unit-test-workstation.ico"
+    },
+    {
+      "from": "assets/branding/ai-unit-test-workstation-256.png",
+      "to": "branding/ai-unit-test-workstation-256.png"
+    }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "assets/branding/ai-unit-test-workstation.ico",
+    "artifactName": "AI-Unit-Test-Workstation-Setup-${version}-${arch}.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "installerIcon": "assets/branding/ai-unit-test-workstation.ico",
+    "uninstallerIcon": "assets/branding/ai-unit-test-workstation.ico",
+    "include": "packaging/windows/installer.nsh"
+  },
+  "mac": {
+    "target": [
+      {
+        "target": "dmg",
+        "arch": ["universal"]
+      }
+    ],
+    "icon": "assets/branding/ai-unit-test-workstation-1024.png",
+    "category": "public.app-category.developer-tools",
+    "identity": null,
+    "artifactName": "AI-Unit-Test-Workstation-${version}-macOS-${arch}.${ext}"
+  },
+  "linux": {
+    "target": [
+      {
+        "target": "tar.gz",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "assets/branding/ai-unit-test-workstation-1024.png",
+    "category": "Development",
+    "artifactName": "AI-Unit-Test-Workstation-${version}-Linux-${arch}.${ext}"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "electron": {
+      "source": "full-stack-skills/electron-skills",
+      "sourceType": "github",
+      "skillPath": "skills/electron/SKILL.md",
+      "computedHash": "0a9f600f1456a143fc36db9b3ee1264c1b1660581f7b98ab667d67439de06615"
+    }
+  }
+}

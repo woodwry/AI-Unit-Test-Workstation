@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "backendMode": "remote-backend-services",
+  "agentServiceUrl": "https://woodwry.cn",
+  "javaAnalyzerUrl": "https://woodwry.cn/java-analyzer"
+}

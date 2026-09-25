@@ -1,0 +1,45 @@
+AI Unit Test Workstation 第三方软件声明（发布前草案）
+====================================================
+
+重要说明
+--------
+
+本文件只是发布前的第三方 notices 草案，用于梳理 Windows 统一安装包预计包含的软件及许可材料，不是最终发布清单。
+
+本文件不构成产品授权、许可承诺或法律意见，也不能替代各第三方组件随附的原始许可文本。实际打包版本、传递依赖、版权声明、完整许可文本及再分发条件，必须在每次正式发布前根据最终产物生成软件物料清单，并由项目负责人和法务人员确认。
+
+预计随安装包分发的主要组件
+----------------------------
+
+1. Eclipse Temurin Java Runtime Environment
+   - 发行方：Eclipse Adoptium
+   - 计划版本：21.0.11+10，Windows x86_64
+   - Java 运行时自身携带的 legal/ 目录是该份运行时对应许可文本和第三方声明的重要依据；staging 必须完整保留该目录，不得用本草案替代。
+
+2. CPython 与 agent-service
+   - 计划使用 CPython 3.11.9 和 PyInstaller 6.16.0 生成 Windows onedir 产物。
+   - agent-service 的 FastAPI、Pydantic、HTTP、LangChain、模型适配及其他 Python 传递依赖，须以最终锁定依赖和实际 onedir 内容为准补齐许可文本与版权声明。
+   - PyInstaller 自身许可及其引导加载器分发例外须在正式发布前单独复核。
+
+3. java-analyzer
+   - 计划以 Java 21、Spring Boot 3.3.6 和 Maven 构建可执行 fat Jar。
+   - Spring Boot、日志、JSON、测试与其他 Maven 传递依赖，须以最终 fat Jar 和 Maven 依赖清单为准补齐相应许可材料。
+
+4. Electron 工作站
+   - 计划使用 Electron 44.4.5、Chromium、Node.js、React、TypeScript、Vite、Monaco/Codingame VS Code API 兼容层及其他 npm 依赖。
+   - Chromium、Node.js、Electron、Monaco、React、图标、字体和所有 npm 传递依赖的版权及许可声明，须以最终 package-lock.json、node_modules 和安装包内容为准复核。
+
+5. Windows 安装器工具链
+   - 安装器由 electron-builder 26.0.12 与 NSIS 生成。
+   - 构建工具通常不等同于运行时分发内容；仍须检查最终安装器中实际包含的 NSIS 插件、辅助二进制文件和相关许可要求。
+
+正式发布前检查清单
+------------------
+
+- 根据最终二进制产物生成并归档 SBOM 或等价的精确组件清单。
+- 核对直接依赖和传递依赖的名称、版本、版权方、许可证 SPDX 标识及原始许可文本。
+- 确认需要随产品分发的 LICENSE、NOTICE、COPYING、第三方声明和源代码提供方式。
+- 完整保留 Eclipse Temurin JRE 的 release 文件和 legal/ 目录，并核对其与实际 JRE 构建一致。
+- 检查 PyInstaller、Electron、Chromium、Node.js、Spring Boot、NSIS 及各自传递依赖的再分发义务。
+- 对字体、图标、图片、示例代码及其他非代码资产单独确认授权范围。
+- 由法务人员确认最终 notices 后，才可替换本草案并用于正式签名和发布。

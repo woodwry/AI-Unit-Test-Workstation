@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Unit Test Workstation</title>
+    <!-- 启动关键样式必须在入口脚本之前生效，避免正式样式加载前出现默认白边和页面滚动条。 -->
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #161819;
+      }
+
+      #root {
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <!-- 即使入口脚本或样式资源损坏，也先给出可见状态，避免只剩空白背景。 -->
+      <main style="height:100%;display:flex;align-items:center;justify-content:center;background:#161819;color:#c7ccd1;font:14px 'Segoe UI',sans-serif">
+        正在启动 AI Unit Test Workstation…
+      </main>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

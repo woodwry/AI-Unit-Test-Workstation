@@ -1,0 +1,41 @@
+.user-management-panel { height: 100%; display: flex; flex-direction: column; color: #d4d8df; background: #1d1f23; }
+.user-management-panel > header { min-height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px 0 16px; border-bottom: 1px solid #2d3036; }
+.user-management-panel > header h2 { margin: 0; font-size: 12px; font-weight: 620; text-transform: uppercase; letter-spacing: .04em; }
+.user-management-panel > header span { display: block; margin-top: 2px; color: #7f8792; font-size: 10px; }
+.user-management-actions, .user-management-row-actions { display: flex; gap: 3px; }
+.user-management-actions button, .user-management-row-actions button { width: 27px; height: 27px; display: grid; place-items: center; border: 0; border-radius: 4px; color: #aeb5bf; background: transparent; cursor: pointer; }
+.user-management-actions button:hover, .user-management-row-actions button:hover:not(:disabled) { color: #eef2f7; background: #31343a; }
+.user-management-row-actions button:disabled { opacity: .3; cursor: default; }
+.user-management-search { height: 30px; display: flex; align-items: center; gap: 7px; margin: 10px 12px; padding: 0 9px; border: 1px solid #373a41; border-radius: 5px; color: #7f8792; background: #17191c; }
+.user-management-search:focus-within { border-color: #4c7ead; }
+.user-management-search input { min-width: 0; flex: 1; border: 0; outline: 0; color: #d8dce3; background: transparent; font-size: 12px; }
+.user-management-error { margin: 0 12px 8px; padding: 8px; border-radius: 4px; color: #ffb8b8; background: rgba(139, 48, 48, .2); font-size: 11px; }
+.user-management-list { min-height: 0; flex: 1; overflow: auto; }
+.user-management-empty { padding: 30px 16px; color: #7f8792; text-align: center; font-size: 12px; }
+.user-management-item { display: grid; grid-template-columns: 28px minmax(0,1fr) auto; gap: 8px; padding: 12px; border-bottom: 1px solid #292c31; }
+.user-management-item:hover { background: #22252a; }
+.user-management-avatar { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 7px; color: #9dbfe4; background: #27384a; }
+.user-management-name { display: flex; align-items: center; gap: 7px; }
+.user-management-name strong { overflow: hidden; color: #e4e7ec; font-size: 12px; text-overflow: ellipsis; }
+.user-management-name small { color: #7e9fc1; font-size: 9px; white-space: nowrap; }
+.user-management-badges { display: flex; gap: 5px; margin: 5px 0 7px; }
+.user-management-badges span { padding: 2px 5px; border-radius: 3px; color: #adb5bf; background: #30333a; font-size: 9px; }
+.user-management-badges span.available { color: #9bd2ae; background: rgba(44, 107, 65, .28); }
+.user-management-badges span.disabled { color: #e7a4a4; background: rgba(127, 49, 49, .27); }
+.user-management-summary dl { margin: 0; color: #858e99; font-size: 9px; }
+.user-management-summary dl div { display: flex; gap: 5px; margin-top: 2px; }
+.user-management-summary dt { width: 26px; }
+.user-management-summary dd { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-editor-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; background: rgba(8, 9, 11, .66); }
+.user-editor { width: 390px; display: grid; gap: 15px; padding: 20px; border: 1px solid #3a3d44; border-radius: 9px; color: #d9dde4; background: #22252a; box-shadow: 0 20px 60px rgba(0,0,0,.45); }
+.user-editor header, .user-editor footer { display: flex; align-items: center; justify-content: space-between; }
+.user-editor h3 { margin: 0; font-size: 16px; font-weight: 560; }
+.user-editor header button { width: 26px; height: 26px; display: grid; place-items: center; border: 0; color: #aeb5bf; background: transparent; cursor: pointer; }
+.user-editor label { display: grid; gap: 6px; color: #afb6c0; font-size: 11px; }
+.user-editor input, .user-editor select { height: 34px; padding: 0 9px; border: 1px solid #3b3f47; border-radius: 5px; outline: 0; color: #e3e7ed; background: #181a1e; }
+.user-editor input:focus, .user-editor select:focus { border-color: #5487bc; }
+.user-editor label small { color: #777f8b; font-size: 9px; }
+.user-editor footer { justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.user-editor footer button { height: 31px; padding: 0 14px; border: 1px solid #3d4149; border-radius: 5px; color: #cbd0d8; background: #292c32; cursor: pointer; }
+.user-editor footer button.primary { border-color: #397ab5; color: #fff; background: #3276b8; }
+.user-editor footer button:disabled { opacity: .5; cursor: default; }
