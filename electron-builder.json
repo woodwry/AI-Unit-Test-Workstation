@@ -1,0 +1,27 @@
+{
+  "appId": "com.aiunittest.workstation",
+  "productName": "AI Unit Test Workstation",
+  "asar": true,
+  "publish": null,
+  "directories": { "output": "release" },
+  "files": ["out/**", "package.json"],
+  "extraResources": [
+    { "from": "build-resources", "to": "." },
+    { "from": "assets/branding/ai-unit-test-workstation.ico", "to": "branding/ai-unit-test-workstation.ico" }
+  ],
+  "win": {
+    "target": [{ "target": "nsis", "arch": ["x64"] }],
+    "icon": "assets/branding/ai-unit-test-workstation.ico",
+    "artifactName": "AI-Unit-Test-Workstation-Setup-${version}-${arch}.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "installerIcon": "assets/branding/ai-unit-test-workstation.ico",
+    "uninstallerIcon": "assets/branding/ai-unit-test-workstation.ico",
+    "include": "packaging/windows/installer.nsh"
+  }
+}

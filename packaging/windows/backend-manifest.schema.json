@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-unit-test.invalid/schemas/backend-manifest-v1.json",
+  "title": "AI Unit Test Workstation Backend Manifest V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "product", "javaRuntime", "components", "entrypoints", "files"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "platform", "arch"],
+      "properties": {
+        "version": { "$ref": "#/$defs/version" },
+        "platform": { "const": "win32" },
+        "arch": { "const": "x64" }
+      }
+    },
+    "javaRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["distribution", "vendor", "version", "architecture"],
+      "properties": {
+        "distribution": { "const": "Eclipse Temurin" },
+        "vendor": { "const": "Eclipse Adoptium" },
+        "version": { "const": "21.0.11+10" },
+        "architecture": { "const": "x86_64" }
+      }
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentService", "javaAnalyzer"],
+      "properties": {
+        "agentService": { "$ref": "#/$defs/component" },
+        "javaAnalyzer": { "$ref": "#/$defs/component" }
+      }
+    },
+    "entrypoints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentService", "javaAnalyzer", "javaRuntime"],
+      "properties": {
+        "agentService": {
+          "allOf": [
+            { "$ref": "#/$defs/file" },
+            { "properties": { "path": { "const": "backend/agent-service/agent-service.exe" }, "size": { "minimum": 1 } } }
+          ]
+        },
+        "javaAnalyzer": {
+          "allOf": [
+            { "$ref": "#/$defs/file" },
+            { "properties": { "path": { "const": "backend/java-analyzer/java-analyzer.jar" }, "size": { "minimum": 1 } } }
+          ]
+        },
+        "javaRuntime": {
+          "allOf": [
+            { "$ref": "#/$defs/file" },
+            { "properties": { "path": { "const": "runtimes/java-21/bin/javaw.exe" }, "size": { "minimum": 1 } } }
+          ]
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/file" }
+    }
+  },
+  "$defs": {
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version"],
+      "properties": { "version": { "$ref": "#/$defs/version" } }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F]+$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    }
+  }
+}

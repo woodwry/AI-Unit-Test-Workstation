@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "product": {
+    "id": "ai-unit-test-workstation",
+    "version": "0.1.3",
+    "appId": "com.aiunittest.workstation",
+    "productName": "AI Unit Test Workstation",
+    "platform": "win32",
+    "arch": "x64",
+    "minimumWindowsVersion": "10.0.17763"
+  },
+  "toolchain": {
+    "node": "22.14.0",
+    "npm": "11.17.0",
+    "python": "3.11.9",
+    "pipTools": "7.5.2",
+    "pyinstaller": "6.16.0",
+    "maven": "3.9.9",
+    "buildJdk": "21.0.11+9",
+    "javaRuntimeVendor": "Eclipse Temurin",
+    "javaRuntimeVersion": "21.0.11+10"
+  },
+  "runtime": {
+    "protocol": 1,
+    "mode": "packaged",
+    "host": "127.0.0.1",
+    "port": 0,
+    "authorizationScheme": "Bearer",
+    "paths": {
+      "live": "/api/internal/live",
+      "ready": "/api/internal/ready"
+    },
+    "environment": {
+      "protocol": "AI_UNIT_TEST_RUNTIME_PROTOCOL",
+      "mode": "AI_UNIT_TEST_RUNTIME_MODE",
+      "service": "AI_UNIT_TEST_SERVICE",
+      "instanceId": "AI_UNIT_TEST_INSTANCE_ID",
+      "parentPid": "AI_UNIT_TEST_PARENT_PID",
+      "accessToken": "AI_UNIT_TEST_ACCESS_TOKEN",
+      "analyzerBaseUrl": "AGENT_JAVA_ANALYZER_BASE_URL",
+      "analyzerAccessToken": "AGENT_JAVA_ANALYZER_ACCESS_TOKEN",
+      "serverHost": "AGENT_SERVER_HOST",
+      "serverPort": "AGENT_SERVER_PORT",
+      "serverReload": "AGENT_SERVER_RELOAD"
+    }
+  },
+  "services": [
+    {
+      "id": "java-analyzer",
+      "version": "0.1.0",
+      "host": "127.0.0.1",
+      "port": 0,
+      "executableRelativePath": "runtimes/java-21/bin/javaw.exe",
+      "arguments": [
+        "-jar",
+        "backend/java-analyzer/java-analyzer.jar",
+        "--server.address=127.0.0.1",
+        "--server.port=0"
+      ],
+      "startupTimeoutMs": 45000,
+      "shutdownTimeoutMs": 10000
+    },
+    {
+      "id": "agent-service",
+      "version": "0.1.0",
+      "host": "127.0.0.1",
+      "port": 0,
+      "executableRelativePath": "backend/agent-service/agent-service.exe",
+      "arguments": [],
+      "startupTimeoutMs": 60000,
+      "shutdownTimeoutMs": 10000
+    }
+  ],
+  "resources": {
+    "backendManifestRelativePath": "backend-manifest.json",
+    "licensesRelativePath": "licenses"
+  },
+  "installer": {
+    "kind": "nsis",
+    "artifactName": "AI-Unit-Test-Workstation-Setup-${version}-${arch}.${ext}",
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true
+  }
+}

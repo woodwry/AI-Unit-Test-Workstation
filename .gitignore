@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build and test output
+out/
+dist/
+release/
+coverage/
+test-results/
+playwright-report/
+**/target/
+
+# Locally staged packaged runtimes and extracted archives
+build-resources/
+META-INF/
+
+# Logs and temporary files
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.tmp
+.cache/
+
+# Local configuration and signing material
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
