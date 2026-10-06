@@ -9,6 +9,7 @@ import type {
   AddClassTasksResult,
   CheckClassTaskMethodsRequest,
   ClassMethodCatalog,
+  ClassTaskMethodCatalogChangedEvent,
   CoverageTotals,
   ClassTaskMethodsFreshness,
   ClassTaskResultSnapshot,
@@ -32,7 +33,7 @@ import type {
   TerminateClassTaskRequest,
   PublicTaskError
 } from '../../shared/class-task-contracts.ts';
-import { hasPendingClassTaskResult } from '../../shared/class-task-contracts.ts';
+import { canHandleClassTaskResult, hasPendingClassTaskResult } from '../../shared/class-task-contracts.ts';
 import { generatedResultMethodsFromArtifacts } from '../../shared/class-task-result-methods.ts';
 import { isMethodSelectable } from '../../shared/class-method-selectability.ts';
 import { modelCredentialEnvironmentVariables } from '../../shared/model-runtime-security.ts';
@@ -126,9 +127,18 @@ import {
 } from './module-preload-coordinator.service.ts';
 import { sanitizePublicText } from './maven-command.ts';
 import { SingleMethodGenerationService } from './single-method-generation.service.ts';
+import { FullSourceGenerationService } from './full-source-generation.service.ts';
+import { FULL_SOURCE_SKILL_RULES_SHA256, sourceSha256, type FullSourceExecutionOutcome } from './full-source-generation-contract.ts';
+import type { FullSourceRunCheckpoint } from './full-source-checkpoint.ts';
+import { attributeFullSourceResults } from './full-source-result-attribution.ts';
+import { recoverFullSourceReplacement } from './full-source-file-recovery.ts';
 import type { ShellService } from './shell.service.ts';
 import type { SurefireReportService } from './surefire-report.service.ts';
-import { TaskJacocoSessionService, type TaskJacocoSessionContext } from './task-jacoco-session.service.ts';
+import {
+  TaskJacocoSessionService,
+  type TaskJacocoRefreshResult,
+  type TaskJacocoSessionContext
+} from './task-jacoco-session.service.ts';
 import {
   isGeneratedTestExternallyModifiedError,
   type TestWriterService
@@ -158,6 +168,8 @@ const RELEASE_RUN_STATES = new Set<ClassTaskSnapshot['state']>([
 const DEFAULT_ANALYSIS_SESSION_HEARTBEAT_INTERVAL_MILLISECONDS = 5 * 60 * 1_000;
 const DEFAULT_ANALYSIS_RESPONSE_TIMEOUT_RETRY_INITIAL_DELAY_MILLISECONDS = 1_000;
 const DEFAULT_ANALYSIS_RESPONSE_TIMEOUT_RETRY_MAX_DELAY_MILLISECONDS = 30_000;
+const MAX_ANALYSIS_TRANSIENT_RESPONSE_RETRIES = 3;
+const MAX_ANALYSIS_SESSION_CREATION_RECOVERY_RETRIES = 1;
 const MAX_COVERAGE_ARTIFACT_REFRESH_RETRIES = 5;
 const MAX_PUBLIC_TASK_ERROR_TEXT_LENGTH = 4_096;
 const MAX_MANAGED_WAVE_CANDIDATE_BYTES = 1024 * 1024;
@@ -231,6 +243,8 @@ export type ClassTaskRuntimeCoordinatorPort = {
     reportPairId: string;
   } | null;
   refreshFailedRunIfStale?(taskId: string): Promise<FailedRunRefreshResult>;
+  reconcileRevokedFullSourceRun?(taskId: string): Promise<void>;
+  canContinueFullSourceFinalization?(taskId: string): Promise<boolean>;
   restart(
     taskId: string,
     signal?: AbortSignal,
@@ -275,6 +289,12 @@ export type ProductionClassTaskRuntimeOptions = {
     | 'nextMethodBatch'
     | 'nextMethodWave'
     | 'nextClassScenarioWave'
+    | 'fullSourceGenerationFacts'
+    | 'startFullSourceGenerationStream'
+    | 'resumeFullSourceGenerationStream'
+    | 'waitFullSourceGenerationTurn'
+    | 'recoverFullSourceGenerationStream'
+    | 'cancelFullSourceGeneration'
     | 'getMethodRepairContext'
     | 'refreshMethodAnalysisCoverage'
     | 'startMethodGenerationStream'
@@ -327,11 +347,13 @@ export type ProductionClassTaskRuntimeOptions = {
   analysisSessionHeartbeatIntervalMilliseconds?: number;
   analysisResponseTimeoutRetryInitialDelayMilliseconds?: number;
   analysisResponseTimeoutRetryMaxDelayMilliseconds?: number;
+  methodGenerationWaveProgressTimeoutMilliseconds?: number;
   ragTelemetry?: (
     event: string,
     fields: Readonly<Record<string, string | number | null>>
   ) => void;
   broadcast(snapshot: ClassTaskSnapshot): void;
+  onMethodCatalogChanged?(event: ClassTaskMethodCatalogChangedEvent): void;
   recordTaskExecution?: () => Promise<void>;
   assertBackendReady?(): void;
   watcherVersion?(moduleKey: string): number;
@@ -354,6 +376,7 @@ type PreparedTaskContext = {
 type TaskPreparation = {
   controller: AbortController;
   promise: Promise<ClassMethodCatalog>;
+  forceCoverageRefresh: boolean;
 };
 
 type ProductionTaskResources = ClassTaskRagRunResources & {
@@ -364,14 +387,18 @@ type ProductionTaskResources = ClassTaskRagRunResources & {
   prepared: PreparedTaskContext | null;
   preparation: TaskPreparation | null;
   preparationReset: Promise<void> | null;
+  restart: Promise<void> | null;
   ownedAnalysisSessionIds: Set<string>;
   packer: FormalTestFilePackerService | null;
   generator: SingleMethodGenerationService | null;
   batchGenerator: DataClassGenerationBatchService | null;
   logs: MethodGenerationLogService;
   loggingPromise: Promise<ModelCallLogSettings> | null;
+  fullSourceRelease: Promise<void> | null;
   jacocoInitialized: boolean;
   coverageArtifactSha256ById: Map<string, string>;
+  restoredCoverageCatalog: ClassMethodCatalog | null;
+  restoredCoverageReport: JacocoArtifactPair | null;
 };
 
 type ProductionCoordinatorDependencies = {
@@ -459,6 +486,16 @@ export class ClassTaskRuntimeService {
   async getClassTaskMethods(request: GetClassTaskMethodsRequest): Promise<ClassMethodCatalog> {
     this.assertRunning();
     const task = this.requireTask(request.workspaceRoot, request.taskId);
+    if (!request.forceReload && (task.state === 'COMPLETED' || task.state === 'TERMINATED')
+      && !task.generatedArtifacts.some(artifact => !artifact.accepted)) {
+      const retained = this.coordinator.peekPreparedMethodCatalog(request.taskId);
+      if (retained) return this.withModuleReportTotals(task, retained);
+    }
+    if (task.state === 'PRELOADING') {
+      const prepared = this.coordinator.peekPreparedMethodCatalog(request.taskId);
+      if (prepared) return this.withModuleReportTotals(task, prepared);
+      throw new Error('当前类正在预加载，请稍后再打开方法列表。');
+    }
     if (task.state === 'PRELOAD_FAILED') {
       await this.coordinator.retryClassPreload(request.taskId);
       const retried = this.requireTask(request.workspaceRoot, request.taskId);
@@ -502,9 +539,13 @@ export class ClassTaskRuntimeService {
 
   async saveMethodSelection(request: SaveMethodSelectionRequest): Promise<ClassTaskSnapshot> {
     this.assertRunning();
-    this.requireTask(request.workspaceRoot, request.taskId);
-    const catalog = await this.coordinator.prepare(request.taskId);
-    validateSelection(request, catalog);
+    const task = this.requireTask(request.workspaceRoot, request.taskId);
+    // Unhandled results keep their frozen selection. The registry permits only
+    // an unchanged save, without launching a disposable analysis session.
+    if (!task.generatedArtifacts.some((artifact) => !artifact.accepted)) {
+      const catalog = await this.coordinator.prepare(request.taskId);
+      validateSelection(request, catalog);
+    }
     return this.registry.saveSelection(
       request.taskId,
       request.selectionMode,
@@ -548,6 +589,7 @@ export class ClassTaskRuntimeService {
     }
     requireSelectedMethods(task);
     try {
+      await this.coordinator.reconcileRevokedFullSourceRun?.(task.id);
       let currentTask = task;
       let preserveCheckpoint = false;
       if (task.state === 'FAILED') {
@@ -559,12 +601,16 @@ export class ClassTaskRuntimeService {
         if (refresh.refreshed) {
           if (currentTask.state === 'PRELOAD_FAILED') return detached(currentTask);
         } else if (requiresFreshGenerationAfterFailure(currentTask.lastError?.code)) {
-          await this.coordinator.restart(task.id, undefined, {
-            resetGenerationCheckpoint: true
-          });
-          currentTask = this.registry.snapshot(task.id);
+          if (await this.coordinator.canContinueFullSourceFinalization?.(task.id)) {
+            preserveCheckpoint = true;
+          } else {
+            await this.coordinator.restart(task.id, undefined, {
+              resetGenerationCheckpoint: true
+            });
+            currentTask = this.registry.snapshot(task.id);
+          }
         }
-        preserveCheckpoint = refresh.preserveCheckpoint;
+        preserveCheckpoint ||= refresh.preserveCheckpoint;
       }
       if (currentTask.state === 'TERMINATED' || currentTask.state === 'COMPLETED') {
         await this.coordinator.restart(task.id, undefined, {
@@ -671,34 +717,28 @@ export class ClassTaskRuntimeService {
     this.requireTask(request.workspaceRoot, request.taskId);
     const result = await this.coordinator.getResult(request.taskId);
     if (!result) return null;
-    return detached(result);
+    const task = this.requireTask(request.workspaceRoot, request.taskId);
+    const canHandleResult = canHandleClassTaskResult(task.state);
+    return detached({
+      ...result,
+      state: task.state,
+      canAccept: canHandleResult && result.canAccept,
+      canRevoke: canHandleResult && result.canRevoke
+    });
   }
 
   async acceptTaskResult(request: AcceptClassTaskRequest): Promise<ClassTaskResultSnapshot> {
     this.assertRunning();
     const task = this.requireTask(request.workspaceRoot, request.taskId);
-    if (task.state === 'RUNNING' || task.state === 'PAUSE_REQUESTED') {
-      return detached(await this.scheduler.runBackgroundOperationAtBoundary(
-        task.id,
-        () => this.coordinator.accept(request.taskId)
-      ));
-    }
-    if (task.state !== 'PAUSED') await this.stopTaskForResultTransaction(task);
+    this.assertResultTransactionIdle(task);
     return detached(await this.coordinator.accept(request.taskId));
   }
 
   async revokeTaskResult(request: RevokeClassTaskRequest): Promise<ClassTaskResultSnapshot> {
     this.assertRunning();
     const task = this.requireTask(request.workspaceRoot, request.taskId);
-    if (task.state === 'RUNNING' || task.state === 'PAUSE_REQUESTED') {
-      return detached(await this.scheduler.runBackgroundOperationAtBoundary(
-        task.id,
-        () => this.coordinator.revoke(request.taskId, { preserveRun: true })
-      ));
-    }
-    const preserveRun = task.state === 'PAUSED';
-    if (!preserveRun) await this.stopTaskForResultTransaction(task);
-    return detached(await this.coordinator.revoke(request.taskId, { preserveRun }));
+    this.assertResultTransactionIdle(task);
+    return detached(await this.coordinator.revoke(request.taskId, { preserveRun: false }));
   }
 
   async retryModulePreload(request: RetryModulePreloadRequest): Promise<void> {
@@ -841,23 +881,11 @@ export class ClassTaskRuntimeService {
   }
 
   private assertResultTransactionIdle(task: ClassTaskSnapshot): void {
-    if (!this.isResultTransactionIdle(task)) {
+    if (!canHandleClassTaskResult(task.state)) {
       throw new Error(
-        'The class task must be stopped before its result can be accepted or revoked.'
+        '请等待生成结束或终止任务后，再接受或撤回结果。'
       );
     }
-  }
-
-  private async stopTaskForResultTransaction(task: ClassTaskSnapshot): Promise<void> {
-    if (ACTIVE_STATES.has(task.state)) {
-      await this.scheduler.terminateTask(task.id);
-      await this.coordinator.releaseRun(task.id);
-    }
-    this.assertResultTransactionIdle(this.registry.snapshot(task.id));
-  }
-
-  private isResultTransactionIdle(task: ClassTaskSnapshot): boolean {
-    return task.state !== 'PRELOADING' && !ACTIVE_STATES.has(task.state);
   }
 }
 
@@ -1214,16 +1242,20 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
           .taskWaveProgress(snapshot.id);
         await this.dependencies.moduleLock.runExclusive(
           snapshot.moduleKey,
-          () => isolatePersistedProjectWaveCandidates({
-            taskId: snapshot.id,
-            workspaceRoot: snapshot.workspaceRoot,
-            candidates: recoveredWaveState.candidates,
-            transaction: resources.transaction,
-            saveCandidate: (candidate) => (
-              this.dependencies.checkpoints.saveWaveCandidate(snapshot.id, candidate)
-            )
-          })
+          async () => {
+            await isolatePersistedProjectWaveCandidates({
+              taskId: snapshot.id,
+              workspaceRoot: snapshot.workspaceRoot,
+              candidates: recoveredWaveState.candidates,
+              transaction: resources.transaction,
+              saveCandidate: (candidate) => (
+                this.dependencies.checkpoints.saveWaveCandidate(snapshot.id, candidate)
+              )
+            });
+            await this.cleanupUnreferencedWaveCandidateDirectories(snapshot);
+          }
         );
+        await this.isolateFullSourceCandidate(snapshot, resources);
       } catch (error) {
         const current = this.dependencies.registry.snapshot(snapshot.id);
         const message = error instanceof Error ? error.message : String(error);
@@ -1257,15 +1289,27 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     signal?: AbortSignal,
     options?: { forceReload?: boolean }
   ): Promise<ClassMethodCatalog> {
-    if (signal?.aborted) throw signal.reason;
     const resources = this.resourceFor(taskId);
-    if (options?.forceReload) {
+    let forceReload = options?.forceReload ?? false;
+    let forceCoverageRefresh = false;
+    for (;;) {
+      if (signal?.aborted) throw signal.reason;
+      const lifecycleBarrier = resources.restart ?? resources.preparationReset;
+      if (lifecycleBarrier) {
+        await waitForSharedPreparation(lifecycleBarrier, signal);
+        continue;
+      }
+      if (!forceReload) break;
       const task = this.dependencies.registry.snapshot(taskId);
       if (task.state === 'PRELOADING' || ACTIVE_STATES.has(task.state)) {
         throw new Error('当前类任务正在运行，暂时无法刷新方法与覆盖率信息。');
       }
+      forceReload = false;
       await this.resetPrepared(resources);
+      forceCoverageRefresh = true;
     }
+    // Checking the barriers and claiming a preparation stay in one synchronous
+    // turn; cleanup cannot lose a controller created while it is draining.
     if (resources.prepared) return Promise.resolve(detached(resources.prepared.catalog));
     if (resources.preparation) {
       return this.waitForPreparation(taskId, resources, resources.preparation, signal)
@@ -1275,6 +1319,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     const controller = new AbortController();
     const preparation = {} as TaskPreparation;
     preparation.controller = controller;
+    preparation.forceCoverageRefresh = forceCoverageRefresh;
     resources.preparation = preparation;
     preparation.promise = Promise.resolve()
       .then(() => this.prepareTask(taskId, resources, preparation))
@@ -1335,19 +1380,21 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
   }
 
   peekPreparedMethodCatalog(taskId: string): ClassMethodCatalog | null {
-    const prepared = this.resources.get(taskId)?.prepared;
-    return prepared ? detached(prepared.catalog) : null;
+    const resources = this.resources.get(taskId);
+    const catalog = resources?.prepared?.catalog ?? resources?.restoredCoverageCatalog;
+    return catalog ? detached(catalog) : null;
   }
 
   peekPreparedCoverageReport(taskId: string): {
     reportPath: string;
     reportPairId: string;
   } | null {
-    const prepared = this.resources.get(taskId)?.prepared;
-    return prepared
+    const resources = this.resources.get(taskId);
+    const pair = resources?.prepared?.pair ?? resources?.restoredCoverageReport;
+    return pair
       ? {
-          reportPath: prepared.pair.reportPath,
-          reportPairId: prepared.pair.pairId
+          reportPath: pair.reportPath,
+          reportPairId: pair.pairId
         }
       : null;
   }
@@ -1357,6 +1404,23 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     _signal?: AbortSignal,
     options: RestartClassTaskOptions = {}
   ): Promise<void> {
+    const resources = this.resourceFor(taskId);
+    await this.enqueueTaskLifecycleChange(resources, () => this.restartNow(taskId, options));
+  }
+
+  private enqueueTaskLifecycleChange(
+    resources: ProductionTaskResources,
+    operation: () => Promise<void>
+  ): Promise<void> {
+    const queued = (resources.restart ?? Promise.resolve()).then(operation);
+    const tracked = queued.finally(() => {
+      if (resources.restart === tracked) resources.restart = null;
+    });
+    resources.restart = tracked;
+    return tracked;
+  }
+
+  private async restartNow(taskId: string, options: RestartClassTaskOptions): Promise<void> {
     const resources = this.resourceFor(taskId);
     let task = this.dependencies.registry.snapshot(taskId);
     const failedRunModelUsage = task.state === 'FAILED'
@@ -1369,6 +1433,11 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     await this.reconcileUnavailableGeneratedArtifacts(task, resources);
     task = this.dependencies.registry.snapshot(taskId);
     const pendingArtifacts = resources.transaction.artifacts(taskId);
+    // Commented failure diagnostics contain no runnable result. Keep their source on
+    // disk when starting a fresh run, without treating them as accepted test results.
+    const retainDiagnosticFiles = (task.state === 'COMPLETED' || task.state === 'TERMINATED')
+      && pendingArtifacts.length > 0
+      && pendingArtifacts.every((artifact) => artifact.ordinaryTestMethodCount === 0);
     const preservePendingFormalArtifacts = !options.discardPendingArtifacts
       && task.state === 'FAILED'
       && pendingArtifacts.length > 0;
@@ -1376,7 +1445,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       ?? !preservePendingFormalArtifacts;
     await this.resetPrepared(resources);
     await this.cleanupRestartTemporaryFiles(task);
-    if (!preservePendingFormalArtifacts && pendingArtifacts.length > 0) {
+    if (!preservePendingFormalArtifacts && !retainDiagnosticFiles && pendingArtifacts.length > 0) {
       await resources.transaction.revoke(taskId, {
         protectedFilePaths: resources.acceptedArtifacts.map((artifact) => artifact.filePath)
       });
@@ -1420,7 +1489,8 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     if (task.state !== 'FAILED') {
       return { refreshed: false, preserveCheckpoint: false };
     }
-    const progress = await this.dependencies.checkpoints.taskProgress(taskId);
+      const progress = await this.dependencies.checkpoints.taskProgress(taskId);
+      if (progress.fullSource) return { refreshed: false, preserveCheckpoint: true };
     const methodOrderChanged = task.methodOrder.length !== progress.resolvedMethodOrder.length
       || task.methodOrder.some((methodId, index) => (
         progress.resolvedMethodOrder[index] !== methodId
@@ -1520,6 +1590,132 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     });
   }
 
+  supportsFullSource(): boolean {
+    const client = this.dependencies.options.aiClient;
+    return typeof client.fullSourceGenerationFacts === 'function'
+      && typeof client.startFullSourceGenerationStream === 'function'
+      && typeof client.resumeFullSourceGenerationStream === 'function';
+  }
+
+  async reconcileRevokedFullSourceRun(taskId: string): Promise<void> {
+    const task = this.dependencies.registry.snapshot(taskId);
+    if (task.state !== 'READY' && task.state !== 'FAILED') return;
+    const full = await this.dependencies.checkpoints.fullSourceProgress(taskId);
+    const publication = full?.publication;
+    if (publication?.phase !== 'VERIFIED') return;
+    if (task.generatedArtifacts.some(a => a.filePath === publication.formalPath && a.sha256 === publication.formalSha256)) return;
+    try {
+      await lstat(publication.formalPath);
+      // Keep an existing file, including an external edit. Absence of metadata
+      // alone is not evidence that the result was revoked.
+      return;
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR'))) throw error;
+    }
+    // A verified terminal publication with neither its file nor its result
+    // metadata must not be treated as a resumable candidate. Keep usage and
+    // saved failure sources; reset only through the ordinary checkpoint API.
+    await this.dependencies.checkpoints.prepareRun(taskId, { reset: true, preserveModelUsage: true });
+  }
+
+  async canContinueFullSourceFinalization(taskId: string): Promise<boolean> {
+    const task = this.dependencies.registry.snapshot(taskId);
+    if (task.state !== 'FAILED' || !requiresFreshGenerationAfterFailure(task.lastError?.code)) return false;
+    const full = await this.dependencies.checkpoints.fullSourceProgress(taskId);
+    if (full?.completion?.stopReason !== 'repair_exhausted' || !full.lastValidCandidate || !full.managedFile
+      || full.publication || full.completion.bestCandidateId !== full.lastValidCandidate.candidateId
+      || full.managedFile.sha256 !== full.lastValidCandidate.generatedCodeSha256) return false;
+    if (sourceSha256(await readFile(task.sourceFilePath, 'utf8')) !== full.batch?.facts.sourceSha256) return false;
+    await this.dependencies.options.testWriterService.loadOwnedGeneratedTest({ workspaceRoot: task.workspaceRoot,
+      filePath: full.managedFile.path, expectedSha256: full.managedFile.sha256 });
+    return true;
+  }
+
+  async executeFullSource(task: ClassTaskSnapshot, methodIds: readonly string[], checkpoint: FullSourceRunCheckpoint,
+    signal: AbortSignal): Promise<FullSourceExecutionOutcome> {
+    await this.prepareRun(task, signal);
+    const resources = this.resourceFor(task.id);
+    const prepared = this.requirePrepared(resources);
+    const modelRuntime = resources.resolvedModelRuntime;
+    if (!modelRuntime) throw new Error('Class task model runtime was not captured for this run.');
+    const logging = await this.beginLogging(resources);
+    this.ensurePacker(task, resources);
+    const full = new FullSourceGenerationService({
+      analyzer: this.dependencies.options.aiClient, agent: this.dependencies.options.aiClient,
+      checkpoints: this.dependencies.checkpoints, writer: this.dependencies.options.testWriterService,
+      moduleLock: this.dependencies.moduleLock, candidateFiles: resources.transaction,
+      maven: this.dependencies.maven, mavenReadyQueue: this.dependencies.mavenReadyQueue,
+      skillRulesSha256: FULL_SOURCE_SKILL_RULES_SHA256,
+      contextProvider: { resolve: async () => ({ analysisSessionId: prepared.analysis.analysisSessionId,
+        reportPairId: prepared.catalog.reportPairId, sourceSha256: prepared.analysis.sourceSha256,
+        packageName: prepared.analysis.packageName, plannedRelativeTestPath: prepared.analysis.suggestedRelativeTestPath,
+        moduleRoot: task.moduleDisplayPath, buildSettings: prepared.buildSettings, buildToolchain: prepared.buildToolchain,
+        modelContext: { llmConfig: modelRuntime.llmConfig }, captureModelCalls: logging.enabled,
+        methodCatalog: prepared.catalog.methods, excludedEnvironmentVariables: prepared.excludedEnvironmentVariables,
+        mavenEnvironmentFingerprint: mavenExecutionEnvironmentFingerprint(task, prepared) }) },
+      onEvent: async (current, facts, event) => {
+        if (event.eventType !== 'model_call') return;
+        const method = facts.methods[0];
+        await resources.logs.record({ taskId: current.id, className: basename(current.sourceFilePath, '.java'),
+          qualifiedClassName: current.qualifiedClassName, methodId: method.methodId, methodName: method.methodName,
+          descriptor: method.descriptor, modifiers: method.modifiers,
+          displaySignature: facts.methods.map(m => `${m.methodName}${m.descriptor}`).join('; '),
+          batchId: facts.factsId, batchIndex: 1, event: { ...event, eventType: 'model_call' } });
+      }
+    });
+    return this.runWithAnalysisSessionHeartbeat(task, resources, signal, heartbeatSignal =>
+      full.execute(task, methodIds, checkpoint, heartbeatSignal));
+  }
+
+  async formalizeFullSource(task: ClassTaskSnapshot, outcome: FullSourceExecutionOutcome, signal: AbortSignal): Promise<void> {
+    const resources = this.resourceFor(task.id);
+    let cp = await this.dependencies.checkpoints.fullSourceProgress(task.id);
+    if (!cp?.batch) throw new Error('完整源码发布缺少冻结事实。');
+    if (!outcome.bundles.length) {
+      await this.dependencies.checkpoints.saveFullSourceProgress(task.id, { ...cp, methodOutcomes: outcome.methodOutcomes });
+      return;
+    }
+    if (cp.publication?.phase === 'VERIFIED') {
+      const p = cp.publication;
+      await this.dependencies.options.testWriterService.loadOwnedGeneratedTest({ workspaceRoot: task.workspaceRoot,
+        filePath: p.formalPath, expectedSha256: p.formalSha256 });
+      if (!resources.transaction.artifacts(task.id).some(a => a.filePath === p.formalPath && a.sha256 === p.formalSha256)) {
+        await resources.transaction.track({ taskId: task.id, workspaceRoot: task.workspaceRoot, filePath: p.formalPath,
+          testClassName: basename(p.formalPath, '.java'), sha256: p.formalSha256,
+          ordinaryTestMethodCount: outcome.bundles.reduce((n, b) => n + b.ordinaryTestMethodCount, 0),
+          methodIds: outcome.bundles.map(b => b.methodId), methodResults: outcome.bundles.map(b => ({
+            methodId: b.methodId, methodName: b.methodName!, displaySignature: b.displaySignature!, jacocoOrder: b.jacocoOrder!,
+            ordinaryTestMethodCount: b.ordinaryTestMethodCount, fullSource: b.fullSource })), sealed: true, existedBefore: false });
+      }
+    } else {
+      if (!cp.candidate || !cp.managedFile || cp.execution?.status !== 'passed'
+        || outcome.candidateIds.length !== 1 || outcome.candidateIds[0] !== cp.candidate.candidateId
+        || outcome.bundles.some(b => b.fullSource?.factsId !== cp!.batch!.batchId
+          || b.fullSource?.candidateId !== cp!.candidate!.candidateId
+          || sourceSha256(b.code) !== cp!.managedFile!.sha256)) throw new Error('完整源码发布候选身份不一致。');
+      await this.atomic(task.id, 'PACK_FORMAL_FILE', () => this.ensurePacker(task, resources).appendSharedTemporaryGroup({
+        code: outcome.bundles[0].code, bundles: outcome.bundles }, signal));
+    }
+    await this.persistArtifacts(resources);
+    await this.refreshCompletedMethodCoverage(task, outcome.methodOutcomes.map(m => m.methodId), resources, signal);
+    cp = await this.dependencies.checkpoints.fullSourceProgress(task.id);
+    if (cp?.managedFile?.location === 'PROJECT' && cp.candidate) {
+      const file = cp.managedFile;
+      const target = join(task.workspaceRoot, '.ai-unit-test', 'full-source-candidates', sourceSha256(task.id).slice(0, 24),
+        cp.candidate.candidateId, basename(file.path));
+      await this.dependencies.moduleLock.runExclusive(task.moduleKey, () => resources.transaction.moveWaveCandidateFiles({
+        moves: [{ candidateId: cp!.candidate!.candidateId, workspaceRoot: task.workspaceRoot,
+          testClassName: cp!.candidate!.outputTestClassName, sourcePath: file.path, targetPath: target, sha256: file.sha256 }],
+        saveMoveTransactions: async transactions => {
+          const t = transactions[0];
+          cp = await this.dependencies.checkpoints.saveFullSourceProgress(task.id, { ...cp!,
+            moveTransaction: { sourcePath: t.sourcePath, targetPath: t.targetPath, sha256: t.sha256, phase: t.phase },
+            ...(t.phase === 'MOVED' ? { managedFile: { path: target, sha256: t.sha256, location: 'ISOLATED' } } : {}) });
+        }
+      }), signal);
+    }
+  }
+
   async execute(
     task: ClassTaskSnapshot,
     methodId: string,
@@ -1599,16 +1795,19 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     // cached (for example, in the crash window between publishing a formal class
     // Wave and clearing its old candidate). Quarantine such files immediately
     // before this Wave chooses and writes its deterministic TMP class name.
-    const waveState = await this.dependencies.checkpoints.taskWaveProgress(task.id);
     await this.dependencies.moduleLock.runExclusive(
       task.moduleKey,
-      () => isolateOrphanProjectWaveCandidates({
-        taskId: task.id,
-        workspaceRoot: task.workspaceRoot,
-        sourceFilePath: task.sourceFilePath,
-        candidates: waveState.candidates,
-        transaction: resources.transaction
-      }),
+      async () => {
+        const waveState = await this.dependencies.checkpoints.taskWaveProgress(task.id);
+        await isolateOrphanProjectWaveCandidates({
+          taskId: task.id,
+          workspaceRoot: task.workspaceRoot,
+          sourceFilePath: task.sourceFilePath,
+          candidates: waveState.candidates,
+          transaction: resources.transaction
+        });
+        await this.cleanupUnreferencedWaveCandidateDirectories(task);
+      },
       signal,
       this.moduleWaitHandlers(task.id)
     );
@@ -1705,18 +1904,23 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       throw new Error('Analysis-session heartbeat interval must be a positive integer.');
     }
     const sessionId = this.requirePrepared(resources).analysis.analysisSessionId;
+    const heartbeatController = new AbortController();
+    const abortHeartbeat = () => heartbeatController.abort(signal.reason);
+    signal.addEventListener('abort', abortHeartbeat, { once: true });
+    if (signal.aborted) abortHeartbeat();
+    const heartbeatSignal = heartbeatController.signal;
     let heartbeatFailure: unknown = null;
     let heartbeatInFlight: Promise<void> | null = null;
     const heartbeat = () => {
-      if (heartbeatInFlight || heartbeatFailure || signal.aborted) return;
+      if (heartbeatInFlight || heartbeatFailure || heartbeatSignal.aborted) return;
       heartbeatInFlight = (async () => {
         const available = resources.ownedAnalysisSessionIds.has(sessionId)
           && await this.retryHealthyAnalyzerTransientResponseFailure(
             () => this.dependencies.options.aiClient.heartbeatMethodAnalysisSession(
               sessionId,
-              signal
+              heartbeatSignal
             ),
-            signal
+            heartbeatSignal
           );
         if (!available) {
           throw new MethodAnalysisRequestError(
@@ -1725,7 +1929,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
           );
         }
       })().catch((error) => {
-        heartbeatFailure = error;
+        if (!heartbeatSignal.aborted) heartbeatFailure = error;
       }).finally(() => {
         heartbeatInFlight = null;
       });
@@ -1734,11 +1938,12 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     timer.unref();
     try {
       const result = await operation(signal);
-      if (heartbeatInFlight) await heartbeatInFlight;
       if (heartbeatFailure) throw heartbeatFailure;
       return result;
     } finally {
       clearInterval(timer);
+      signal.removeEventListener('abort', abortHeartbeat);
+      heartbeatController.abort();
     }
   }
 
@@ -1845,7 +2050,8 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     const published = findPublishedWaveArtifact(
       resources.transaction.artifacts(task.id),
       bundle.sourceMethodId ?? bundle.methodId,
-      bundle.waveIndex ?? 0
+      bundle.waveIndex ?? 0,
+      bundle.sourceBatchIds
     );
     if (published) {
       if (
@@ -1917,7 +2123,8 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     const published = bundles.map((bundle) => findPublishedWaveArtifact(
       resources.transaction.artifacts(task.id),
       bundle.sourceMethodId ?? bundle.methodId,
-      bundle.waveIndex ?? 0
+      bundle.waveIndex ?? 0,
+      bundle.sourceBatchIds
     ));
     if (published.every((item) => item !== null)) {
       const artifactIds = new Set(published.map((item) => item?.artifact.id));
@@ -1935,6 +2142,11 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
         task,
         bundles.map((bundle) => bundle.sourceMethodId ?? bundle.methodId),
         resources,
+        signal
+      );
+      await this.cleanupFormalizedWaveCandidates(
+        task,
+        candidateIds.flatMap((id) => waveState.candidates[id] ? [waveState.candidates[id]] : []),
         signal
       );
       return;
@@ -1972,8 +2184,8 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     candidates: readonly WaveCandidateCheckpoint[],
     signal: AbortSignal
   ): Promise<void> {
-    for (const candidate of candidates) {
-      await this.dependencies.moduleLock.runExclusive(task.moduleKey, async () => {
+    await this.dependencies.moduleLock.runExclusive(task.moduleKey, async () => {
+      for (const candidate of candidates) {
         for (const file of waveCandidateOwnedFiles(candidate)) {
           await this.deleteOwnedWaveScratchFile(task, file.path, file.sha256);
         }
@@ -1981,15 +2193,54 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
           recursive: true,
           force: true
         });
-      }, signal, this.moduleWaitHandlers(task.id));
-      if (!candidate.managedFile && !candidate.moveTransaction) continue;
-      await this.dependencies.checkpoints.saveWaveCandidate(task.id, {
-        ...candidate,
-        managedFile: null,
-        moveTransaction: null
-      });
+        if (!candidate.managedFile && !candidate.moveTransaction) continue;
+        await this.dependencies.checkpoints.saveWaveCandidate(task.id, {
+          ...candidate,
+          managedFile: null,
+          moveTransaction: null
+        });
+      }
+      await this.cleanupUnreferencedWaveCandidateDirectories(task);
+    }, signal, this.moduleWaitHandlers(task.id));
+  }
+
+  // Call only while holding the module lock: candidate files and their ownership
+  // checkpoints are created under the same lock, so no unregistered write is removed.
+  private async cleanupUnreferencedWaveCandidateDirectories(
+    task: ClassTaskSnapshot
+  ): Promise<void> {
+    const taskDirectory = waveCandidateTaskDirectory(task);
+    for (const directory of [dirname(dirname(taskDirectory)), dirname(taskDirectory), taskDirectory]) {
+      try {
+        const stat = await lstat(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+      } catch (error) {
+        if (isMissingPath(error)) return;
+        throw error;
+      }
     }
-    await removeDirectoryIfEmpty(waveCandidateTaskDirectory(task));
+    const waveState = await this.dependencies.checkpoints.taskWaveProgress(task.id);
+    const referencedDirectories = new Set(
+      Object.values(waveState.candidates).map((candidate) => candidate.candidateId.toLowerCase())
+    );
+    for (const candidate of Object.values(waveState.candidates)) {
+      for (const file of waveCandidateOwnedFiles(candidate)) {
+        const fileRelativePath = relative(taskDirectory, resolve(file.path));
+        if (fileRelativePath === '..' || fileRelativePath.startsWith(`..${sep}`)
+          || isAbsolute(fileRelativePath)) continue;
+        referencedDirectories.add(fileRelativePath.split(sep)[0].toLowerCase());
+      }
+    }
+    const entries = await readdir(taskDirectory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()
+        || !/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(entry.name)
+        || referencedDirectories.has(entry.name.toLowerCase())) continue;
+      const directory = resolve(taskDirectory, entry.name);
+      if (dirname(directory) !== taskDirectory) continue;
+      await rm(directory, { recursive: true, force: true });
+    }
+    await removeDirectoryIfEmpty(taskDirectory);
   }
 
   private async restorePublishedWaveBundle(
@@ -2008,11 +2259,12 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       const progress = await this.dependencies.checkpoints.taskWaveProgress(input.task.id);
       const published = input.wave.selectedMethodIds.flatMap((methodId) => {
         const waveIndex = progress.methods[methodId]?.nextWaveIndex
-          ?? input.waveCheckpoint.waveIndex;
+          ?? (methodId === classWave.methodId ? input.waveCheckpoint.waveIndex : 1);
         const item = findPublishedWaveArtifact(
           resources.transaction.artifacts(input.task.id),
           methodId,
-          waveIndex
+          waveIndex,
+          [input.candidate.candidateId]
         );
         return item ? [{ methodId, waveIndex, ...item }] : [];
       });
@@ -2046,7 +2298,8 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     const published = findPublishedWaveArtifact(
       resources.transaction.artifacts(input.task.id),
       input.wave.methodId,
-      input.waveCheckpoint.waveIndex
+      input.waveCheckpoint.waveIndex,
+      [input.candidate.candidateId]
     );
     if (!published) return null;
     const code = await this.dependencies.options.testWriterService.loadOwnedGeneratedTest({
@@ -2100,10 +2353,11 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     ));
     for (const artifact of changedArtifacts) {
       const prepared = this.requirePrepared(resources);
-      const refreshed = await this.atomic(task.id, 'JACOCO_REFRESH', () => (
-        this.dependencies.jacoco.refreshArtifact(prepared.jacoco, artifact, signal)
-      ));
-      this.updatePreparedCoverage(resources, refreshed.pair, refreshed.catalog);
+      const refreshed = await this.atomic(task.id, 'JACOCO_REFRESH', async () => {
+        await this.retainCoverageForPendingResult(resources, signal);
+        return this.dependencies.jacoco.refreshArtifact(prepared.jacoco, artifact, signal);
+      });
+      this.updatePreparedCoverage(resources, refreshed);
       resources.coverageArtifactSha256ById.set(artifact.id, artifact.sha256);
       await this.persistCoverage(
         resources,
@@ -2129,20 +2383,31 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       resources.coverageArtifactSha256ById
     )) return;
     const prepared = this.requirePrepared(resources);
-    const refreshed = await this.atomic(task.id, 'JACOCO_REFRESH', () => (
-      this.dependencies.jacoco.recalculate(
+    const refreshed = await this.atomic(task.id, 'JACOCO_REFRESH', async () => {
+      await this.retainCoverageForPendingResult(resources, signal);
+      return this.dependencies.jacoco.recalculate(
         prepared.jacoco,
         coverageArtifacts,
         signal
-      )
-    ));
-    this.updatePreparedCoverage(resources, refreshed.pair, refreshed.catalog);
+      );
+    });
+    this.updatePreparedCoverage(resources, refreshed);
     replaceCoverageArtifactVersions(resources, coverageArtifacts);
     await this.persistCoverage(
       resources,
       refreshed.coverage.counts,
       refreshed.contributions
     );
+  }
+
+  private async retainCoverageForPendingResult(resources: ProductionTaskResources, signal: AbortSignal): Promise<void> {
+    const prepared = this.requirePrepared(resources);
+    const context = prepared.jacoco;
+    await this.dependencies.moduleLock.runExclusive(context.moduleKey, () => (
+      this.dependencies.options.jacocoArtifactsService.retainTaskResultCoverage(context.moduleRoot, context.taskId, {
+        coverage: context.baselineCoverage, qualifiedClassName: context.qualifiedClassName, catalog: prepared.catalog
+      })
+    ), signal);
   }
 
   private async packCompletedMethods(
@@ -2289,20 +2554,48 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     const resources = this.resources.get(taskId);
     if (!resources) return;
     const task = this.dependencies.registry.snapshot(taskId);
-    const operations: Promise<unknown>[] = [
-      this.dependencies.ragRuns.releaseRun(resources),
-      resources.logs.finish()
+    const operations: Array<() => Promise<unknown>> = [
+      () => this.dependencies.ragRuns.releaseRun(resources),
+      () => resources.logs.finish()
     ];
-    if (shouldCleanupWaveScratchOnRelease(task)) {
-      operations.push(this.cleanupTerminalWaveScratch(task));
+    const full = await this.dependencies.checkpoints.fullSourceProgress(taskId);
+    const requiredOperations: Promise<unknown>[] = [];
+    if (full && RELEASE_RUN_STATES.has(task.state)) {
+      resources.fullSourceRelease ??= (async () => {
+        await this.isolateFullSourceCandidate(task, resources);
+        const current = await this.dependencies.checkpoints.fullSourceProgress(taskId);
+        if (task.state === 'TERMINATED' && current?.sessionId && current.startRequest && !current.completion && !current.sessionCancelled) {
+          await this.dependencies.options.aiClient.cancelFullSourceGeneration(current.sessionId, current.startRequest);
+          const latest = await this.dependencies.checkpoints.fullSourceProgress(taskId);
+          if (latest) await this.dependencies.checkpoints.saveFullSourceProgress(taskId, { ...latest, sessionCancelled: true });
+        }
+      })().finally(() => { resources.fullSourceRelease = null; });
+      requiredOperations.push(resources.fullSourceRelease);
     }
-    await Promise.allSettled(operations);
+    if (shouldCleanupWaveScratchOnRelease(task)) {
+      operations.push(() => this.cleanupTerminalWaveScratch(task));
+    } else if (task.state === 'FAILED') {
+      const wave = await this.dependencies.checkpoints.taskWaveProgress(task.id);
+      operations.push(() => this.dependencies.moduleLock.runExclusive(task.moduleKey, () => (
+        isolatePersistedProjectWaveCandidates({
+          taskId: task.id,
+          workspaceRoot: task.workspaceRoot,
+          candidates: wave.candidates,
+          transaction: resources.transaction,
+          saveCandidate: (candidate) => this.dependencies.checkpoints.saveWaveCandidate(task.id, candidate)
+        })
+      )));
+    }
+    const requiredResults = await Promise.allSettled(requiredOperations);
+    await Promise.allSettled(operations.map(operation => Promise.resolve().then(operation)));
     resources.loggingPromise = null;
     if (RELEASE_RUN_STATES.has(task.state)) {
       resources.generator = null;
       resources.batchGenerator = null;
       await this.releaseOwnedAnalysisSessions(resources);
     }
+    const failures = requiredResults.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length) throw new AggregateError(failures.map(result => result.reason), '完整源码任务释放失败，候选或会话需恢复。');
   }
 
   async refreshGenerationModel(taskId: string): Promise<void> {
@@ -2317,7 +2610,10 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     let candidates: WaveCandidateCheckpoint[] = [];
     try {
       const waveState = await this.dependencies.checkpoints.taskWaveProgress(task.id);
-      candidates = Object.values(waveState.candidates).sort((left, right) => (
+      // Exhausted candidate failures are retained in method-wave-failures with
+      // their Maven evidence. They are results for inspection, not scratch.
+      candidates = Object.values(waveState.candidates)
+        .filter((candidate) => candidate.status !== 'QUARANTINED').sort((left, right) => (
         left.candidateId.localeCompare(right.candidateId)
       ));
     } catch (error) {
@@ -2397,9 +2693,12 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
   }
 
   async remove(taskId: string): Promise<void> {
-    const resources = this.resources.get(taskId);
-    if (!resources) return;
     const task = this.dependencies.registry.snapshot(taskId);
+    const resources = this.resources.get(taskId);
+    if (!resources) {
+      await this.cleanupRemovedTaskData(task);
+      return;
+    }
     resources.preparation?.controller.abort(new Error('Class task was removed.'));
     await Promise.allSettled([
       resources.preparation?.promise ?? Promise.resolve(),
@@ -2419,8 +2718,51 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     } finally {
       await this.releaseOwnedAnalysisSessions(resources);
     }
+    await this.cleanupRemovedTaskData(task);
+    await this.cleanupHandledCoverageRollback(task, true);
     this.dependencies.coverageLedger.remove(taskId);
     this.resources.delete(taskId);
+  }
+
+  private async isolateFullSourceCandidate(task: ClassTaskSnapshot, resources: ProductionTaskResources): Promise<void> {
+    await this.dependencies.moduleLock.runExclusive(task.moduleKey, async () => {
+      let cp = await this.dependencies.checkpoints.fullSourceProgress(task.id);
+      if (cp?.pendingReplacement) cp = await recoverFullSourceReplacement(task.workspaceRoot, cp,
+        this.dependencies.options.testWriterService,
+        next => this.dependencies.checkpoints.saveFullSourceProgress(task.id, next));
+      const candidate = cp?.candidate ?? cp?.lastValidCandidate;
+      if (!cp || !candidate || !cp.managedFile) return;
+      if (cp.moveTransaction) {
+        const recovered = await resources.transaction.recoverWaveCandidateMove({ ...cp.moveTransaction,
+          candidateId: candidate.candidateId, workspaceRoot: task.workspaceRoot, testClassName: candidate.outputTestClassName });
+        cp = await this.dependencies.checkpoints.saveFullSourceProgress(task.id, { ...cp, moveTransaction: null,
+          managedFile: { path: recovered.filePath, sha256: recovered.sha256, location: recovered.location } });
+      }
+      if (cp.managedFile?.location !== 'PROJECT') return;
+      const file = cp.managedFile;
+      const target = join(task.workspaceRoot, '.ai-unit-test', 'full-source-candidates', sourceSha256(task.id).slice(0, 24),
+        candidate.candidateId, basename(file.path));
+      await resources.transaction.moveWaveCandidateFiles({ moves: [{ candidateId: candidate.candidateId,
+        workspaceRoot: task.workspaceRoot, testClassName: candidate.outputTestClassName,
+        sourcePath: file.path, targetPath: target, sha256: file.sha256 }], saveMoveTransactions: async transactions => {
+          const t = transactions[0];
+          cp = await this.dependencies.checkpoints.saveFullSourceProgress(task.id, { ...cp!,
+            moveTransaction: { sourcePath: t.sourcePath, targetPath: t.targetPath, sha256: t.sha256, phase: t.phase },
+            ...(t.phase === 'MOVED' ? { managedFile: { path: target, sha256: t.sha256, location: 'ISOLATED' } } : {}) });
+        } });
+    });
+  }
+
+  private async cleanupRemovedTaskData(task: ClassTaskSnapshot): Promise<void> {
+    const dataRoot = join(resolve(task.workspaceRoot), '.ai-unit-test');
+    const hasOtherTasks = this.dependencies.registry.list(task.workspaceRoot)
+      .some((candidate) => candidate.id !== task.id);
+    // Failure evidence survives completion, but explicit removal owns its cleanup.
+    const cleanupPath = hasOtherTasks
+      ? join(dataRoot, 'method-wave-failures',
+        createHash('sha256').update(task.id, 'utf8').digest('hex').slice(0, 24))
+      : dataRoot;
+    await rm(cleanupPath, { recursive: true, force: true });
   }
 
   async getResult(taskId: string): Promise<ClassTaskResultSnapshot | null> {
@@ -2431,9 +2773,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       && task.coverageBaseline !== null
       && task.coverageCurrent !== null;
     if (
-      (task.generatedArtifacts.length === 0 && !hasRevokedCompletedResult)
-      || !task.coverageBaseline
-      || !task.coverageCurrent
+      task.generatedArtifacts.length === 0 && !hasRevokedCompletedResult
     ) return null;
     const resources = this.resourceFor(taskId);
     await this.restorePendingResultArtifacts(task, resources);
@@ -2445,9 +2785,6 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     const current = resources.transaction.artifacts(taskId);
     if (current.length === 0) throw new Error('The class task has no result to accept.');
     const task = this.dependencies.registry.snapshot(taskId);
-    if (!task.coverageCurrent) {
-      throw new Error('The class task has no exact current coverage to accept.');
-    }
     let acceptedCoverage = detached(task.coverageCurrent);
     if (resources.jacocoInitialized && resources.prepared) {
       const checkpoint = await this.dependencies.jacoco.checkpointAcceptedBaseline(
@@ -2455,6 +2792,9 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       );
       resources.prepared.jacoco = checkpoint.context;
       acceptedCoverage = detached(checkpoint.coverage.counts);
+    } else if (await this.dependencies.options.jacocoArtifactsService.readTaskResultCoverageRollback(task.moduleDisplayPath, taskId)) {
+      // A completed result can be accepted after reopening, without starting an analysis session.
+      await this.dependencies.options.jacocoArtifactsService.checkpointTaskBaseline(task.moduleDisplayPath, taskId);
     }
     const accepted = await resources.transaction.accept(taskId);
     resources.acceptedArtifacts = uniqueArtifacts([
@@ -2476,6 +2816,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coverageContributions: [],
       updatedAt: this.now()
     });
+    await this.cleanupHandledCoverageRollback(task);
     return this.requireResult(taskId, resources);
   }
 
@@ -2484,15 +2825,34 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     options: RevokeClassTaskResultOptions = {}
   ): Promise<ClassTaskResultSnapshot> {
     const resources = this.resourceFor(taskId);
+    if (options.preserveRun) {
+      const current = resources.transaction.artifacts(taskId);
+      if (current.length === 0) throw new Error('The class task has no result to revoke.');
+      return this.revokePendingRunArtifacts(this.dependencies.registry.snapshot(taskId), resources);
+    }
+    let result!: ClassTaskResultSnapshot;
+    await this.enqueueTaskLifecycleChange(resources, async () => {
+      result = await this.revokeCompletedResult(taskId, resources);
+    });
+    return result;
+  }
+
+  private async revokeCompletedResult(
+    taskId: string,
+    resources: ProductionTaskResources
+  ): Promise<ClassTaskResultSnapshot> {
     const current = resources.transaction.artifacts(taskId);
     if (current.length === 0) throw new Error('The class task has no result to revoke.');
     const task = this.dependencies.registry.snapshot(taskId);
-    if (!task.coverageBaseline) {
-      throw new Error('The class task has no exact coverage baseline to restore.');
-    }
-    if (options.preserveRun) {
-      return this.revokePendingRunArtifacts(task, resources);
-    }
+    // Validate the retained report before deleting sources or disposable sessions.
+    const retained = await this.dependencies.options.jacocoArtifactsService.readTaskResultCoverageRollback(task.moduleDisplayPath, taskId);
+    if (retained && task.coverageBaseline && Object.keys(task.coverageBaseline).some(key => (
+      retained.coverage[key as keyof ExactCoverageCounts] !== task.coverageBaseline![key as keyof ExactCoverageCounts]
+    ))) throw new Error('Retained coverage does not match the task rollback baseline.');
+    await this.resetPrepared(resources);
+    const restored = retained
+      ? await this.dependencies.options.jacocoArtifactsService.restoreTaskResultCoverage(task.moduleDisplayPath, taskId)
+      : null;
     await resources.transaction.revoke(taskId, {
       protectedFilePaths: resources.acceptedArtifacts.map((artifact) => artifact.filePath)
     });
@@ -2512,6 +2872,8 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     resources.batchGenerator = null;
     resources.loggingPromise = null;
     resources.coverageArtifactSha256ById.clear();
+    resources.restoredCoverageCatalog = restored?.catalog ? detached(restored.catalog) : null;
+    resources.restoredCoverageReport = restored?.pair ?? null;
     const latest = this.dependencies.registry.snapshot(taskId);
     await this.dependencies.registry.save({
       ...latest,
@@ -2521,6 +2883,12 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coverageContributions: [],
       updatedAt: this.now()
     });
+    if (restored) {
+      await this.cleanupHandledCoverageRollback(task);
+      if (restored.catalog) this.dependencies.options.onMethodCatalogChanged?.({
+        workspaceRoot: task.workspaceRoot, catalog: detached(restored.catalog)
+      });
+    }
     return this.requireResult(taskId, resources);
   }
 
@@ -2546,7 +2914,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     resources.batchGenerator = null;
     resources.coverageArtifactSha256ById.clear();
     if (recalculated) {
-      this.updatePreparedCoverage(resources, recalculated.pair, recalculated.catalog);
+      this.updatePreparedCoverage(resources, recalculated);
       await this.persistCoverage(
         resources,
         recalculated.coverage.counts,
@@ -2558,13 +2926,26 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
         ...latest,
         generatedArtifacts: uniqueArtifacts(resources.acceptedArtifacts),
         coveredMethodIds: [],
-        coverageCurrent: detached(task.coverageBaseline!),
+        coverageCurrent: detached(task.coverageBaseline),
         coverageContributions: [],
         completionAttentionPending: false,
         updatedAt: this.now()
       });
     }
     return this.requireResult(task.id, resources);
+  }
+
+  private async cleanupHandledCoverageRollback(task: ClassTaskSnapshot, force = false): Promise<void> {
+    try {
+      await this.dependencies.options.jacocoArtifactsService.discardTaskResultCoverageRollback(
+        task.moduleDisplayPath, task.id, { force }
+      );
+    } catch (error) {
+      // The result is already committed. A Windows file lock must not turn a
+      // successful accept/revoke into an apparent failure; keep files for retry.
+      const code = error && typeof error === 'object' && 'code' in error ? error.code : 'UNKNOWN_ERROR';
+      console.warn('[class-task] Coverage rollback cleanup deferred', task.id, code);
+    }
   }
 
   async retryClassPreload(taskId: string): Promise<void> {
@@ -2706,10 +3087,9 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       qualifiedClassName: initialTask.qualifiedClassName,
       targetFilePath: initialTask.sourceFilePath
     };
-    let classPair = await this.dependencies.preload.prepareClassReport(
-      classReportRequest,
-      signal
-    );
+    let classPair = preparation.forceCoverageRefresh
+      ? await this.dependencies.preload.refreshClassReport(classReportRequest, signal)
+      : await this.dependencies.preload.prepareClassReport(classReportRequest, signal);
     throwIfAborted(signal);
 
     const planned = await this.dependencies.options.testWriterService
@@ -2826,32 +3206,61 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       };
 
       let initializedHere = false;
+      let preparedJacocoContext = jacocoContext;
       try {
-        const baseline = await this.dependencies.jacoco.initialize(jacocoContext, signal);
-        resources.jacocoInitialized = true;
-        initializedHere = true;
-        let currentCounts = baseline.counts;
-        let contributions = this.dependencies.coverageLedger.contributions(taskId);
-        let currentPair = pair;
-        if (pendingArtifacts.length > 0) {
-          const recalculated = await this.dependencies.jacoco.recalculate(
-            jacocoContext,
-            pendingArtifacts,
-            signal
-          );
-          currentCounts = recalculated.coverage.counts;
-          contributions = recalculated.contributions;
-          currentPair = recalculated.pair;
+        const coverageArtifacts = pendingArtifacts.filter(shouldRefreshCoverageForArtifact);
+        const restored = coverageArtifacts.length > 0 && !preparation.forceCoverageRefresh
+          ? await this.dependencies.jacoco.tryRestoreCurrent(
+              jacocoContext,
+              coverageArtifacts,
+              initialTask.coverageCurrent,
+              signal
+            )
+          : null;
+        let currentCounts: ExactCoverageCounts;
+        let contributions: ClassTaskSnapshot['coverageContributions'];
+        let currentPair: JacocoArtifactPair;
+        if (restored) {
+          resources.jacocoInitialized = true;
+          initializedHere = true;
+          preparedJacocoContext = restored.context;
+          currentCounts = restored.coverage.counts;
+          contributions = restored.contributions;
+          currentPair = restored.pair;
           catalog = toClassMethodCatalog(
             taskId,
-            recalculated.catalog,
+            restored.catalog,
             this.now(),
             classPair.fingerprint
           );
+        } else {
+          const baseline = await this.dependencies.jacoco.initialize(jacocoContext, signal);
+          resources.jacocoInitialized = true;
+          initializedHere = true;
+          currentCounts = baseline.counts;
+          contributions = this.dependencies.coverageLedger.contributions(taskId);
+          currentPair = pair;
+          if (pendingArtifacts.length > 0) {
+            const recalculated = await this.dependencies.jacoco.recalculate(
+              jacocoContext,
+              pendingArtifacts,
+              signal
+            );
+            currentCounts = recalculated.coverage.counts;
+            contributions = recalculated.contributions;
+            currentPair = recalculated.pair;
+            preparedJacocoContext = recalculated.context;
+            catalog = toClassMethodCatalog(
+              taskId,
+              recalculated.catalog,
+              this.now(),
+              classPair.fingerprint
+            );
+          }
         }
         replaceCoverageArtifactVersions(
           resources,
-          pendingArtifacts.filter(shouldRefreshCoverageForArtifact)
+          coverageArtifacts
         );
         resources.prepared = {
           fingerprint: classPair.fingerprint,
@@ -2866,7 +3275,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
           catalog,
           buildSettings: build.settings,
           buildToolchain: build.toolchain,
-          jacoco: jacocoContext,
+          jacoco: preparedJacocoContext,
           excludedEnvironmentVariables: build.excludedEnvironmentVariables
         };
         await this.persistCoverage(resources, currentCounts, contributions);
@@ -2876,7 +3285,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       } catch (error) {
         if (initializedHere) {
           try {
-            await this.dependencies.jacoco.remove(jacocoContext);
+            await this.dependencies.jacoco.remove(preparedJacocoContext);
           } catch {
             // The original preparation failure remains the actionable error.
           }
@@ -3043,6 +3452,8 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       logs: resources.logs,
       ragIndexCoordinator: this.dependencies.options.ragIndexCoordinator,
       ragIndexRefreshWaitMilliseconds: this.dependencies.options.ragIndexWaitMilliseconds,
+      methodGenerationWaveProgressTimeoutMilliseconds:
+        this.dependencies.options.methodGenerationWaveProgressTimeoutMilliseconds,
       publishedWaveRecovery: {
         restore: (input) => this.restorePublishedWaveBundle(resources, input)
       },
@@ -3084,6 +3495,28 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       merger: this.dependencies.bundleMerger,
       excludedEnvironmentVariables: prepared.excludedEnvironmentVariables,
       idFactory: this.dependencies.idFactory
+      ,onBeforeFormalVerification: async artifact => {
+        const cp = await this.dependencies.checkpoints.fullSourceProgress(task.id);
+        if (!cp?.candidate || !cp.managedFile || cp.publication?.phase === 'VERIFIED') return;
+        await this.dependencies.checkpoints.saveFullSourceProgress(task.id, { ...cp, publication: {
+          phase: 'PREPARED', candidateId: cp.candidate.candidateId, candidateSha256: cp.managedFile.sha256,
+          formalPath: artifact.filePath, formalSha256: artifact.sha256, startedAt: this.now() } });
+      },
+      onFormalVerified: async (artifact, execution) => {
+        const cp = await this.dependencies.checkpoints.fullSourceProgress(task.id);
+        if (!cp?.batch || !cp.publication || cp.publication.phase === 'VERIFIED') return;
+        if (cp.publication.formalPath !== artifact.filePath || cp.publication.formalSha256 !== artifact.sha256
+          || !cp.execution || cp.execution.status !== 'passed') throw new Error('完整源码正式验证身份不符。');
+        const code = await this.dependencies.options.testWriterService.loadOwnedGeneratedTest({ workspaceRoot: task.workspaceRoot,
+          filePath: artifact.filePath, expectedSha256: artifact.sha256 });
+        const methodOutcomes = attributeFullSourceResults(cp.batch.facts, code, cp.execution, execution,
+          { retainedFailureMembers: cp.stableRepair.annotatedMemberIds, deletedTests: cp.deletedTests });
+        if (methodOutcomes.reduce((n, m) => n + m.passedTestNames.length, 0) !== artifact.ordinaryTestMethodCount) {
+          throw new Error('正式源包含未保留目标执行或断言的测试，不能计为通过。');
+        }
+        await this.dependencies.checkpoints.saveFullSourceProgress(task.id, { ...cp,
+          publication: { ...cp.publication, phase: 'VERIFIED' }, methodOutcomes });
+      }
     });
     return resources.packer;
   }
@@ -3231,7 +3664,11 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       ? findPublishedWaveArtifact(
           pendingArtifacts,
           waveProgress.activeWave.methodId,
-          waveProgress.activeWave.waveIndex
+          waveProgress.activeWave.waveIndex,
+          Object.values(waveProgress.candidates).filter((candidate) => (
+            candidate.methodId === waveProgress.activeWave?.methodId
+            && candidate.waveId === waveProgress.activeWave.waveId
+          )).map((candidate) => candidate.candidateId)
         )
       : null;
     const managedActiveWaveCandidate = waveProgress.activeWave
@@ -3241,6 +3678,15 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
           && (candidate.managedFile !== null || candidate.moveTransaction !== null)
         )) ?? null
       : null;
+    const rebuildableActiveWaveCandidate = waveProgress.activeWave?.startRequest
+      && (waveProgress.activeWave.waveSessionId || waveProgress.activeWave.recoveryRequestId)
+      && Object.values(waveProgress.candidates).some((candidate) => (
+        candidate.methodId === waveProgress.activeWave?.methodId
+        && candidate.waveId === waveProgress.activeWave.waveId
+        && (candidate.status === 'PASSED' || candidate.status === 'MODEL_REPAIR')
+        && candidate.stableRepair.phase === 'NOT_STARTED'
+        && candidate.managedFile === null && candidate.moveTransaction === null
+      ));
     for (const candidate of Object.values(waveProgress.candidates)) {
       if (
         publishedActiveWave
@@ -3253,7 +3699,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
         requireFile(candidate.managedFile.path, candidate.managedFile.sha256);
       }
     }
-    if (!publishedActiveWave && !managedActiveWaveCandidate) {
+    if (!publishedActiveWave && !managedActiveWaveCandidate && !rebuildableActiveWaveCandidate) {
       for (const part of waveProgress.activeWave?.parts ?? []) {
         if (part.status === 'SUCCEEDED' && part.isolatedFilePath && part.fileSha256) {
           requireFile(part.isolatedFilePath, part.fileSha256);
@@ -3404,14 +3850,19 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coverageContributions: detached(contributions),
       updatedAt: this.now()
     });
+    this.dependencies.options.onMethodCatalogChanged?.({
+      workspaceRoot: task.workspaceRoot,
+      catalog: detached(this.requirePrepared(resources).catalog)
+    });
   }
 
   private updatePreparedCoverage(
     resources: ProductionTaskResources,
-    pair: JacocoArtifactPair,
-    catalog: MethodCatalogResponse
+    refreshed: Pick<TaskJacocoRefreshResult, 'context' | 'pair' | 'catalog'>
   ): void {
     const prepared = this.requirePrepared(resources);
+    const { context, pair, catalog } = refreshed;
+    prepared.jacoco = context;
     prepared.pair = { ...pair };
     prepared.analysis = { ...prepared.analysis, reportPairId: pair.pairId };
     prepared.analysisInput = {
@@ -3450,7 +3901,10 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
           }
         }, signal);
       } catch (error) {
-        if (!isRecoverableAnalysisSessionError(error)) throw error;
+        if (!isRecoverableAnalysisSessionError(error)
+          || recoverableSessionRetryIndex >= MAX_ANALYSIS_SESSION_CREATION_RECOVERY_RETRIES) {
+          throw error;
+        }
         if (signal) throwIfAborted(signal);
         await waitForAnalysisResponseTimeoutRetry(
           recoverableSessionRetryIndex,
@@ -3484,6 +3938,12 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
         if (signal) throwIfAborted(signal);
         if (!await this.dependencies.options.aiClient.isJavaAnalyzerHealthy(signal)) {
           throw error;
+        }
+        if (timeoutRetryIndex >= MAX_ANALYSIS_TRANSIENT_RESPONSE_RETRIES) {
+          throw new MethodAnalysisRequestError(
+            'ANALYSIS_SESSION_UNRESPONSIVE',
+            'Java Analyzer 连续重试后仍未响应，正在恢复分析会话。'
+          );
         }
         await waitForAnalysisResponseTimeoutRetry(
           timeoutRetryIndex,
@@ -3554,16 +4014,18 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
   }
 
   private async resetPrepared(resources: ProductionTaskResources): Promise<void> {
-    if (resources.preparationReset) await resources.preparationReset;
-    const reset = this.doResetPrepared(resources);
+    const reset = (resources.preparationReset ?? Promise.resolve())
+      .then(() => this.doResetPrepared(resources));
     const trackedReset = reset.finally(() => {
       if (resources.preparationReset === trackedReset) resources.preparationReset = null;
     });
     resources.preparationReset = trackedReset;
-    await resources.preparationReset;
+    await trackedReset;
   }
 
   private async doResetPrepared(resources: ProductionTaskResources): Promise<void> {
+    resources.restoredCoverageCatalog = null;
+    resources.restoredCoverageReport = null;
     resources.preparation?.controller.abort(new ModulePreloadRetriedError());
     await Promise.allSettled([
       resources.preparation?.promise ?? Promise.resolve(),
@@ -3597,8 +4059,11 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     try {
       return await waitForSharedPreparation(preparation.promise, signal);
     } catch (error) {
-      if (!isModulePreloadRetriedError(error) || signal?.aborted) throw error;
-      await (resources.preparationReset ?? Promise.resolve());
+      // Child-process cancellation can wrap the reason in AbortError or replace
+      // it with CommandCancelledError. The owned signal identifies an internal reset.
+      const internallyRetried = isModulePreloadRetriedError(error)
+        || isModulePreloadRetriedError(preparation.controller.signal.reason);
+      if (!internallyRetried || signal?.aborted) throw error;
       return this.prepare(taskId, signal);
     }
   }
@@ -3607,9 +4072,6 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     task: ClassTaskSnapshot,
     resources: ProductionTaskResources
   ): Promise<ClassTaskResultSnapshot> {
-    if (!task.coverageBaseline || !task.coverageCurrent) {
-      throw new Error('The class task has no exact coverage result.');
-    }
     const currentArtifacts = resources.transaction.artifacts(task.id);
     const waveProgress = await this.dependencies.checkpoints.taskWaveProgress(task.id);
     const methodProgress = Object.values(waveProgress.methods);
@@ -3629,8 +4091,9 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coverageBaseline: detached(task.coverageBaseline),
       coverageCurrent: detached(task.coverageCurrent),
       coverageContributions: detached(task.coverageContributions),
-      canAccept: currentArtifacts.length > 0,
-      canRevoke: currentArtifacts.length > 0
+      ...(resources.restoredCoverageCatalog ? { restoredMethodCatalog: detached(resources.restoredCoverageCatalog) } : {}),
+      canAccept: canHandleClassTaskResult(task.state) && currentArtifacts.length > 0,
+      canRevoke: canHandleClassTaskResult(task.state) && currentArtifacts.length > 0
     };
   }
 
@@ -3759,14 +4222,18 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       prepared: null,
       preparation: null,
       preparationReset: null,
+      restart: null,
       ownedAnalysisSessionIds: new Set(),
       packer: null,
       generator: null,
       batchGenerator: null,
       logs: new MethodGenerationLogService(),
       loggingPromise: null,
+      fullSourceRelease: null,
       jacocoInitialized: false,
       coverageArtifactSha256ById: new Map(),
+      restoredCoverageCatalog: null,
+      restoredCoverageReport: null,
       ragSubscription: null,
       ragRunContext: undefined,
       ragTaskRun: undefined,
@@ -3886,6 +4353,7 @@ export function shouldPreserveFailedRunWaveCheckpoint(
   if (Object.values(wave.candidates).some((candidate) => (
     !completedMethodIds.has(candidate.methodId)
       && candidate.status !== 'BLOCKED'
+      && candidate.status !== 'QUARANTINED'
   ))) {
     return true;
   }
@@ -4003,15 +4471,18 @@ export function createProductionClassTaskRuntime(
     broadcast: options.broadcast,
     clock
   });
+  const moduleLock = new ModuleOperationLock();
   const checkpoints = new ClassTaskCheckpointService({
     storagePath: join(options.storageDirectory, 'class-task-checkpoints-v2.json'),
     taskState: registry,
-    clock
+    clock,
+    canDrainBackgroundOperations: (taskId) => !moduleLock.isLocked(
+      registry.snapshot(taskId).moduleKey
+    )
   });
   const preloadCache = new ModulePreloadCacheStore(
     join(options.storageDirectory, 'module-preload-cache-v1.json')
   );
-  const moduleLock = new ModuleOperationLock();
   const preload = new ModulePreloadCoordinator({
     identityService: identity,
     fingerprintService: fingerprint,
@@ -4189,18 +4660,23 @@ function uniqueArtifacts(
 function findPublishedWaveArtifact(
   artifacts: readonly GeneratedClassTaskArtifact[],
   methodId: string,
-  waveIndex: number
+  waveIndex: number,
+  sourceBatchIds: readonly string[]
 ): {
   artifact: GeneratedClassTaskArtifact;
   methodResult: NonNullable<GeneratedClassTaskArtifact['methodResults']>[number];
 } | null {
   if (!methodId.trim() || !Number.isSafeInteger(waveIndex) || waveIndex < 1) return null;
-  let occurrence = 0;
+  if (sourceBatchIds.length === 0) return null;
+  const expectedIds = new Set(sourceBatchIds);
   for (const artifact of artifacts) {
     for (const methodResult of artifact.methodResults ?? []) {
-      if (methodResult.methodId !== methodId) continue;
-      occurrence += 1;
-      if (occurrence === waveIndex) return { artifact, methodResult };
+      if (methodResult.methodId === methodId
+        && methodResult.waveIndex === waveIndex
+        && methodResult.sourceBatchIds?.length === expectedIds.size
+        && methodResult.sourceBatchIds.every((id) => expectedIds.has(id))) {
+        return { artifact, methodResult };
+      }
     }
   }
   return null;
@@ -4400,6 +4876,7 @@ function isRecoverableAnalysisSessionError(error: unknown): boolean {
     && (
       error.code === 'ANALYSIS_SESSION_CANCELLED'
       || error.code === 'ANALYSIS_SESSION_NOT_FOUND'
+      || error.code === 'ANALYSIS_SESSION_UNRESPONSIVE'
     );
 }
 
@@ -4408,11 +4885,18 @@ function shouldCleanupWaveScratchOnRelease(task: ClassTaskSnapshot): boolean {
   if (task.state !== 'FAILED') return false;
   const code = task.lastError?.code ?? '';
   if (code === 'MODEL_NO_FORMAL_TEST_FILE_GENERATED') return true;
-  if (code.startsWith('MODEL_') || isRetryableCoverageArtifactTaskError(task.lastError)) {
+  // RAG configuration/session failures do not invalidate generated test source.
+  // Preserve it just like a provider failure so retry can resume the same Wave.
+  if (code.startsWith('MODEL_') || code.startsWith('RAG_')
+    || isRetryableCoverageArtifactTaskError(task.lastError)) {
     return false;
   }
+  if (code === 'METHOD_GENERATION_PROJECT_BLOCKED') return false;
+  if (code === 'TASK_JACOCO_MAVEN_FAILED') return false;
+  if (code === 'METHOD_GENERATION_TEST_RENAME_UNSAFE') return false;
   return code !== 'ANALYSIS_SESSION_CANCELLED'
-    && code !== 'ANALYSIS_SESSION_NOT_FOUND';
+    && code !== 'ANALYSIS_SESSION_NOT_FOUND'
+    && code !== 'ANALYSIS_SESSION_UNRESPONSIVE';
 }
 
 function isAnalysisCapacityError(error: unknown): boolean {

@@ -234,7 +234,7 @@ function fieldNamesFromDeclaration(declaration: string): string[] {
     /@(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*(?:\s*\([^)]*\))?/g,
     ' '
   );
-  if (/\b(?:class|record|interface|enum)\b/.test(withoutAnnotations)) {
+  if (/\b(?:class|record|interface|enum)\s+[A-Za-z_$][\w$]*/.test(withoutAnnotations)) {
     return [];
   }
   const parts = splitTopLevel(withoutAnnotations.slice(0, -1), ',');
@@ -286,7 +286,8 @@ const JAVA_NON_FIELD_WORDS = new Set([
 ]);
 
 export function sanitizeJava(code: string): string {
-  const output = [...code];
+  // Scanner offsets use UTF-16 code units, including both halves of surrogate pairs.
+  const output = code.split('');
   let index = 0;
   const blank = (position: number): void => {
     if (output[position] !== '\n' && output[position] !== '\r') {

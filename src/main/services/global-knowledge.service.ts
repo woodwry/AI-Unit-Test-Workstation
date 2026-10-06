@@ -4,10 +4,56 @@ import { basename, extname, isAbsolute, join, relative, sep } from 'node:path';
 import type { AiClient } from './ai-client';
 import {
   resolveRagEmbeddingModelFingerprint,
+  type RagRepairContext,
+  type RagEmbeddingModelContext,
+  type RagMethodSelector,
   type RagSourceSnapshotPage
 } from './rag-index-contract.ts';
 import type { GlobalKnowledgeRequest } from '../../shared/rag-knowledge-contracts';
 import type { RagEmbeddingInterfacesService } from './rag-embedding-interfaces.service';
+
+export async function lookupGlobalRepairKnowledge(input: {
+  context: RagRepairContext;
+  embeddingContext: RagEmbeddingModelContext;
+  requestedFqns: string[];
+  requestedMethods: RagMethodSelector[];
+  signal?: AbortSignal;
+}, aiClient: Pick<AiClient, 'globalKnowledge'>): Promise<{
+  missingFqns: string[]; missingMethods: RagMethodSelector[];
+}> {
+  if (!input.context.activeIndex) throw new TypeError('RAG active scope is required.');
+  const result = await aiClient.globalKnowledge({
+    action: 'lookup', scopeId: input.context.activeIndex.scopeId,
+    embeddingModelFingerprint: resolveRagEmbeddingModelFingerprint(input.embeddingContext.embeddingConfig),
+    requestedFqns: input.requestedFqns, requestedMethods: input.requestedMethods
+  }, undefined, input.signal);
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw new TypeError('RAG knowledge lookup response is invalid.');
+  }
+  const value = result as Record<string, unknown>;
+  if (Object.keys(value).some(key => key !== 'missingFqns' && key !== 'missingMethods')
+    || !Array.isArray(value.missingFqns) || !Array.isArray(value.missingMethods)) {
+    throw new TypeError('RAG knowledge lookup response is invalid.');
+  }
+  const missingFqns = value.missingFqns as unknown[];
+  if (missingFqns.some(fqn => typeof fqn !== 'string' || !input.requestedFqns.includes(fqn))) {
+    throw new TypeError('RAG knowledge lookup returned unrequested classes.');
+  }
+  const missingMethods: RagMethodSelector[] = [];
+  for (const raw of value.missingMethods) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+      || Object.keys(raw).some(key => !['ownerFqn','methodName','descriptor','sourceLine'].includes(key))) {
+      throw new TypeError('RAG knowledge lookup returned invalid methods.');
+    }
+    const item = raw as Record<string, unknown>;
+    const original = input.requestedMethods.find(method => method.ownerFqn === item.ownerFqn
+      && method.methodName === item.methodName && method.descriptor === item.descriptor
+      && method.sourceLine === item.sourceLine);
+    if (!original) throw new TypeError('RAG knowledge lookup returned an unrequested method.');
+    missingMethods.push({ ...original });
+  }
+  return { missingFqns: [...new Set(missingFqns as string[])], missingMethods };
+}
 
 export async function executeGlobalKnowledge(raw: unknown, options: {
   aiClient: Pick<AiClient, 'globalKnowledge'>;

@@ -3,8 +3,31 @@ import test from 'node:test';
 
 import {
   buildCoverageView,
-  presentClassTaskResultDuringAction
+  presentClassTaskResultDuringAction,
+  resolveClassTaskResultStatus
 } from '../src/renderer/src/class-tasks/coverage-view.ts';
+
+test('a READY result with an unhandled artifact is labelled pending', () => {
+  assert.equal(resolveClassTaskResultStatus('READY', true).label, '待处理');
+  assert.equal(resolveClassTaskResultStatus('READY', false).label, '待执行');
+});
+
+test('missing coverage displays unavailable metrics without inventing percentages', () => {
+  for (const missing of [
+    { coverageBaseline: null },
+    { coverageCurrent: null },
+    { coverageBaseline: null, coverageCurrent: null }
+  ]) {
+    const view = buildCoverageView(resultSnapshot(missing));
+    for (const metric of [view.lines, view.branches]) {
+      assert.equal(metric.available, false);
+      assert.equal(metric.currentLabel, '--');
+      assert.equal(metric.originalLabel, '--');
+      assert.equal(metric.addedLabel, '--');
+      assert.deepEqual(metric.contributions, []);
+    }
+  }
+});
 
 test('line and branch segments retain exact totals and formatted percentages sum to 100', () => {
   const view = buildCoverageView(resultSnapshot());

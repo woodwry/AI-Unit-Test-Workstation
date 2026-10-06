@@ -233,6 +233,7 @@ export type ModelInterfaceConnectionTestRequest = {
   credentialMode: ModelInterfaceCredentialMode;
   environmentVariableName?: string;
   apiKey?: string;
+  requestParameters?: ModelRequestParameters;
 };
 
 export type ModelInterfaceConnectionTestResult = {
@@ -240,6 +241,10 @@ export type ModelInterfaceConnectionTestResult = {
   code:
     | 'success'
     | 'invalid_configuration'
+    | 'invalid_request'
+    | 'invalid_response'
+    | 'quota_exhausted'
+    | 'rate_limited'
     | 'authentication_failed'
     | 'not_found'
     | 'unsupported'

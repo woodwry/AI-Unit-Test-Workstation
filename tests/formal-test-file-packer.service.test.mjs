@@ -620,6 +620,30 @@ test('restores completed Wave identities and accepts the next Wave without mergi
   );
 });
 
+for (const legacy of [true, false]) {
+  test(`a restored ${legacy ? 'legacy' : 'identified'} Wave permits a new run candidate with the same ordinal`, async (t) => {
+    // A reset method Wave ordinal is not a duplicate publication when its verified
+    // source candidate differs. Restoring old artifacts must preserve both files.
+    const { packer, makePacker, workspaceRoot } = await harness(t, 'formal-pack-new-run-wave-');
+    await packer.append(waveBundle(1, 1, 25, true));
+    const artifacts = packer.artifacts();
+    const oldCode = await readFile(artifacts[0].filePath, 'utf8');
+    if (legacy) {
+      delete artifacts[0].methodResults[0].waveIndex;
+      delete artifacts[0].methodResults[0].sourceBatchIds;
+    }
+    const restored = new ClassTaskFileTransactionService({ writer: new TestWriterService() });
+    await restored.restoreTask({ taskId: TASK_ID, workspaceRoot, artifacts });
+    const restarted = makePacker(restored);
+    const current = { ...waveBundle(1, 1, 6, false), sourceBatchIds: ['new-run-candidate'] };
+    await restarted.append(current);
+    assert.deepEqual(restarted.artifacts().map((artifact) => artifact.ordinaryTestMethodCount), [25, 6]);
+    assert.equal(await readFile(artifacts[0].filePath, 'utf8'), oldCode);
+    assert.deepEqual(restarted.artifacts()[1].methodResults[0].sourceBatchIds, ['new-run-candidate']);
+    await assert.rejects(restarted.append(current), /identity.*duplicated/);
+  });
+}
+
 test('restores split Waves when historical JaCoCo display order drifted', async (t) => {
   const { packer, makePacker, workspaceRoot } = await harness(
     t,

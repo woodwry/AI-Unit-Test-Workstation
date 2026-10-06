@@ -657,7 +657,7 @@ test('method refresh relinquishes a modified unaccepted result and keeps the use
   assert.ok((await harness.listGeneratedTestFiles()).includes('AlphaService1Test.java'));
 });
 
-test('a failed class Wave publication deletes TMP scratch and retries from a fresh run', async (t) => {
+test('a failed class Wave publication restores its passed candidate after TMP cleanup', async (t) => {
   const harness = await createClassTaskEndToEndHarness({
     methodsPerClass: 2,
     expectedModelCalls: 1,
@@ -679,16 +679,16 @@ test('a failed class Wave publication deletes TMP scratch and retries from a fre
   assert.equal(result.modelCallCountAfterFailure, 1);
 
   assert.equal(result.second.state, 'COMPLETED');
-  assert.equal(result.agentRequests.length, 2, 'retry must freshly generate the class Wave');
+  assert.equal(result.agentRequests.length, 1, 'retry must reuse the verified class Wave');
   assert.equal(
     result.second.modelCallCount,
-    2,
-    'a failed retry with a different model must retain calls from the previous attempt'
+    1,
+    'restoring a passed candidate must retain the original model call count'
   );
   assert.equal(
     result.second.usageReportedCallCount,
-    2,
-    'reported usage from every model configuration must remain cumulative'
+    1,
+    'restoring a passed candidate must not report duplicate model usage'
   );
   assert.deepEqual(
     result.testFiles.filter((name) => /^AlphaService/.test(name)),
@@ -708,7 +708,7 @@ test('a failed class Wave publication deletes TMP scratch and retries from a fre
   );
 });
 
-test('running a failed task refreshes after terminal cleanup removed its TMP scratch', async (t) => {
+test('running a failed task restores durable Wave evidence after TMP cleanup', async (t) => {
   const states = [];
   const harness = await createClassTaskEndToEndHarness({
     methodsPerClass: 2,
@@ -731,8 +731,9 @@ test('running a failed task refreshes after terminal cleanup removed its TMP scr
 
   assert.equal(refreshed.state, 'COMPLETED', JSON.stringify(refreshed.lastError));
   assert.equal(refreshed.lastError, null);
-  assert.ok(states.slice(refreshStateOffset).includes('PRELOADING'));
-  assert.ok(states.slice(refreshStateOffset).includes('READY'));
+  assert.ok(states.slice(refreshStateOffset).includes('RUNNING'));
+  assert.equal(states.slice(refreshStateOffset).includes('PRELOADING'), false);
+  assert.deepEqual(refreshed.methodOrder, first.snapshot.methodOrder);
   assert.deepEqual(
     (await harness.listGeneratedTestFiles()).filter((name) => /^AlphaService/.test(name)),
     ['AlphaService1Test.java']

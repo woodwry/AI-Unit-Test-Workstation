@@ -23,6 +23,7 @@ import {
   validateStartMethodGenerationWaveRequest,
   validateRecoverMethodGenerationRequest,
   type MethodGenerationFailure,
+  type MethodGenerationModelCall,
   type MethodCandidate,
   type StartMethodGenerationSessionRequest,
   type StartMethodGenerationWaveRequest
@@ -32,6 +33,10 @@ import type {
   SingleMethodWorkWave
 } from './method-analysis-contract.ts';
 import { sanitizePublicText } from './maven-command.ts';
+import { resolveExecutionMode, newFullSourceCheckpoint, validateFullSourceIdentity,
+  validateFullSourceCheckpoint, assertFullSourceTransition,
+  type ClassTaskExecutionMode, type FullSourceRunCheckpoint, type FullSourceFrozenIdentity
+} from './full-source-checkpoint.ts';
 
 const NEWER_MODEL_TOOL_WAVE_FIELDS = new Set([
   'deferredScenarioIds',
@@ -99,6 +104,8 @@ export type ClassTaskRunCheckpoint = {
   completedMethodIds: string[];
   methods: Record<string, MethodExecutionCheckpoint>;
   ragRun: ClassTaskRagRunCheckpoint | null;
+  executionMode?: ClassTaskExecutionMode;
+  fullSource?: FullSourceRunCheckpoint;
 };
 
 export type MethodWavePartCheckpoint = {
@@ -161,7 +168,8 @@ export type WaveCandidateCheckpoint = {
     | 'MODEL_REPAIR'
     | 'STABLE_REPAIR'
     | 'PASSED'
-    | 'BLOCKED';
+    | 'BLOCKED'
+    | 'QUARANTINED';
   llmRepairAttemptsUsed: number;
   repairAttemptLimit: number | null;
   unlimitedRepair: boolean;
@@ -234,6 +242,7 @@ export type ClassTaskCheckpointServiceOptions = {
   storagePath: string;
   taskState: ClassTaskStatePersistencePort;
   clock?: () => Date;
+  canDrainBackgroundOperations?: (taskId: string) => boolean;
 };
 
 export type PrepareClassTaskRunOptions = {
@@ -242,6 +251,7 @@ export type PrepareClassTaskRunOptions = {
   catalogIdentity?: ClassTaskCatalogIdentity;
   resolvedMethodOrder?: readonly string[];
   completedMethodIdsFromArtifacts?: readonly string[];
+  requireWaveCompletionEvidence?: boolean;
 };
 
 type ClassTaskBackgroundBoundaryOperation = {
@@ -564,6 +574,7 @@ export class ClassTaskRegistryStateAdapter implements ClassTaskStatePersistenceP
 export class ClassTaskCheckpointService {
   private readonly store: AtomicJsonStore<CheckpointStoreFile>;
   private readonly taskState: ClassTaskStatePersistencePort;
+  private readonly canDrainBackgroundOperations: (taskId: string) => boolean;
   private readonly clock: () => Date;
   private readonly taskQueues = new Map<string, Promise<void>>();
   private readonly backgroundBoundaryOperations = new Map<
@@ -575,6 +586,7 @@ export class ClassTaskCheckpointService {
   constructor(options: ClassTaskCheckpointServiceOptions) {
     if (!options.storagePath.trim()) throw new TypeError('Checkpoint storage path cannot be empty.');
     this.taskState = options.taskState;
+    this.canDrainBackgroundOperations = options.canDrainBackgroundOperations ?? (() => true);
     this.clock = options.clock ?? (() => new Date());
     this.store = new AtomicJsonStore(
       options.storagePath,
@@ -598,13 +610,109 @@ export class ClassTaskCheckpointService {
     return detached((file.tasks[taskId] ?? emptyTaskCheckpoint()).waveState);
   }
 
+  async executionModeForRun(taskId: string): Promise<ClassTaskExecutionMode> {
+    const file = await this.store.read();
+    return resolveExecutionMode(this.snapshot(taskId), file.tasks[taskId] ?? {});
+  }
+
+  async fullSourceProgress(taskId: string): Promise<FullSourceRunCheckpoint | null> {
+    requireIdentifier(taskId, 'taskId');
+    const file = await this.store.read();
+    return detached(file.tasks[taskId]?.fullSource ?? null);
+  }
+
+  async prepareFullSourceRun(taskId: string, frozenIdentity: FullSourceFrozenIdentity): Promise<FullSourceRunCheckpoint> {
+    requireIdentifier(taskId, 'taskId');
+    const identity = validateFullSourceIdentity(frozenIdentity);
+    return this.enqueueTask(taskId, async () => {
+      const publicTask = this.snapshot(taskId);
+      const file = await this.store.update(current => {
+        const task = detached(current.tasks[taskId] ?? emptyTaskCheckpoint());
+        if (resolveExecutionMode(publicTask, task) !== 'FULL_SOURCE') throw new Error('历史执行必须继续原生成协议。');
+        if (task.fullSource && JSON.stringify(task.fullSource.identity) !== JSON.stringify(identity)) {
+          throw new Error('完整源码执行的选择与分析身份已冻结。');
+        }
+        task.executionMode = 'FULL_SOURCE';
+        task.fullSource ??= newFullSourceCheckpoint(identity);
+        if (!current.tasks[taskId]?.fullSource && publicTask.modelCallCount != null && publicTask.usageReportedCallCount != null) {
+          task.fullSource.usageBaseline = { tokenUsage: publicTask.tokenUsage, modelCallCount: publicTask.modelCallCount,
+            usageReportedCallCount: publicTask.usageReportedCallCount };
+        }
+        task.catalogIdentity = { analysisSessionId: identity.analysisSessionId, reportPairId: identity.reportPairId };
+        task.resolvedMethodOrder = [...identity.methodIds];
+        return { ...current, tasks: { ...current.tasks, [taskId]: task } };
+      });
+      await this.savePublicTask({ ...publicTask, executionMode: 'FULL_SOURCE' });
+      return detached(file.tasks[taskId].fullSource!);
+    });
+  }
+
+  async saveFullSourceProgress(taskId: string, input: FullSourceRunCheckpoint): Promise<FullSourceRunCheckpoint> {
+    requireIdentifier(taskId, 'taskId');
+    const progress = validateFullSourceCheckpoint(input);
+    return this.enqueueTask(taskId, async () => {
+      const file = await this.store.update(current => {
+        const task = detached(current.tasks[taskId]);
+        if (!task?.fullSource || task.executionMode !== 'FULL_SOURCE') throw new Error('完整源码执行尚未准备。');
+        assertFullSourceTransition(task.fullSource, progress);
+        task.fullSource = detached(progress);
+        return { ...current, tasks: { ...current.tasks, [taskId]: task } };
+      });
+      return detached(file.tasks[taskId].fullSource!);
+    });
+  }
+
+  async recordFullSourceModelCall(taskId: string, call: MethodGenerationModelCall): Promise<FullSourceRunCheckpoint> {
+    requireIdentifier(taskId, 'taskId');
+    if (!['completed','failed','stopped'].includes(call.phase)) throw new TypeError('Only actual terminal calls count.');
+    return this.enqueueTask(taskId, async () => {
+      const file = await this.store.update(current => {
+        const task = detached(current.tasks[taskId]); const full = task?.fullSource;
+        if (!full?.batch || call.batchId !== full.batch.batchId || call.methodId !== full.batch.methodId) {
+          throw new TypeError('Full-source model call identity mismatch.');
+        }
+        if (!full.accountedModelCallIds.includes(call.callId)) {
+          full.accountedModelCallIds.push(call.callId);
+          full.modelUsage = { tokenUsage: mergeModelTokenUsage(full.modelUsage.tokenUsage, call.usage),
+            modelCallCount: full.modelUsage.modelCallCount + 1,
+            usageReportedCallCount: full.modelUsage.usageReportedCallCount + (call.usage ? 1 : 0) };
+          full.repairAttemptsUsed = Math.max(full.repairAttemptsUsed, call.repairAttempt);
+        }
+        return { ...current, tasks: { ...current.tasks, [taskId]: task } };
+      });
+      const cp = file.tasks[taskId].fullSource!;
+      // Reconcile absolute totals even for a replay after the two-file crash window.
+      if (cp.usageBaseline) await this.savePublicTask({ ...this.snapshot(taskId),
+        tokenUsage: mergeModelTokenUsage(cp.usageBaseline.tokenUsage, cp.modelUsage.tokenUsage),
+        modelCallCount: cp.usageBaseline.modelCallCount + cp.modelUsage.modelCallCount,
+        usageReportedCallCount: cp.usageBaseline.usageReportedCallCount + cp.modelUsage.usageReportedCallCount });
+      return detached(cp);
+    });
+  }
+
+  async commitFullSourceResults(taskId: string): Promise<void> {
+    await this.enqueueTask(taskId, async () => {
+      const file = await this.store.update(current => {
+        const task = detached(current.tasks[taskId]); const full = task?.fullSource;
+        if (!full?.completion || full.methodOutcomes.length !== full.identity.methodIds.length
+          || full.methodOutcomes.some(m => m.passedTestNames.length) && full.publication?.phase !== 'VERIFIED') {
+          throw new Error('完整源码完成缺少实际验证证据。');
+        }
+        task.completedMethodIds = [...full.identity.methodIds];
+        return { ...current, tasks: { ...current.tasks, [taskId]: task } };
+      });
+      await this.savePublicTask({ ...this.snapshot(taskId), currentMethodIndex: file.tasks[taskId].completedMethodIds.length - 1 });
+    });
+  }
+
   async hasResumableProgress(taskId: string): Promise<boolean> {
     requireIdentifier(taskId, 'taskId');
     const file = await this.store.read();
     const task = file.tasks[taskId];
     if (!task) return false;
     const wave = task.waveState;
-    return task.completedMethodIds.length > 0
+    return task.fullSource !== undefined
+      || task.completedMethodIds.length > 0
       || Object.keys(task.methods).length > 0
       || wave.activeMethodId !== null
       || wave.activeWave !== null
@@ -1175,16 +1283,36 @@ export class ClassTaskCheckpointService {
       const file = await this.store.update((current) => {
         const existing = current.tasks[taskId];
         const progress = options.reset ? emptyTaskCheckpoint() : detached(existing ?? emptyTaskCheckpoint());
+        if (progress.fullSource && catalogIdentity && resolvedMethodOrder) {
+          if (!sameStrings([...progress.fullSource.identity.methodIds], resolvedMethodOrder)
+            || progress.fullSource.identity.reportPairId !== catalogIdentity.reportPairId) {
+            throw new Error('完整源码恢复身份已冻结，不能转换为 Wave 执行。');
+          }
+          return { ...current, tasks: { ...current.tasks, [taskId]: progress } };
+        }
         if (catalogIdentity && resolvedMethodOrder) {
           const catalogChanged = progress.catalogIdentity !== null
             && progress.catalogIdentity.reportPairId !== catalogIdentity.reportPairId;
+          if (options.requireWaveCompletionEvidence) {
+            // A retained formal file proves some tests passed, not that every
+            // current class scenario was processed. Remove old artifact-only
+            // completion claims while retaining Wave/no-work and legacy checkpoints.
+            progress.completedMethodIds = progress.completedMethodIds.filter((methodId) => (
+              progress.waveState.methods[methodId]?.remainingScenarioCount === 0
+              || progress.methods[methodId] !== undefined
+            ));
+            const completed = new Set(progress.completedMethodIds);
+            progress.waveState.methodQueue = resolvedMethodOrder.filter((methodId) => (
+              !completed.has(methodId) && methodId !== progress.waveState.activeMethodId
+            ));
+          }
           reconcileCompletedMethodIdsFromArtifacts(
             progress,
             resolvedMethodOrder,
-            completedMethodIdsFromArtifacts
+            options.requireWaveCompletionEvidence ? [] : completedMethodIdsFromArtifacts
           );
           const completedActiveWave = catalogChanged && !options.reset
-            ? recoverableCompletedActiveWave(progress.waveState)
+            ? recoverableActiveWave(progress.waveState, resolvedMethodOrder)
             : null;
           if (catalogChanged) {
             const completed = new Set(progress.completedMethodIds);
@@ -1221,6 +1349,7 @@ export class ClassTaskCheckpointService {
         currentAtomicStep: 'IDLE',
         activeGenerationBatch: null,
         ...(options.reset ? {
+          executionMode: undefined,
           coveredMethodIds: [],
           coverageContributions: []
         } : {}),
@@ -1624,6 +1753,9 @@ export class ClassTaskCheckpointService {
   async drainBackgroundOperationsAtBoundary(taskId: string): Promise<void> {
     requireIdentifier(taskId, 'taskId');
     if (this.taskState.snapshot(taskId).currentAtomicStep !== 'IDLE') return;
+    // Result actions acquire the module lock for JaCoCo. An IDLE phase inside
+    // a Maven batch still owns that lock; drain at the next unlocked boundary.
+    if (!this.canDrainBackgroundOperations(taskId)) return;
     const currentDrain = this.backgroundBoundaryDrains.get(taskId);
     if (currentDrain) return currentDrain;
     let drain!: Promise<void>;
@@ -1727,7 +1859,9 @@ function legacyTaskCheckpoint(
     resolvedMethodOrder: [...checkpoint.resolvedMethodOrder],
     completedMethodIds: [...checkpoint.completedMethodIds],
     methods: detached(checkpoint.methods),
-    ragRun: detached(checkpoint.ragRun)
+    ragRun: detached(checkpoint.ragRun),
+    ...(checkpoint.executionMode ? { executionMode: checkpoint.executionMode } : {}),
+    ...(checkpoint.fullSource ? { fullSource: detached(checkpoint.fullSource) } : {})
   };
 }
 
@@ -1738,9 +1872,19 @@ function reconcileCompletedMethodIdsFromArtifacts(
 ): void {
   if (artifactMethodIds.length === 0) return;
   const published = new Set(artifactMethodIds);
+  const activeWave = progress.waveState.activeWave;
+  const hasUncommittedWaveWork = activeWave !== null && (
+    activeWave.parts.some((part) => part.status === 'SUCCEEDED' || part.status === 'RUNNING')
+    || Object.values(progress.waveState.candidates).some((candidate) => (
+      candidate.waveId === activeWave.waveId && candidate.managedFile !== null
+    ))
+  );
+  // Earlier files can cover a method without completing its current Wave.
+  // Its saved Parts/candidate must finish recovery before artifacts settle it.
+  const recoveringMethods = new Set(hasUncommittedWaveWork ? activeWaveMethodIds(activeWave) : []);
   const completed = new Set(progress.completedMethodIds);
   for (const methodId of resolvedMethodOrder) {
-    if (published.has(methodId)) completed.add(methodId);
+    if (published.has(methodId) && !recoveringMethods.has(methodId)) completed.add(methodId);
   }
   progress.completedMethodIds = resolvedMethodOrder.filter((methodId) => completed.has(methodId));
 
@@ -1752,6 +1896,7 @@ function reconcileCompletedMethodIdsFromArtifacts(
   const activeMethodIds = activeWaveMethodIds(progress.waveState.activeWave);
   if (
     progress.waveState.activeMethodId
+    && !hasUncommittedWaveWork
     && (
       reconciledCompleted.has(progress.waveState.activeMethodId)
       || activeMethodIds.some((methodId) => reconciledCompleted.has(methodId))
@@ -1793,7 +1938,7 @@ function reconcileChangedCatalogWaveProgress(
   previous: ClassTaskWaveCheckpoint,
   resolvedMethodOrder: readonly string[],
   completedMethodIds: readonly string[],
-  completedActiveWave: ReturnType<typeof recoverableCompletedActiveWave>
+  completedActiveWave: ReturnType<typeof recoverableActiveWave>
 ): ClassTaskWaveCheckpoint {
   const available = new Set(resolvedMethodOrder);
   const completed = new Set(completedMethodIds);
@@ -1847,8 +1992,9 @@ function reconcileChangedCatalogWaveProgress(
   };
 }
 
-function recoverableCompletedActiveWave(
-  wave: ClassTaskWaveCheckpoint
+function recoverableActiveWave(
+  wave: ClassTaskWaveCheckpoint,
+  resolvedMethodOrder: readonly string[]
 ): {
   methodId: string;
   activeWave: ActiveMethodWaveCheckpoint;
@@ -1858,38 +2004,24 @@ function recoverableCompletedActiveWave(
   const activeWave = wave.activeWave;
   const methodId = wave.activeMethodId;
   if (!activeWave || !methodId || activeWave.methodId !== methodId) return null;
-  if (!activeWave.parts.some((part) => part.status === 'SUCCEEDED')
-    || activeWave.parts.some((part) => (
-      part.status === 'PENDING' || part.status === 'RUNNING'
-    ))) {
+  const available = new Set(resolvedMethodOrder);
+  if (!activeWaveMethodIds(activeWave).every((id) => available.has(id))
+    || !activeWave.parts.some((part) => part.status === 'SUCCEEDED')) {
     return null;
   }
+  // A coverage report rebuilt after restart must not discard saved Parts while
+  // another Part is still generating or the merge has not been checkpointed yet.
+  // The normal recovery path validates their files and resumes only missing work.
   const completedCandidates = Object.values(wave.candidates).filter((candidate) => (
     candidate.methodId === methodId
     && candidate.waveId === activeWave.waveId
-    && candidate.moveTransaction === null
-    && (
-      candidate.status === 'PASSED'
-        ? candidate.managedFile === null || candidate.managedFile.location === 'PROJECT'
-        : candidate.managedFile !== null || isRebuildableZeroAttemptCandidate(candidate)
-    )
   ));
-  if (completedCandidates.length !== 1) return null;
   return {
     methodId,
     activeWave: detached(activeWave),
     method: detached(wave.methods[methodId] ?? emptyMethodWaveProgress()),
     candidateIds: completedCandidates.map((candidate) => candidate.candidateId)
   };
-}
-
-function isRebuildableZeroAttemptCandidate(candidate: WaveCandidateCheckpoint): boolean {
-  return candidate.status === 'MODEL_REPAIR'
-    && candidate.llmRepairAttemptsUsed === 0
-    && candidate.managedFile === null
-    && candidate.stableRepair.phase === 'NOT_STARTED'
-    && candidate.stableRepair.iteration === 0
-    && candidate.stableRepair.annotatedMemberIds.length === 0;
 }
 
 function completedMethodsInResolvedOrder(progress: ClassTaskRunCheckpoint): number {
@@ -1915,7 +2047,7 @@ function validateCheckpointStoreFile(value: unknown): CheckpointStoreFile {
   for (const [taskId, rawTask] of taskEntries) {
     requireIdentifier(taskId, 'taskId');
     const task = requireRecord(rawTask, 'task checkpoint');
-    requireExactFields(
+    requireFields(
       task,
       record.version === 5
         ? [
@@ -1925,6 +2057,7 @@ function validateCheckpointStoreFile(value: unknown): CheckpointStoreFile {
         : record.version === 4
         ? ['catalogIdentity', 'resolvedMethodOrder', 'completedMethodIds', 'methods', 'ragRun']
         : ['catalogIdentity', 'resolvedMethodOrder', 'completedMethodIds', 'methods'],
+      record.version === 5 ? ['executionMode','fullSource'] : [],
       'task checkpoint'
     );
     const catalogIdentity = task.catalogIdentity === null
@@ -2005,13 +2138,24 @@ function validateCheckpointStoreFile(value: unknown): CheckpointStoreFile {
               requireRecord(rawMethod, 'method checkpoint').inProgressBatch !== undefined
             ))
         );
+    if (task.executionMode !== undefined && task.executionMode !== 'FULL_SOURCE' && task.executionMode !== 'LEGACY_WAVE') {
+      throw new TypeError('Stored execution mode is invalid.');
+    }
+    const fullSource = task.fullSource === undefined ? undefined : validateFullSourceCheckpoint(task.fullSource);
+    if ((task.executionMode === 'FULL_SOURCE') !== (fullSource !== undefined)) {
+      throw new TypeError('Full-source mode requires a frozen checkpoint.');
+    }
+    if (fullSource && (!sameStrings([...fullSource.identity.methodIds], resolvedMethodOrder)
+      || fullSource.identity.reportPairId !== catalogIdentity?.reportPairId)) throw new TypeError('Full-source catalog mismatch.');
     tasks[taskId] = {
       catalogIdentity,
       resolvedMethodOrder,
       completedMethodIds,
       methods,
       ragRun,
-      waveState
+      waveState,
+      ...(task.executionMode ? { executionMode: task.executionMode as ClassTaskExecutionMode } : {}),
+      ...(fullSource ? { fullSource } : {})
     };
   }
   return { version: 5, tasks };
@@ -2685,7 +2829,7 @@ function validateWaveCandidateCheckpoint(value: unknown): WaveCandidateCheckpoin
   const waveId = requireSha256(record.waveId, 'Wave ID');
   const allowedStatuses = new Set<WaveCandidateCheckpoint['status']>([
     'GENERATED', 'READY_FOR_MAVEN', 'MAVEN_RUNNING', 'MODEL_REPAIR',
-    'STABLE_REPAIR', 'PASSED', 'BLOCKED'
+    'STABLE_REPAIR', 'PASSED', 'BLOCKED', 'QUARANTINED'
   ]);
   if (!allowedStatuses.has(record.status as WaveCandidateCheckpoint['status'])) {
     throw new TypeError('Wave candidate status is invalid.');
@@ -2727,6 +2871,10 @@ function validateWaveCandidateCheckpoint(value: unknown): WaveCandidateCheckpoin
     : validateWaveMoveTransaction(record.moveTransaction);
   if (moveTransaction && managedFile && moveTransaction.sha256 !== managedFile.sha256) {
     throw new TypeError('Move transaction SHA-256 must match the managed file.');
+  }
+  if (record.status === 'QUARANTINED'
+    && (!managedFile || managedFile.location !== 'ISOLATED' || moveTransaction !== null)) {
+    throw new TypeError('Quarantined candidates must have a settled isolated file.');
   }
   return {
     candidateId,

@@ -39,7 +39,8 @@ test('method configuration page exposes the approved compact controls and access
     /if \(!repairConfiguration\.valid\)[\s\S]{0,240}return;[\s\S]*onSave\(\{/
   );
   assert.doesNotMatch(component, /class-task-class-options/);
-  assert.match(component, /基于RAG提升单元测试质量/);
+  assert.match(component, /<strong>深度覆盖<\/strong>/);
+  assert.match(component, /不勾选时将全部所选方法一次生成/);
   assert.match(component, /ragConfigurationState === 'unconfigured'/);
   assert.doesNotMatch(component, /window\.workstation\.getRagSettings\(\)/);
   assert.match(component, /请先在设置中完成 Embedding 配置/);
@@ -159,7 +160,8 @@ test('App opens method configuration while loading its catalog and persists sele
     /async function refreshClassTaskMethodConfiguration\(\): Promise<void> \{[\s\S]*?(?=\n  async function refreshClassTaskCatalogIfNeeded)/
   )?.[0];
   assert.ok(refreshHandler, 'manual refresh handler must exist');
-  assert.doesNotMatch(refreshHandler, /forceReload/);
+  assert.match(refreshHandler, /forceReload: true/);
+  assert.match(refreshHandler, /manualRefresh: true/);
   assert.match(app, /freshness\.catalog/);
   assert.match(
     app,

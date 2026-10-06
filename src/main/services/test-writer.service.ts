@@ -2,6 +2,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { promises as fs } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import type { WriteGeneratedTestRequest, WriteGeneratedTestResult } from '../../shared/types';
+import { sanitizeJava } from './java-test-structure.service.ts';
 
 export type PreparedGeneratedTest = {
   workspaceRoot: string;
@@ -18,6 +19,15 @@ export type PreparedGeneratedReplacement = Omit<PreparedGeneratedTest, 'workspac
 const MAX_GENERATED_TEST_BYTES = 1024 * 1024;
 const GENERATED_TEST_EXTERNALLY_MODIFIED_MESSAGE =
   '生成测试文件已被外部修改，已停止自动替换或删除。';
+
+export class GeneratedTestRenameError extends Error {
+  readonly code = 'METHOD_GENERATION_TEST_RENAME_UNSAFE';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'GeneratedTestRenameError';
+  }
+}
 
 export class GeneratedTestExternallyModifiedError extends Error {
   readonly code = 'GENERATED_TEST_EXTERNALLY_MODIFIED';
@@ -581,23 +591,27 @@ export class TestWriterService {
 
   private rewriteTestClassName(content: string, finalClassName: string): string {
     const declarationPattern = /\b(class|interface|record|enum)\s+([A-Za-z_$][\w$]*)\b/;
-    const match = content.match(declarationPattern);
+    const sanitized = sanitizeJava(content);
+    const match = sanitized.match(declarationPattern);
     if (!match || match[2] === finalClassName) {
       return content;
     }
 
     if (!match[2].endsWith('Test')) {
-      throw new Error('生成的 Java 代码中没有可安全重命名的测试类声明。');
+      throw new GeneratedTestRenameError('生成的 Java 代码中没有可安全重命名的测试类声明。');
     }
 
     const originalClassName = match[2];
-    const renamedContent = content.replace(declarationPattern, `$1 ${finalClassName}`);
+    const classNameOffset = match.index! + match[0].length - originalClassName.length;
+    const renamedSanitized = sanitized.slice(0, classNameOffset)
+      + finalClassName + sanitized.slice(classNameOffset + originalClassName.length);
     const remainingReferencePattern = new RegExp(`\\b${this.escapeRegExp(originalClassName)}\\b`);
-    if (remainingReferencePattern.test(renamedContent)) {
-      throw new Error('生成的 Java 代码包含额外的测试类引用，无法安全重命名。');
+    if (remainingReferencePattern.test(renamedSanitized)) {
+      throw new GeneratedTestRenameError('生成的 Java 代码包含额外的测试类引用，无法安全重命名。');
     }
 
-    return renamedContent;
+    return content.slice(0, classNameOffset)
+      + finalClassName + content.slice(classNameOffset + originalClassName.length);
   }
 
   private escapeRegExp(value: string): string {

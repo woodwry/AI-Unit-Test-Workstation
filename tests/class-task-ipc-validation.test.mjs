@@ -273,6 +273,19 @@ test('class task validates the complete frozen snapshot and returns detached nes
   }), /未知字段/);
 });
 
+test('class task accepts persisted timestamps with shorter millisecond precision', () => {
+  const actual = validation.validateClassTaskSnapshot({
+    ...validSnapshot,
+    startedAt: '2026-08-08T00:00:00.7Z',
+    finishedAt: '2026-08-08T00:00:01.78Z',
+    updatedAt: '2026-08-08T00:00:02.9876543Z'
+  });
+
+  assert.equal(actual.startedAt, '2026-08-08T00:00:00.700Z');
+  assert.equal(actual.finishedAt, '2026-08-08T00:00:01.780Z');
+  assert.equal(actual.updatedAt, '2026-08-08T00:00:02.987Z');
+});
+
 test('class task validates every ClassMethodCatalog field recursively', () => {
   const actual = validation.validateClassMethodCatalog(validCatalog);
   assert.deepEqual(actual, validCatalog);
@@ -306,6 +319,23 @@ test('class task validates every ClassMethodCatalog field recursively', () => {
   }), /instructionMissed/i);
 });
 
+test('class task preserves verified Wave candidate identity across snapshot validation', () => {
+  const methodResult = {
+    ...validArtifact.methodResults[0], waveIndex: 3,
+    sourceBatchIds: ['66666666-6666-4666-8666-666666666666']
+  };
+  const snapshot = {
+    ...validSnapshot,
+    generatedArtifacts: [{ ...validArtifact, methodResults: [methodResult] }]
+  };
+  const validated = validation.validateClassTaskSnapshot(snapshot);
+  assert.deepEqual(validated.generatedArtifacts[0].methodResults[0], methodResult);
+  const { sourceBatchIds, ...incomplete } = methodResult;
+  assert.throws(() => validation.validateClassTaskSnapshot({
+    ...snapshot, generatedArtifacts: [{ ...validArtifact, methodResults: [incomplete] }]
+  }), /Wave/);
+});
+
 test('class task validates the complete result snapshot and exact coverage totals', () => {
   const result = {
     taskId: TASK_ID,
@@ -327,6 +357,8 @@ test('class task validates the complete result snapshot and exact coverage total
     canRevoke: false
   };
   assert.deepEqual(validation.validateClassTaskResultSnapshot(result), result);
+  const withoutCoverage = { ...result, coverageBaseline: null, coverageCurrent: null, coverageContributions: [] };
+  assert.deepEqual(validation.validateClassTaskResultSnapshot(withoutCoverage), withoutCoverage);
   assert.throws(() => validation.validateClassTaskResultSnapshot({
     ...result,
     coverageCurrent: { ...exactCoverage, lineTotal: 5 }

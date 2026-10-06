@@ -480,7 +480,7 @@ test('failed Maven coverage refresh preserves the previous pair, exec, and ledge
       await appendFile(executionDataPath, '|failed-run', 'utf8');
       return {
         command: 'mvn test', cwd: moduleRoot, exitCode: 1,
-        stdout: '', stderr: 'failed'
+        stdout: '[ERROR] demo.Test.badStub: UnnecessaryStubbingException', stderr: 'failed'
       };
     }
   };
@@ -506,13 +506,94 @@ test('failed Maven coverage refresh preserves the previous pair, exec, and ledge
       artifact(1),
       new AbortController().signal
     ),
-    /Maven.*failed|exit.*1/i
+    error => {
+      assert.equal(error.code, 'TASK_JACOCO_MAVEN_FAILED');
+      assert.equal(error.command, 'mvn test');
+      assert.match(error.message, /UnnecessaryStubbingException/);
+      assert.equal(error.evidenceDirectory.includes(VERSION_IDS[0]), true);
+      return true;
+    }
   );
 
   assert.equal(targetCalls, 0);
   assert.deepEqual(service.currentPair(TASK_ID), beforePair);
   assert.deepEqual(ledger.snapshot(TASK_ID), beforeLedger);
   assert.equal(await readFile(taskPaths.currentExecutionDataPath, 'utf8'), beforeExec);
+  const evidence = join(taskPaths.versionsDirectory, VERSION_IDS[0], 'maven-failure.json');
+  const saved = JSON.parse(await readFile(evidence, 'utf8'));
+  assert.equal(saved.maven.exitCode, 1);
+  assert.match(saved.maven.stdout, /UnnecessaryStubbingException/);
+  assert.equal(saved.artifact.id, 'artifact-1');
+});
+
+test('unhandled formal coverage retains the original XML across session cleanup and restores it without Maven', async (t) => {
+  const { service, artifacts, context, events } = await harness(t);
+  await service.initialize(context);
+  const paths = artifacts.taskSessionPaths(context.moduleRoot, TASK_ID);
+  const originalXml = await readFile(paths.current.reportPath);
+  const originalSnapshot = await readFile(paths.current.branchSnapshotPath);
+  const originalExec = await readFile(paths.currentExecutionDataPath);
+  const catalog = { taskId: TASK_ID, analysisSessionId: SESSION_ID,
+    reportPairId: context.baselinePair.pairId, methods: [], warnings: [],
+    fingerprint: 'a'.repeat(64), refreshedAt: new Date().toISOString() };
+  await artifacts.retainTaskResultCoverage(context.moduleRoot, TASK_ID, {
+    coverage: context.baselineCoverage, qualifiedClassName: context.qualifiedClassName, catalog
+  });
+  const refreshed = await service.refreshArtifact(context, artifact(1), new AbortController().signal);
+  await artifacts.retainTaskResultCoverage(context.moduleRoot, TASK_ID, {
+    coverage: context.baselineCoverage, qualifiedClassName: context.qualifiedClassName
+  });
+  const retained = await artifacts.readTaskResultCoverageRollback(context.moduleRoot, TASK_ID);
+  assert.deepEqual(await readFile(retained.pair.reportPath), originalXml);
+  assert.deepEqual(retained.catalog, catalog);
+  const rollbackPaths = artifacts.taskResultRollbackPaths(context.moduleRoot, TASK_ID);
+  assert.equal((await readdir(rollbackPaths.versionsDirectory)).length, 2);
+  assert.notEqual(refreshed.pair.pairId, retained.pair.pairId);
+  await service.remove(context);
+  events.length = 0;
+  const reopenedArtifacts = new JacocoArtifactsService();
+  const restored = await reopenedArtifacts.restoreTaskResultCoverage(context.moduleRoot, TASK_ID);
+  assert.deepEqual(restored.coverage, context.baselineCoverage);
+  assert.deepEqual(await readFile(paths.current.reportPath), originalXml);
+  assert.deepEqual(await readFile(paths.current.branchSnapshotPath), originalSnapshot);
+  assert.deepEqual(await readFile(paths.currentExecutionDataPath), originalExec);
+  assert.deepEqual(events, []);
+});
+
+test('accepting coverage removes retained old XML only after the new baseline is committed', async (t) => {
+  const { service, artifacts, context } = await harness(t);
+  await service.initialize(context);
+  await artifacts.retainTaskResultCoverage(context.moduleRoot, TASK_ID, {
+    coverage: context.baselineCoverage, qualifiedClassName: context.qualifiedClassName
+  });
+  const refreshed = await service.refreshArtifact(context, artifact(1), new AbortController().signal);
+  const paths = artifacts.taskSessionPaths(context.moduleRoot, TASK_ID);
+  const finalXml = await readFile(paths.current.reportPath);
+  await service.checkpointAcceptedBaseline(context);
+  assert.ok(await artifacts.readTaskResultCoverageRollback(context.moduleRoot, TASK_ID));
+  await artifacts.discardTaskResultCoverageRollback(context.moduleRoot, TASK_ID);
+  assert.equal(await artifacts.readTaskResultCoverageRollback(context.moduleRoot, TASK_ID), null);
+  await assert.rejects(access(artifacts.taskResultRollbackPaths(context.moduleRoot, TASK_ID).taskDirectory), { code: 'ENOENT' });
+  await assert.rejects(access(paths.versionsDirectory), { code: 'ENOENT' });
+  assert.deepEqual(await readFile(paths.current.reportPath), finalXml);
+  assert.deepEqual(await readFile(paths.baseline.reportPath), finalXml);
+  assert.equal((await artifacts.currentTaskPair(context.moduleRoot, TASK_ID)).pairId, refreshed.pair.pairId);
+});
+
+test('a corrupted retained XML cannot replace the current report or be silently discarded', async (t) => {
+  const { service, artifacts, context } = await harness(t);
+  await service.initialize(context);
+  await artifacts.retainTaskResultCoverage(context.moduleRoot, TASK_ID, {
+    coverage: context.baselineCoverage, qualifiedClassName: context.qualifiedClassName
+  });
+  await service.refreshArtifact(context, artifact(1), new AbortController().signal);
+  const paths = artifacts.taskSessionPaths(context.moduleRoot, TASK_ID);
+  const finalXml = await readFile(paths.current.reportPath);
+  const retained = await artifacts.readTaskResultCoverageRollback(context.moduleRoot, TASK_ID);
+  await writeFile(retained.pair.reportPath, 'corrupted');
+  await assert.rejects(artifacts.restoreTaskResultCoverage(context.moduleRoot, TASK_ID), /摘要|匹配/);
+  assert.deepEqual(await readFile(paths.current.reportPath), finalXml);
+  await access(retained.pair.reportPath);
 });
 
 test('recalculates multiple formal files in order from a private baseline exec copy', async (t) => {
@@ -621,6 +702,208 @@ test('recalculates multiple formal files in order from a private baseline exec c
   );
   assert.equal(result.coverage.counts.lineCovered, 3);
   assert.equal(service.currentPair(TASK_ID).pairId, result.pair.pairId);
+});
+
+test('restores current task coverage from durable files without rerunning Maven', async (t) => {
+  const generatedCoverage = new Map();
+  let reportIndex = 0;
+  const sourceEvents = [];
+  const maven = {
+    async runMavenDirectTestsWithJacocoAppend(
+      moduleRoot,
+      settings,
+      testNames,
+      executionDataPath
+    ) {
+      sourceEvents.push(`maven:${testNames[0]}`);
+      await appendFile(executionDataPath, `|${testNames[0]}`, 'utf8');
+      return {
+        command: 'mvn test', cwd: moduleRoot, exitCode: 0,
+        stdout: '', stderr: ''
+      };
+    }
+  };
+  const targetReport = {
+    async generateTargetJacocoReport(request) {
+      reportIndex++;
+      const coveredLines = reportIndex === 1 ? [10, 11] : [10, 11, 12];
+      const coveredBranches = ['B_FALSE', 'B_TRUE'];
+      const pair = await writePair(
+        {
+          reportPath: request.outputPath,
+          branchSnapshotPath: request.branchSnapshotOutputPath
+        },
+        `durable-restore-${reportIndex}`,
+        coveredLines,
+        coveredBranches,
+        await readFile(request.executionDataPath)
+      );
+      generatedCoverage.set(pair.pairId, exactCounts(coveredLines, coveredBranches));
+      return {
+        generated: true,
+        ...pair,
+        targetClass: request.targetClass,
+        generatedAt: `2026-08-09T00:00:0${reportIndex}.000Z`,
+        message: 'generated'
+      };
+    }
+  };
+  const analyzer = {
+    async refreshMethodAnalysisCoverage(analysisSessionId, request) {
+      return {
+        reportPairId: request.reportPairId,
+        coverage: generatedCoverage.get(request.reportPairId),
+        catalog: {
+          analysisSessionId,
+          reportPairId: request.reportPairId,
+          methods: [],
+          warnings: []
+        }
+      };
+    }
+  };
+  const { service, artifacts, context } = await harness(t, {
+    maven,
+    targetReport,
+    analyzer
+  });
+  await service.initialize(context);
+  const source = await service.recalculate(
+    context,
+    [artifact(1), artifact(2)],
+    new AbortController().signal
+  );
+
+  const restoreEvents = [];
+  const restoredLedger = new ClassCoverageLedgerService();
+  let restoredReportIndex = 0;
+  const restoredService = new TaskJacocoSessionService({
+    artifacts,
+    ledger: restoredLedger,
+    moduleLock: {
+      async runExclusive(moduleKey, operation, signal) {
+        assert.equal(moduleKey, 'module-key');
+        assert.equal(signal?.aborted ?? false, false);
+        restoreEvents.push('lock');
+        return operation();
+      }
+    },
+    maven: {
+      async runMavenDirectTestsWithJacocoAppend(
+        moduleRoot,
+        settings,
+        testNames,
+        executionDataPath
+      ) {
+        restoreEvents.push(`maven:${testNames[0]}`);
+        await appendFile(executionDataPath, `|${testNames[0]}`, 'utf8');
+        return {
+          command: 'mvn test', cwd: moduleRoot, exitCode: 0,
+          stdout: '', stderr: ''
+        };
+      }
+    },
+    targetReport: {
+      async generateTargetJacocoReport(request) {
+        restoreEvents.push('target-report');
+        restoredReportIndex++;
+        const pair = await writePair(
+          {
+            reportPath: request.outputPath,
+            branchSnapshotPath: request.branchSnapshotOutputPath
+          },
+          `post-restore-${restoredReportIndex}`,
+          [10, 11, 12],
+          ['B_FALSE', 'B_TRUE'],
+          await readFile(request.executionDataPath)
+        );
+        generatedCoverage.set(pair.pairId, exactCounts([10, 11, 12], ['B_FALSE', 'B_TRUE']));
+        return {
+          generated: true,
+          ...pair,
+          targetClass: request.targetClass,
+          generatedAt: `2026-08-09T00:01:0${restoredReportIndex}.000Z`,
+          message: 'generated'
+        };
+      }
+    },
+    analyzer: {
+      async refreshMethodAnalysisCoverage(analysisSessionId, request, signal) {
+        restoreEvents.push('analyzer-refresh');
+        assert.equal(analysisSessionId, SESSION_ID);
+        assert.equal(signal?.aborted ?? false, false);
+        return {
+          reportPairId: request.reportPairId,
+          coverage: generatedCoverage.get(request.reportPairId),
+          catalog: {
+            analysisSessionId,
+            reportPairId: request.reportPairId,
+            methods: [],
+            warnings: []
+          }
+        };
+      }
+    }
+  });
+  const replacementBaselinePair = await writePair(
+    {
+      reportPath: join(context.moduleRoot, 'replacement-baseline.xml'),
+      branchSnapshotPath: join(context.moduleRoot, 'replacement-baseline.branches.json')
+    },
+    'replacement-baseline',
+    [10],
+    ['B_FALSE'],
+    'baseline-exec'
+  );
+  const replacementContext = {
+    ...context,
+    baselinePair: replacementBaselinePair
+  };
+
+  const restored = await restoredService.tryRestoreCurrent(
+    replacementContext,
+    [artifact(1), artifact(2)],
+    source.coverage.counts,
+    new AbortController().signal
+  );
+
+  assert.deepEqual(sourceEvents, [
+    'maven:com.example.TaskService1Test',
+    'maven:com.example.TaskService2Test'
+  ]);
+  assert.deepEqual(restoreEvents, ['lock', 'analyzer-refresh']);
+  assert.ok(restored);
+  assert.equal(restored.context.baselinePair.pairId, context.baselinePair.pairId);
+  assert.notEqual(restored.context.baselinePair.pairId, replacementBaselinePair.pairId);
+  assert.equal(restored.coverage.counts.lineCovered, 3);
+  assert.deepEqual(
+    restored.contributions.map((item) => ({
+      artifactId: item.artifactId,
+      addedLineCount: item.addedLineCount,
+      addedBranchCount: item.addedBranchCount
+    })),
+    [
+      { artifactId: 'artifact-1', addedLineCount: 1, addedBranchCount: 1 },
+      { artifactId: 'artifact-2', addedLineCount: 1, addedBranchCount: 0 }
+    ]
+  );
+  assert.equal(restoredService.currentPair(TASK_ID).pairId, source.pair.pairId);
+  assert.deepEqual(restoredLedger.artifacts(TASK_ID), [
+    { id: 'artifact-1', filePath: 'C:/tests/TaskService1Test.java' },
+    { id: 'artifact-2', filePath: 'C:/tests/TaskService2Test.java' }
+  ]);
+
+  const refreshed = await restoredService.refreshArtifact(
+    restored.context,
+    artifact(3),
+    new AbortController().signal
+  );
+  assert.equal(refreshed.coverage.counts.lineCovered, 3);
+  assert.equal(restoredService.currentPair(TASK_ID).pairId, refreshed.pair.pairId);
+  assert.deepEqual(restoreEvents, [
+    'lock', 'analyzer-refresh',
+    'lock', 'maven:com.example.TaskService3Test', 'target-report', 'analyzer-refresh'
+  ]);
 });
 
 test('restores Analyzer when exact snapshot validation fails after refresh', async (t) => {

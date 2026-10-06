@@ -1,6 +1,7 @@
 import type {
   CreateModelInterfaceRequest,
   JsonValue,
+  ModelInterfaceConnectionTestRequest,
   ModelInterfaceConnectionTestResult,
   ModelInterfaceDraft,
   ModelInterfaceView,
@@ -87,7 +88,7 @@ export function buildModelInterfaceDraft(item: ModelInterfaceView): ModelInterfa
     apiKey: '',
     requestParameters: Object.entries(item.requestParameters ?? {}).map(([name, value]) => ({
       name,
-      value: JSON.stringify(value)
+      value: formatModelRequestParameterValue(value)
     }))
   };
 }
@@ -167,7 +168,7 @@ export function validateModelRequestParameterDrafts(
       continue;
     }
     try {
-      const parsed = JSON.parse(rawValue) as JsonValue;
+      const parsed = parseModelRequestParameterValue(rawValue);
       if (!errors[index].name) requestParameters[name] = parsed;
     } catch {
       errors[index].value = '参数值不是有效 JSON。';
@@ -197,6 +198,43 @@ export function validateModelRequestParameterDrafts(
   } catch {
     return { errors, message: '高级请求参数无效。' };
   }
+}
+
+export function buildModelInterfaceConnectionTestRequest(
+  draft: ModelInterfaceDraft
+): ModelInterfaceConnectionTestRequest {
+  // 测试无需填写接口名称；编辑已有接口时允许主进程读取已保存的凭证。
+  const existingId = draft.id && draft.id !== 'new' ? draft.id : undefined;
+  const validation = validateModelInterfaceDraft(
+    { ...draft, name: 'connection-test' },
+    { mode: existingId ? 'update' : 'create' }
+  );
+  if (validation) throw new TypeError(validation);
+  const { name: _name, ...request } = buildCreateModelInterfaceRequest(draft);
+  if (request.credentialMode === 'direct' && !request.apiKey) delete request.apiKey;
+  return { ...(existingId ? { interfaceId: existingId } : {}), ...request };
+}
+
+function parseModelRequestParameterValue(rawValue: string): JsonValue {
+  try {
+    return JSON.parse(rawValue) as JsonValue;
+  } catch (error) {
+    if (rawValue.startsWith('{') || rawValue.startsWith('[') || rawValue.startsWith('"')) {
+      throw error;
+    }
+    return rawValue;
+  }
+}
+
+function formatModelRequestParameterValue(value: JsonValue): string {
+  if (typeof value === 'string' && value && value === value.trim()) {
+    try {
+      if (parseModelRequestParameterValue(value) === value) return value;
+    } catch {
+      // 保存过的字符串可能以 JSON 标记开头；保留引号才能维持原类型。
+    }
+  }
+  return JSON.stringify(value);
 }
 
 function normalizeRequestParameterDraftsForComparison(

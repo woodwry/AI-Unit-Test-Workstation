@@ -1,4 +1,13 @@
 import { Buffer } from 'node:buffer';
+import {
+  validateFullSourceFacts, validateFullSourceFactsRequest,
+  validateStartFullSourceRequest, validateFullSourceFeedback, decodeFullSourceEvent, decodeFullSourceStatus,
+  decodeFullSourceCandidate,
+  type FullSourceClassFacts, type FullSourceFactsRequest, type StartFullSourceGenerationSessionRequest,
+  type ResumeFullSourceGenerationSessionRequest, type FullSourceGenerationEvent,
+  type FullSourceGenerationStatus, type FullSourceGenerationTurn, type FullSourceProgressHandler,
+  type FullSourceCandidateResponse
+} from './full-source-generation-contract.ts';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, relative, resolve, sep } from 'node:path';
 import { isIP } from 'node:net';
@@ -99,6 +108,7 @@ import {
 } from './rag-index-contract.ts';
 import { sanitizePublicText } from './maven-command.ts';
 import { ModuleOperationLock } from './module-operation-lock.service.ts';
+import { ANALYSIS_DEPENDENCY_JAR_PATH, collectAnalysisDependencyBytecode } from './analysis-dependency-bytecode.ts';
 
 export const DEFAULT_BACKEND_SETTINGS: BackendSettings = {
   agentServiceUrl: 'http://127.0.0.1:18000',
@@ -110,6 +120,8 @@ const METHOD_GENERATION_RECOVERY_POLL_MAX_MS = 10_000;
 const METHOD_GENERATION_RECOVERY_FETCH_FAILURE_LIMIT = 3;
 const METHOD_GENERATION_STREAM_HEARTBEAT_RECOVERY_LIMIT = 3;
 const METHOD_GENERATION_WAVE_IDLE_STREAM_RECOVERY_MS = 60_000;
+const METHOD_GENERATION_WAVE_FIRST_EVENT_TIMEOUT_MESSAGE =
+  '单方法 Wave 连接在返回首个事件前超时。';
 const MAX_BACKEND_ERROR_TEXT_LENGTH = 4_096;
 const DEFAULT_METHOD_ANALYSIS_RESPONSE_TIMEOUT_MS = 120_000;
 
@@ -387,6 +399,13 @@ type MethodGenerationWaveStreamRecoveryCursor = Readonly<{
   waveSessionId: string;
   lastEventSequence: number;
 }>;
+
+class MethodGenerationWaveFirstEventTimeoutError extends Error {
+  constructor() {
+    super(METHOD_GENERATION_WAVE_FIRST_EVENT_TIMEOUT_MESSAGE);
+    this.name = 'MethodGenerationWaveFirstEventTimeoutError';
+  }
+}
 
 function isSseHeartbeatBlock(block: string): boolean {
   return block.split(/\r?\n/).some((line) => line.trim() === ': heartbeat');
@@ -1102,7 +1121,12 @@ export class AiClient {
     signal?: AbortSignal
   ): Promise<CreateMethodAnalysisSessionResponse> {
     const manifest = await this.createMethodAnalysisArtifactManifest(payload);
-    const bundle = await this.createMethodAnalysisArtifactBundle(payload, manifest);
+    const dependencyClasses = await collectAnalysisDependencyBytecode(payload, signal);
+    const dependencyJar = dependencyClasses.length
+      ? createZip(dependencyClasses.map(entry => ({ path: entry.relativePath, data: entry.content })))
+      : undefined;
+    if (dependencyJar) manifest.classpathEntryRelativePaths.push(ANALYSIS_DEPENDENCY_JAR_PATH);
+    const bundle = await this.createMethodAnalysisArtifactBundle(payload, manifest, dependencyJar);
     const formData = new FormData();
     formData.append(
       'request',
@@ -1257,7 +1281,8 @@ export class AiClient {
       branchSnapshotRelativePath: string;
       sourceRootRelativePaths: string[];
       classpathEntryRelativePaths: string[];
-    }
+    },
+    dependencyJar?: Buffer
   ): Promise<Buffer> {
     const entries: JacocoArtifactEntry[] = [];
     const seen = new Set<string>();
@@ -1311,6 +1336,10 @@ export class AiClient {
     await addEntry(payload.targetSourcePath, manifest.targetSourceRelativePath, true);
     await addEntry(payload.reportPath, manifest.reportRelativePath, true);
     await addEntry(payload.branchSnapshotPath, manifest.branchSnapshotRelativePath, true);
+    if (dependencyJar) {
+      entries.push({ path: ANALYSIS_DEPENDENCY_JAR_PATH, data: dependencyJar });
+      seen.add(ANALYSIS_DEPENDENCY_JAR_PATH);
+    }
 
     for (const relativeSourceRoot of manifest.sourceRootRelativePaths) {
       const sourceRoot = resolve(payload.workspaceRoot, ...relativeSourceRoot.split('/'));
@@ -1552,6 +1581,25 @@ export class AiClient {
     });
   }
 
+  async fullSourceGenerationFacts(
+    sessionId: string, request: FullSourceFactsRequest, signal?: AbortSignal
+  ): Promise<FullSourceClassFacts> {
+    this.assertAnalysisSessionId(sessionId);
+    validateFullSourceFactsRequest(request);
+    const backend = this.resolveBackendRequest('java-analyzer');
+    this.assertBackendAuthorizationTransportSafe(backend);
+    const response = await this.fetchWithRedaction(backendEndpoint(backend.baseUrl,
+      `/api/generation-analysis/sessions/${encodeURIComponent(sessionId)}/full-source-facts`), {
+      method: 'POST', redirect: 'error', signal,
+      headers: { 'Content-Type': 'application/json', ...(backend.authorizationHeader
+        ? { Authorization: backend.authorizationHeader } : {}) },
+      body: JSON.stringify(request)
+    }, undefined, backend.managedAccess);
+    if (!response.ok) throw await this.methodAnalysisHttpError(response, backend.managedAccess, '读取完整源码事实失败');
+    return validateFullSourceFacts(await this.readJsonResponse<unknown>(response, undefined, backend.managedAccess),
+      { reportPairId: request.reportPairId, methodIds: request.selectedMethodIds });
+  }
+
   async refreshMethodAnalysisCoverage(
     sessionId: string,
     request: RefreshMethodAnalysisCoverageRequest,
@@ -1753,6 +1801,159 @@ export class AiClient {
     return decodeMethodRepairContextResponse(value, {
       reportPairId: payload.reportPairId
     });
+  }
+
+  async startFullSourceGenerationStream(request: StartFullSourceGenerationSessionRequest,
+    modelContext: MethodGenerationModelContext, onProgress: FullSourceProgressHandler,
+    signal?: AbortSignal): Promise<FullSourceGenerationTurn> {
+    validateStartFullSourceRequest(request);
+    return this.fullSourceStreamRequest('/api/unit-tests/method-generation-sessions/start/stream',
+      { ...request, llmConfig: modelContext.llmConfig }, request, modelContext, onProgress, signal);
+  }
+
+  async resumeFullSourceGenerationStream(sessionId: string, feedback: ResumeFullSourceGenerationSessionRequest,
+    request: StartFullSourceGenerationSessionRequest, modelContext: MethodGenerationModelContext,
+    onProgress: FullSourceProgressHandler, signal?: AbortSignal): Promise<FullSourceGenerationTurn> {
+    this.assertMethodGenerationSessionId(sessionId); validateFullSourceFeedback(feedback);
+    validateStartFullSourceRequest(request);
+    return this.fullSourceStreamRequest(`/api/unit-tests/method-generation-sessions/${encodeURIComponent(sessionId)}/resume/stream`,
+      { ...feedback, llmConfig: modelContext.llmConfig }, request, modelContext, onProgress, signal,
+      { sessionId, eventSequence: feedback.expectedEventSequence });
+  }
+
+  async recoverFullSourceGenerationStream(request: StartFullSourceGenerationSessionRequest,
+    candidate: FullSourceCandidateResponse, modelContext: MethodGenerationModelContext,
+    onProgress: FullSourceProgressHandler, signal?: AbortSignal): Promise<FullSourceGenerationTurn> {
+    validateStartFullSourceRequest(request); decodeFullSourceCandidate(candidate);
+    if (candidate.batchId !== request.batchId || candidate.methodId !== request.methodId
+      || candidate.outputTestClassName !== request.outputTestClassName) throw new Error(METHOD_GENERATION_RESPONSE_INVALID);
+    return this.fullSourceStreamRequest('/api/unit-tests/method-generation-sessions/recover/stream',
+      { recoveryRequestId: request.clientRequestId, startRequest: { ...request, llmConfig: modelContext.llmConfig },
+        candidate }, request, modelContext, onProgress, signal);
+  }
+
+  async getFullSourceGenerationStatus(sessionId: string, afterEventSequence: number,
+    request: StartFullSourceGenerationSessionRequest, signal?: AbortSignal): Promise<FullSourceGenerationStatus> {
+    this.assertMethodGenerationSessionId(sessionId);
+    if (!Number.isSafeInteger(afterEventSequence) || afterEventSequence < 0) throw new Error(METHOD_GENERATION_RESPONSE_INVALID);
+    const backend = this.resolveBackendRequest('agent-service');
+    this.assertBackendAuthorizationTransportSafe(backend);
+    const endpoint = backendEndpoint(backend.baseUrl, `/api/unit-tests/method-generation-sessions/${encodeURIComponent(sessionId)}`);
+    endpoint.searchParams.set('afterEventSequence', String(afterEventSequence));
+    const response = await this.fetchWithRedaction(endpoint, { method: 'GET', redirect: 'error', signal,
+      headers: backend.authorizationHeader ? { Authorization: backend.authorizationHeader } : {} }, undefined, backend.managedAccess);
+    if (response.status === 404) throw new MethodGenerationSessionNotFoundError(sessionId);
+    if (!response.ok) throw await this.methodGenerationHttpError(response, undefined, backend.managedAccess);
+    return decodeFullSourceStatus(await this.readJsonResponse(response, undefined, backend.managedAccess),
+      request, sessionId, afterEventSequence);
+  }
+
+  async waitFullSourceGenerationTurn(sessionId: string, afterEventSequence: number,
+    request: StartFullSourceGenerationSessionRequest, onProgress: FullSourceProgressHandler,
+    signal?: AbortSignal): Promise<FullSourceGenerationTurn> {
+    let sequence = afterEventSequence;
+    for (let idle = 0; ; idle++) {
+      if (signal?.aborted) throw signal.reason;
+      const status = await this.getFullSourceGenerationStatus(sessionId, sequence, request, signal);
+      for (const event of status.events) {
+        await onProgress(event); sequence = event.eventSequence;
+        const terminal = this.fullSourceTurn(event);
+        if (terminal) return terminal;
+      }
+      if (status.pendingCandidate) return { kind: 'candidate_ready', sessionId,
+        eventSequence: status.lastEventSequence, candidate: status.pendingCandidate };
+      if (status.pendingOutputInvalid) return { kind: 'output_invalid', sessionId,
+        eventSequence: status.lastEventSequence, outputInvalid: status.pendingOutputInvalid };
+      if (status.completion) return { kind: 'completed', sessionId,
+        eventSequence: status.lastEventSequence, completion: status.completion };
+      if (status.terminalError) throw new MethodGenerationRequestError(status.terminalError.code, status.terminalError.message);
+      if (status.phase === 'cancelled' || status.phase === 'failed' || status.phase === 'completed') {
+        throw new MethodGenerationRequestError('FULL_SOURCE_RECOVERY_UNAVAILABLE', '生成会话已结束，无法恢复候选。');
+      }
+      await this.waitForMethodGenerationRecovery(methodGenerationRecoveryPollDelayMilliseconds(idle), signal);
+    }
+  }
+
+  async cancelFullSourceGeneration(sessionId: string, request: StartFullSourceGenerationSessionRequest): Promise<void> {
+    this.assertMethodGenerationSessionId(sessionId);
+    const backend = this.resolveBackendRequest('agent-service');
+    this.assertBackendAuthorizationTransportSafe(backend);
+    const response = await this.fetchWithRedaction(backendEndpoint(backend.baseUrl,
+      `/api/unit-tests/method-generation-sessions/${encodeURIComponent(sessionId)}`), {
+      method: 'DELETE', redirect: 'error', headers: backend.authorizationHeader ? { Authorization: backend.authorizationHeader } : {}
+    }, undefined, backend.managedAccess);
+    if (response.status === 404) return;
+    if (!response.ok) throw await this.methodGenerationHttpError(response, undefined, backend.managedAccess);
+    decodeFullSourceStatus(await this.readJsonResponse(response, undefined, backend.managedAccess), request, sessionId, 0);
+  }
+
+  private fullSourceTurn(event: FullSourceGenerationEvent): FullSourceGenerationTurn | null {
+    const cursor = { sessionId: event.sessionId, eventSequence: event.eventSequence };
+    if (event.candidate) return { ...cursor, kind: 'candidate_ready', candidate: event.candidate };
+    if (event.outputInvalid) return { ...cursor, kind: 'output_invalid', outputInvalid: event.outputInvalid };
+    if (event.completion) return { ...cursor, kind: 'completed', completion: event.completion };
+    if (event.error) throw new MethodGenerationRequestError(event.error.code, event.error.message);
+    return null;
+  }
+
+  private async fullSourceStreamRequest(path: string, body: unknown, request: StartFullSourceGenerationSessionRequest,
+    modelContext: MethodGenerationModelContext, onProgress: FullSourceProgressHandler, signal?: AbortSignal,
+    cursor?: { sessionId: string; eventSequence: number }): Promise<FullSourceGenerationTurn> {
+    const backend = this.resolveBackendRequest('agent-service');
+    this.assertBackendAuthorizationTransportSafe(backend);
+    assertCredentialTransportSafe(backend.baseUrl, modelContext.llmConfig);
+    let response: Response;
+    try {
+      response = await this.fetchWithRedaction(backendEndpoint(backend.baseUrl, path), {
+        method: 'POST', redirect: 'error', signal,
+        headers: { 'Content-Type': 'application/json', ...(backend.authorizationHeader
+          ? { Authorization: backend.authorizationHeader } : {}) }, body: JSON.stringify(body)
+      }, modelContext.llmConfig, backend.managedAccess);
+    } catch (error) {
+      if (cursor && !signal?.aborted) return this.waitFullSourceGenerationTurn(cursor.sessionId,
+        cursor.eventSequence, request, onProgress, signal);
+      throw error;
+    }
+    if (response.status === 404 && cursor) throw new MethodGenerationSessionNotFoundError(cursor.sessionId);
+    if (!response.ok) throw await this.methodGenerationHttpError(response, modelContext.llmConfig, backend.managedAccess);
+    if (!response.body) throw new Error(METHOD_GENERATION_RESPONSE_INVALID);
+    const reader = response.body.getReader();
+    const cancelReader = (): void => { void reader.cancel().catch(() => undefined); };
+    signal?.addEventListener('abort', cancelReader, { once: true });
+    if (signal?.aborted) cancelReader();
+    const decoder = new TextDecoder(); let buffer = '';
+    let readInterrupted = false;
+    let sessionId = cursor?.sessionId; let sequence = cursor?.eventSequence ?? 0;
+    const consume = async (block: string): Promise<FullSourceGenerationTurn | null> => {
+      const lines = block.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart());
+      if (!lines.length) return null;
+      const raw = this.redactSensitive(JSON.parse(lines.join('\n')), modelContext.llmConfig, backend.managedAccess);
+      const event = decodeFullSourceEvent(raw, { expectedSessionId: sessionId, previousEventSequence: sequence, request });
+      // The callback durably records the session before any later stream recovery.
+      await onProgress(event); sessionId = event.sessionId; sequence = event.eventSequence;
+      return this.fullSourceTurn(event);
+    };
+    try {
+      for (;;) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try { chunk = await reader.read(); }
+        catch { readInterrupted = true; break; }
+        const { done, value } = chunk;
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() ?? '';
+        for (const block of blocks) { const turn = await consume(block); if (turn) return turn; }
+      }
+      buffer += decoder.decode();
+      if (!readInterrupted && buffer.trim()) { const turn = await consume(buffer); if (turn) return turn; }
+    } finally {
+      signal?.removeEventListener('abort', cancelReader);
+      await reader.cancel().catch(() => undefined); reader.releaseLock();
+    }
+    if (signal?.aborted) throw signal.reason;
+    if (!sessionId) throw new MethodGenerationRequestError('INITIAL_GENERATION_RECOVERY_UNAVAILABLE',
+      '首次请求已发出，但未取得可恢复的会话身份。');
+    return this.waitFullSourceGenerationTurn(sessionId, sequence, request, onProgress, signal);
   }
 
   async startMethodGenerationStream(
@@ -3015,8 +3216,14 @@ export class AiClient {
         ...init,
         signal: requestController.signal
       });
+      // Keep the deadline active until the whole JSON response is received.
+      const body = response.body === null ? null : await response.arrayBuffer();
       if (timedOut) throw timeoutError;
-      return response;
+      return new Response(body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      });
     } catch (error) {
       if (callerSignal?.aborted) throw callerSignal.reason;
       if (timedOut) {
@@ -3039,10 +3246,11 @@ export class AiClient {
       const requestUrl = input instanceof URL
         ? input
         : new URL(typeof input === 'string' ? input : input.url);
-      return requestUrl.pathname === '/api/generation-analysis/sessions'
-        || requestUrl.pathname.startsWith(
-          '/api/generation-analysis/sessions/'
-        );
+      const apiPath = requestUrl.pathname.slice(requestUrl.pathname.indexOf('/api/'));
+      return apiPath === '/api/health'
+        || apiPath === '/api/generation-analysis/sessions'
+        || apiPath.startsWith('/api/generation-analysis/sessions/')
+        || apiPath.startsWith('/api/reports/jacoco/');
     } catch {
       return false;
     }
@@ -3052,12 +3260,11 @@ export class AiClient {
     input: string | URL | Request,
     managedAccess?: ManagedBackendAccess
   ): 'Agent Service' | 'Java Analyzer' | null {
-    let requestOrigin: string;
+    let requestUrl: URL;
     try {
-      const requestUrl = input instanceof URL
+      requestUrl = input instanceof URL
         ? input
         : new URL(typeof input === 'string' ? input : input.url);
-      requestOrigin = requestUrl.origin;
     } catch {
       return null;
     }
@@ -3078,15 +3285,25 @@ export class AiClient {
               ?? this.settings.javaAnalyzerUrl
           ]
         ];
+    let match: 'Agent Service' | 'Java Analyzer' | null = null;
+    let longestMatchingPath = -1;
     for (const [name, endpoint] of endpoints) {
       if (!endpoint) continue;
       try {
-        if (new URL(endpoint).origin === requestOrigin) return name;
+        const endpointUrl = new URL(endpoint);
+        const endpointPath = endpointUrl.pathname.replace(/\/+$/, '');
+        if (endpointUrl.origin === requestUrl.origin
+          && (requestUrl.pathname === endpointPath
+            || requestUrl.pathname.startsWith(`${endpointPath}/`))
+          && endpointPath.length > longestMatchingPath) {
+          match = name;
+          longestMatchingPath = endpointPath.length;
+        }
       } catch {
         continue;
       }
     }
-    return null;
+    return match;
   }
 
   private async readJsonResponse<T>(
@@ -3442,15 +3659,16 @@ export class AiClient {
     let terminal: MethodGenerationWaveTurnResult | null = null;
 
     const readNextChunk = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
-      if (!waveSessionId || lastHandledSequence <= 0) {
-        return reader.read();
-      }
       let timeout: ReturnType<typeof setTimeout> | null = null;
       try {
         return await Promise.race([
           reader.read(),
           new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => {
             timeout = setTimeout(() => {
+              if (!waveSessionId || lastHandledSequence <= 0) {
+                reject(new MethodGenerationWaveFirstEventTimeoutError());
+                return;
+              }
               cancelReader();
               reject(new MethodGenerationWaveStreamInterruptedError(
                 waveSessionId,
@@ -3570,9 +3788,14 @@ export class AiClient {
         await reader.cancel().catch(() => undefined);
         throw error;
       }
+      if (error instanceof MethodGenerationWaveFirstEventTimeoutError) {
+        await reader.cancel().catch(() => undefined);
+        throw error;
+      }
       if (
         error instanceof MethodGenerationWaveNotFoundError
         || error instanceof MethodGenerationRequestError
+        || error instanceof MethodGenerationWaveFirstEventTimeoutError
         || error instanceof Error
           && (error.message === METHOD_GENERATION_RESPONSE_INVALID || signal?.aborted)
       ) {

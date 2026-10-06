@@ -1,4 +1,6 @@
 import type { ClassTaskSnapshot } from '../../shared/class-task-contracts.ts';
+import type { FullSourceRunCheckpoint } from './full-source-checkpoint.ts';
+import type { FullSourceExecutionOutcome } from './full-source-generation-contract.ts';
 import {
   ClassTaskCheckpointService,
   ClassTaskPausedAtBoundaryError,
@@ -33,6 +35,7 @@ export type MethodTestBundle = {
   ordinaryTestMethodCount: number;
   passedTestMethods: string[];
   sourceBatchIds: string[];
+  fullSource?: { factsId: string; candidateId: string };
 };
 
 export type MethodWaveExecutionOutcome = {
@@ -45,6 +48,10 @@ export type MethodWaveExecutionOutcome = {
 };
 
 export interface MethodExecutionPort {
+  supportsFullSource?(): boolean;
+  executeFullSource?(task: ClassTaskSnapshot, methodIds: readonly string[], checkpoint: FullSourceRunCheckpoint,
+    signal: AbortSignal): Promise<FullSourceExecutionOutcome>;
+  formalizeFullSource?(task: ClassTaskSnapshot, outcome: FullSourceExecutionOutcome, signal: AbortSignal): Promise<void>;
   nextClassWave?(
     task: ClassTaskSnapshot,
     request: ClassScenarioWaveRequest,
@@ -130,11 +137,38 @@ export class ClassTaskRunnerService {
     catalogIdentity: ClassTaskCatalogIdentity,
     signal: AbortSignal
   ): Promise<ClassTaskRunOutcome> {
+    const frozenFull = await this.checkpoints.fullSourceProgress(task.id);
+    if (frozenFull && (!this.methodExecution.executeFullSource || this.methodExecution.supportsFullSource?.() === false)) {
+      throw new Error('当前执行适配器不支持恢复完整源码协议。');
+    }
+    if (this.methodExecution.executeFullSource && this.methodExecution.supportsFullSource?.() !== false
+      && await this.checkpoints.executionModeForRun(task.id) === 'FULL_SOURCE') {
+      try {
+        await this.checkpoints.waitIfPausedAtBoundary(task.id);
+        this.throwIfStopped(task.id, signal);
+        const existing = await this.checkpoints.fullSourceProgress(task.id);
+        const full = await this.checkpoints.prepareFullSourceRun(task.id, existing?.identity ?? {
+          ...catalogIdentity, methodIds: [...methodOrder], repairAttemptLimit: task.repairAttemptLimit,
+          unlimitedRepair: task.unlimitedRepair
+        });
+        const outcome = await this.methodExecution.executeFullSource(this.checkpoints.snapshot(task.id), methodOrder, full, signal);
+        this.throwIfStopped(task.id, signal);
+        if (!this.methodExecution.formalizeFullSource) throw new Error('完整源码正式发布入口不可用。');
+        await this.methodExecution.formalizeFullSource(this.checkpoints.snapshot(task.id), outcome, signal);
+        if (outcome.bundles.length) await this.checkpoints.commitFullSourceResults(task.id);
+        if (await this.checkpoints.pauseAtBoundary(task.id)) return 'PAUSED';
+        return outcome.bundles.length ? 'COMPLETED' : 'NO_FORMAL_TEST_FILE';
+      } catch (error) {
+        if (error instanceof ClassTaskPausedAtBoundaryError) return 'PAUSED';
+        throw error;
+      }
+    }
     const progress = await this.checkpoints.prepareRun(task.id, {
       reset: false,
       catalogIdentity,
       resolvedMethodOrder: methodOrder,
-      completedMethodIdsFromArtifacts: generatedArtifactMethodIds(task)
+      completedMethodIdsFromArtifacts: generatedArtifactMethodIds(task),
+      requireWaveCompletionEvidence: this.methodExecution.nextClassWave !== undefined
     });
     if (this.methodExecution.nextClassWave) {
       if (!this.methodExecution.executeWave) {

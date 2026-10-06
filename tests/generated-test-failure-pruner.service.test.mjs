@@ -11,6 +11,26 @@ import {
 const candidatePath =
   'D:\\work\\manager-core\\src\\test\\java\\com\\example\\TaskServicePublicTmpTest.java';
 
+test('failed verification after try/catch preserves the preceding thread cleanup block', () => {
+  const cleanup = '        try {\n            thread.join(2000);\n        } catch (InterruptedException ignored) {\n        }';
+  const lines = ['package demo;', 'class TaskServiceTmp1Test {', '    @org.junit.jupiter.api.Test',
+    '    void waitsForWorker() {', '        Thread thread = startWorker();', cleanup,
+    '        sysParamsMock.verify(() -> Params.getValue("enabled"));',
+    '        verifyNoInteractions(repository);', '    }', '}'];
+  const code = lines.join('\n'), failureLine = code.split('\n').findIndex(l=>l.includes('sysParamsMock.verify'))+1;
+  const result = new GeneratedTestFailurePrunerService().prune({ code,
+    candidateFilePath: 'D:\\work\\module\\src\\test\\java\\demo\\TaskServiceTmp1Test.java',
+    execution: { status: 'test_failed', mavenExecutions: [mavenExecution('test',1)],
+      testReport: { reportCount:1,tests:1,failures:1,errors:0,skipped:0,
+        generatedTestClassName:'demo.TaskServiceTmp1Test',generatedTests:1,generatedSkipped:0,
+        failureDetails:[{ suiteName:'demo.TaskServiceTmp1Test',testClassName:'demo.TaskServiceTmp1Test',
+          testName:'waitsForWorker',kind:'failure',type:'Wanted but not invoked',message:'not invoked',
+          detail:`at demo.TaskServiceTmp1Test.waitsForWorker(TaskServiceTmp1Test.java:${failureLine})` }] } } });
+  assert.ok(result.code.includes(cleanup),'Unrelated thread cleanup must remain active and byte-identical');
+  assert.match(result.code,/\/\/ sysParamsMock\.verify/);
+  assert.deepEqual(activeTestNames(result.code),['waitsForWorker']);
+});
+
 const candidateCode = [
   'package com.example;',
   '',
@@ -131,7 +151,7 @@ test('Windows Maven 的 /D:/ 路径能够归属到 D:\\ 候选文件并注释对
   assert.equal(countRepairTodos(result.code), 1);
 });
 
-test('最后一轮编译错误命中无效 import 时注释使用它的测试并保留 import 原文', () => {
+test('无效 import 的编译错误不证明引用它的测试方法各自失败', () => {
   const filePath =
     'D:\\work\\module\\src\\test\\java\\demo\\TaskServiceTmp22Test.java';
   const lines = [
@@ -171,13 +191,8 @@ test('最后一轮编译错误命中无效 import 时注释使用它的测试并
     }
   });
 
-  assert.deepEqual(result.commentedMethods, ['failingScenario']);
-  assert.deepEqual(activeTestNames(result.code), ['passingScenario']);
-  assert.equal(countRepairTodos(result.code), 1);
-  assert.match(result.code, /^\/\/ import wrong\.package\.ReportUnit;$/m);
-  assert.match(result.code, /^import org\.junit\.jupiter\.api\.Test;$/m);
-  assert.match(result.code, /\/\/ void failingScenario\(\) \{/);
-  assert.match(result.code, /^\s*void passingScenario\(\) \{/m);
+  assert.deepEqual(result.commentedMethods, []);
+  assert.equal(result.code, code);
 });
 
 test('参数化 Surefire 展示名只能删除唯一匹配的测试方法', () => {
@@ -394,6 +409,54 @@ test('最后一轮只有断言失败时仅注释断言且不添加 TODO', () => 
   assert.doesNotMatch(result.code, /^\s*assertEquals\($/m);
 });
 
+for (const assertion of [
+  ['assertThrows block', '        assertThrows(ReportException.class, () -> {\n            taskService.deleteBbqForDistribution(hashMap);\n        });'],
+  ['assertThrows expression', '        assertThrows(ReportException.class, () -> taskService.deleteBbqForDistribution(hashMap));'],
+  ['assertThrows method reference', '        assertThrows(ReportException.class, taskService::deleteBbqForDistribution);'],
+  ['inline actual call', '        assertEquals(1, taskService.deleteBbqForDistribution(hashMap));'],
+  ['qualified assertDoesNotThrow', '        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> taskService.deleteBbqForDistribution(hashMap));']
+]) {
+  test(`failed ${assertion[0]} preserves the complete test as comments instead of leaving an active test without its act`, () => {
+    const lines = [
+      'package demo;',
+      'class TaskServicePublicTmpTest {',
+      '    @Test',
+      '    void failedExecutableAssertion() {',
+      '        when(dependency.load()).thenReturn("unused");',
+      assertion[1],
+      '    }',
+      '    @Test',
+      '    void remainingScenario() { taskService.run(); }',
+      '}'
+    ];
+    const code = lines.join('\n');
+    const failureLine = code.split('\n').findIndex((line) => /assert(?:Throws|Equals|DoesNotThrow)\(/.test(line)) + 1;
+    const result = new GeneratedTestFailurePrunerService().prune({
+      code,
+      candidateFilePath: candidatePath,
+      execution: {
+        status: 'test_failed',
+        mavenExecutions: [mavenExecution('test', 1)],
+        testReport: {
+          reportCount: 1, tests: 2, failures: 1, errors: 0, skipped: 0,
+          generatedTestClassName: 'demo.TaskServicePublicTmpTest',
+          generatedTests: 2, generatedSkipped: 0,
+          failureDetails: [{
+            testName: 'failedExecutableAssertion', kind: 'failure',
+            type: 'org.opentest4j.AssertionFailedError',
+            detail: `at demo.TaskServicePublicTmpTest.failedExecutableAssertion(TaskServicePublicTmpTest.java:${failureLine})`
+          }]
+        }
+      }
+    });
+    assert.deepEqual(activeTestNames(result.code), ['remainingScenario']);
+    assert.deepEqual(result.commentedMethods, ['failedExecutableAssertion']);
+    const restored = result.code.split('\n').filter((line) => !line.includes('TODO 当前测试方法需要修复'))
+      .map((line) => line.replace(/^(\s*)\/\/ ?/, '$1')).join('\n');
+    assert.equal(restored, code, 'the complete failed test remains recoverable');
+  });
+}
+
 test('即使所有测试方法都被精确定位，仍保留分类文件的类与辅助结构', () => {
   const code = [
     'package com.example;',
@@ -450,7 +513,7 @@ test('即使所有测试方法都被精确定位，仍保留分类文件的类�
   assert.notEqual(result.code.trim(), '');
 });
 
-test('compiler failure in a helper comments only its calling test and preserves all support members', () => {
+test('compiler failure in a helper preserves its callers until they actually fail', () => {
   const filePath = 'D:\\work\\module\\src\\test\\java\\demo\\TaskServiceTmp1Test.java';
   const code = [
     'package demo;',
@@ -499,16 +562,8 @@ test('compiler failure in a helper comments only its calling test and preserves 
     }
   });
 
-  assert.deepEqual(result.commentedMethods, ['failingScenario']);
-  assert.deepEqual(activeTestNames(result.code), ['passingScenario']);
-  assert.equal(countRepairTodos(result.code), 1);
-  assert.match(result.code, /void passingScenario\(\)/);
-  assert.match(result.code, /void sharedHelper\(\)/);
-  assert.match(result.code, /import demo\.SharedType;/);
-  assert.match(result.code, /\/\/ void failingScenario\(\) \{/);
-  assert.match(result.code, /private void brokenHelper/);
-  assert.match(result.code, /private MissingType failureOnlyField/);
-  assert.match(result.code, /import demo\.MissingType;/);
+  assert.deepEqual(result.commentedMethods, []);
+  assert.equal(result.code, code);
 });
 
 test('Mockito unnecessary stubbing comments only the reported statement and keeps the test active', () => {
@@ -649,7 +704,7 @@ test('Mockito unnecessary stubbing comments every reported statement in one prun
   assert.match(result.code, /^\s*dependency\.run\(\);$/m);
 });
 
-test('compiler failure in support shared by two tests comments every caller but preserves support source', () => {
+test('compiler failure in shared support does not erase all tests', () => {
   const filePath = 'D:\\work\\module\\src\\test\\java\\demo\\TaskServiceTmp1Test.java';
   const code = [
     'package demo;',
@@ -680,15 +735,11 @@ test('compiler failure in support shared by two tests comments every caller but 
     }
   });
 
-  assert.deepEqual(result.commentedMethods, ['firstScenario', 'secondScenario']);
-  assert.deepEqual(activeTestNames(result.code), []);
-  assert.equal(countRepairTodos(result.code), 2);
-  assert.match(result.code, /private void sharedBrokenHelper\(\)/);
-  assert.match(result.code, /^\s*MissingType value = null;$/m);
-  assert.doesNotMatch(result.code, /^\s*\/\/ MissingType value = null;$/m);
+  assert.deepEqual(result.commentedMethods, []);
+  assert.equal(result.code, code);
 });
 
-test('compiler failure reached through nested helpers comments only the failed test method', () => {
+test('compiler failure in a transitive helper preserves the unexecuted test', () => {
   const filePath = 'D:\\work\\module\\src\\test\\java\\demo\\TaskServiceTmp1Test.java';
   const code = [
     'package demo;',
@@ -717,15 +768,8 @@ test('compiler failure reached through nested helpers comments only the failed t
     }
   });
 
-  assert.deepEqual(result.commentedMethods, ['failingScenario']);
-  assert.deepEqual(activeTestNames(result.code), []);
-  assert.match(result.code, /\/\/ @Test void failingScenario\(\) throws Exception/);
-  assert.match(result.code, /^\s*private void injectMock\(\) throws Exception \{ findField\(\); \}$/m);
-  assert.match(
-    result.code,
-    /^\s*private void findField\(\) throws java\.lang\.reflect\.NoSuchFieldException \{\}$/m
-  );
-  assert.doesNotMatch(result.code, /\/\/ private void (?:injectMock|findField)/);
+  assert.deepEqual(result.commentedMethods, []);
+  assert.equal(result.code, code);
 });
 
 test('keeps a multi-variable field declaration when a surviving test still uses one variable', () => {

@@ -152,7 +152,7 @@ export class MavenBatchDiagnosticAttributionService {
 
     const consoleOutput = [input.stdout, input.stderr].filter(Boolean).join('\n');
     for (const candidate of input.candidates) {
-      if (results[candidate.candidateId].status !== 'UNPROVEN') continue;
+      if (results[candidate.candidateId].status === 'TEST_FAILED') continue;
       const diagnostic = explicitSurefireConsoleFailure(
         consoleOutput,
         candidate.qualifiedTestClassName
@@ -173,7 +173,11 @@ export class MavenBatchDiagnosticAttributionService {
       );
       if (matchingCandidates.length !== 1) continue;
       const candidate = matchingCandidates[0];
-      if (results[candidate.candidateId].status !== 'UNPROVEN') continue;
+      if (results[candidate.candidateId].status === 'TEST_FAILED') continue;
+      // Passing XML may precede a fork crash. Only fatal evidence can override
+      // that XML; harmless channel warnings must not turn a passed test failed.
+      if (results[candidate.candidateId].status === 'PASSED'
+        && !/(?:^|\n)\s*(?:\[[A-Z]+\]\s*)?(?:Exception in thread "[^"]+"\s+|Caused by:\s*)?(?:[\w$.]+\.)?(?:OutOfMemoryError|StackOverflowError|TimeoutException)(?=[:\s]|$)/u.test(artifact.content)) continue;
       results[candidate.candidateId] = {
         candidateId: candidate.candidateId,
         status: 'TEST_FAILED',

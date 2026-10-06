@@ -1,5 +1,7 @@
 import { basename, dirname, relative, resolve, sep } from 'node:path';
 import { createHash, randomUUID as nodeRandomUUID } from 'node:crypto';
+import { AtomicJsonStore } from './atomic-json-store.ts';
+import { AbnormalTestPrunerService, type RemovedAbnormalTest } from './abnormal-test-pruner.service.ts';
 import type {
   BackendLlmConfig,
   BuildToolchainContext,
@@ -120,7 +122,8 @@ import {
   type StoredMethodWavePart
 } from './method-wave-part-store.service.ts';
 import {
-  StableTestRepairService
+  StableTestRepairService,
+  type StableRepairChangeEvidence
 } from './stable-test-repair.service.ts';
 
 export type SingleMethodGenerationContext = {
@@ -243,6 +246,19 @@ export type SingleMethodGenerationOptions = {
   randomUUID?: () => string;
   structure?: JavaTestStructureService;
   analysisHeartbeatIntervalMs?: number;
+  methodGenerationWaveProgressTimeoutMilliseconds?: number;
+};
+
+type WaveCandidateFailureRecord = {
+  taskId: string;
+  candidateId: string;
+  waveId: string;
+  methodId: string;
+  occurredAt: string;
+  fileSha256: string;
+  llmRepairAttemptsUsed: number;
+  repairAttemptLimit: number | null;
+  execution: CandidateExecutionFeedback;
 };
 
 export type SingleMethodGenerationExecutionOptions = {
@@ -259,6 +275,7 @@ export type GeneratedMethodBatches = {
 
 const DEFAULT_ANALYSIS_HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_RAG_INDEX_REFRESH_WAIT_MILLISECONDS = 600_000;
+const DEFAULT_METHOD_GENERATION_WAVE_PROGRESS_TIMEOUT_MILLISECONDS = 5 * 60_000;
 const STANDARD_TEST_REPAIR_IMPORTS = Object.freeze([
   'org.junit.jupiter.api.Assertions.*',
   'org.mockito.ArgumentMatchers.*',
@@ -282,6 +299,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
   private readonly stableRepair: Pick<StableTestRepairService, 'repair'>;
   private readonly analysisHeartbeatIntervalMs: number;
   private readonly ragIndexRefreshWaitMilliseconds: number;
+  private readonly methodGenerationWaveProgressTimeoutMilliseconds: number;
 
   constructor(options: SingleMethodGenerationOptions) {
     this.options = options;
@@ -297,9 +315,16 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       ?? DEFAULT_ANALYSIS_HEARTBEAT_INTERVAL_MS;
     this.ragIndexRefreshWaitMilliseconds = options.ragIndexRefreshWaitMilliseconds
       ?? DEFAULT_RAG_INDEX_REFRESH_WAIT_MILLISECONDS;
+    this.methodGenerationWaveProgressTimeoutMilliseconds =
+      options.methodGenerationWaveProgressTimeoutMilliseconds
+        ?? DEFAULT_METHOD_GENERATION_WAVE_PROGRESS_TIMEOUT_MILLISECONDS;
     if (!Number.isFinite(this.analysisHeartbeatIntervalMs)
       || this.analysisHeartbeatIntervalMs <= 0) {
       throw new Error('Analyzer heartbeat interval must be a positive number.');
+    }
+    if (!Number.isSafeInteger(this.methodGenerationWaveProgressTimeoutMilliseconds)
+      || this.methodGenerationWaveProgressTimeoutMilliseconds <= 0) {
+      throw new Error('Method generation Wave progress timeout must be a positive integer.');
     }
     if (
       !Number.isSafeInteger(this.ragIndexRefreshWaitMilliseconds)
@@ -349,15 +374,8 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       throw new Error('Active Wave has multiple persisted merged candidates.');
     }
     const existingCandidate = existingCandidates[0];
-    if (existingCandidate?.status === 'BLOCKED') {
-      throw new Error(
-        'Stable repair is blocked by a Maven failure outside the generated test. '
-        + 'The generated test source was preserved; resolve the project failure manually.'
-      );
-    }
     const rebuildableCandidateId = existingCandidate
       && existingCandidate.status === 'MODEL_REPAIR'
-      && existingCandidate.llmRepairAttemptsUsed === 0
       && existingCandidate.stableRepair.phase === 'NOT_STARTED'
       && existingCandidate.managedFile === null
       && existingCandidate.moveTransaction === null
@@ -373,12 +391,25 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       ? Math.max(waveCheckpoint.waveIndex, completedClassWaveCount + 1)
       : waveCheckpoint.waveIndex;
     const outputTestClassName = `${sourceClassName}Tmp${candidateFileIndex}Test`;
+    if (existingCandidate?.status === 'QUARANTINED') {
+      const managed = existingCandidate.managedFile;
+      if (!managed || managed.location !== 'ISOLATED' || !samePath(managed.path,
+        waveCandidateFailurePath(task, existingCandidate.candidateId, outputTestClassName))) {
+        throw new Error('Quarantined candidate file identity is inconsistent.');
+      }
+      await this.options.writer.loadOwnedGeneratedTest({ workspaceRoot: task.workspaceRoot,
+        filePath: managed.path, expectedSha256: managed.sha256 });
+      await this.candidateFailureStore(task.id, existingCandidate.candidateId,
+        `${managed.path}.failure.json`, managed.sha256).read();
+      return quarantinedWaveOutcome(wave);
+    }
     if (existingCandidate && rebuildableCandidateId === null && [
       'GENERATED',
       'READY_FOR_MAVEN',
       'MAVEN_RUNNING',
       'MODEL_REPAIR',
       'STABLE_REPAIR',
+      'BLOCKED',
       'PASSED'
     ].includes(existingCandidate.status)) {
       const acceptedPartIndexes = new Set(
@@ -426,6 +457,19 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         }
       }
       const managed = existingCandidate.managedFile;
+      if (!managed && existingCandidate.status === 'PASSED'
+        && existingCandidate.moveTransaction === null
+        && existingCandidate.stableRepair.phase === 'NOT_STARTED'
+        && waveCheckpoint.startRequest
+        && (waveCheckpoint.waveSessionId || waveCheckpoint.recoveryRequestId)) {
+        // Publication may fail after Maven passed and terminal cleanup removed TMP.
+        // Recover the Agent's Parts, then verify a rebuilt candidate with the same
+        // identity and remaining repair budget; the old Maven pass is not reused.
+        await this.options.checkpoints.saveWaveCandidate(task.id, {
+          ...existingCandidate, status: 'MODEL_REPAIR'
+        });
+        return this.executeWave(task, wave, checkpoint, waveCheckpoint, signal);
+      }
       if (!managed) throw new Error('Wave candidate has no managed TMP recovery identity.');
       const testClassName = basename(managed.path, '.java');
       const isolationFilePath = waveCandidateIsolationPath(
@@ -544,8 +588,23 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
             ordinaryTestMethodCount: methods.length,
             usage: null
           };
-          const resumeStableRepair = existingCandidate.status === 'STABLE_REPAIR'
-            || existingCandidate.stableRepair.phase !== 'NOT_STARTED';
+          // Older clients entered stable repair after one failed Agent session,
+          // even with repair attempts left. A candidate-local failure can still
+          // use that durable budget; repeating stable repair cannot recover it.
+          const resumeModelRepair = existingCandidate.status === 'BLOCKED'
+            && !candidateCheckpoint.unlimitedRepair
+            && recoveredRepairAttempt < (candidateCheckpoint.repairAttemptLimit as number)
+            && this.diagnostic.normalize({
+              execution,
+              generatedTestFilePath: projectFilePath,
+              generatedTestClassName: qualifiedName(context.packageName, testClassName),
+              targetProductionClassName: task.qualifiedClassName,
+              targetProductionFilePath: task.sourceFilePath
+            }).compilerErrors.length > 0;
+          const resumeStableRepair = !resumeModelRepair && (
+            existingCandidate.status === 'STABLE_REPAIR'
+            || existingCandidate.stableRepair.phase !== 'NOT_STARTED'
+          );
           if (resumeStableRepair) {
             const stabilized = await this.stabilizeMergedWaveCandidate({
               task,
@@ -555,6 +614,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
               checkpoint: candidateCheckpoint,
               signal
             });
+            if (stabilized.quarantined) return quarantinedWaveOutcome(wave);
             ({ owned, execution, candidateCheckpoint, retainedEmpty } = stabilized);
           } else {
             candidateCheckpoint = await this.options.checkpoints.saveWaveCandidate(
@@ -577,6 +637,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
               checkpoint: candidateCheckpoint,
               signal
             });
+            if (repaired.quarantined) return quarantinedWaveOutcome(wave);
             ({ owned, execution, candidateCheckpoint, retainedEmpty } = repaired);
           }
           methods = this.structure.findTestMethods(owned.code);
@@ -594,7 +655,12 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         }
         candidateCheckpoint = await this.options.checkpoints.saveWaveCandidate(
           task.id,
-          updateWaveCandidateCheckpoint(candidateCheckpoint, owned, 'PASSED')
+          {
+            ...updateWaveCandidateCheckpoint(candidateCheckpoint, owned, 'PASSED'),
+            ...(existingCandidate.status === 'BLOCKED' ? {
+              stableRepair: { ...candidateCheckpoint.stableRepair, phase: 'PASSED' as const }
+            } : {})
+          }
         );
       } else if (candidateCheckpoint.managedFile?.location !== 'PROJECT') {
         throw new Error('Passing Wave candidate has no project TMP recovery identity.');
@@ -635,7 +701,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       );
     }
     const context = await this.options.contextProvider.resolve(task, signal);
-    if (context.reportPairId !== wave.reportPairId) {
+    if (context.reportPairId !== wave.reportPairId && !waveCheckpoint.startRequest) {
       throw new Error('Method Wave belongs to a stale coverage report.');
     }
     const generatedStartRequest = buildMethodGenerationWaveRequest({
@@ -674,33 +740,14 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       const checkpointPart = requireWaveCheckpointPart(activeWave, part.partIndex);
       applyTerminalPartCheckpoint(checkpointPart, result);
       if (result.status !== 'succeeded') return;
+      let candidate: MethodCandidate;
       try {
-        const candidate = requireSuccessfulWavePartCandidate(
+        candidate = requireSuccessfulWavePartCandidate(
           result,
           part,
           wave.methodId,
           outputPartTestClassName(sourceClassName, waveCheckpoint.waveIndex, part.partIndex)
         );
-        const stored = await this.partStore.store({
-          workspaceRoot: task.workspaceRoot,
-          taskId: task.id,
-          methodId: wave.methodId,
-          sourceClassName,
-          waveIndex: waveCheckpoint.waveIndex,
-          partIndex: part.partIndex,
-          partBatchId: part.partBatchId,
-          scenarioIds: part.scenarioIds,
-          candidateId: candidate.candidateId,
-          code: candidate.testCode
-        });
-        Object.assign(checkpointPart, {
-          status: 'SUCCEEDED',
-          childSessionId: result.childSessionId,
-          candidateId: stored.candidateId,
-          isolatedFilePath: stored.filePath,
-          fileSha256: stored.sha256,
-          failureReason: null
-        });
       } catch (error) {
         Object.assign(checkpointPart, {
           status: 'FAILED',
@@ -710,10 +757,35 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           fileSha256: null,
           failureReason: compactWaveFailure(error)
         });
+        return;
       }
+      // A local I/O or identity conflict is not an invalid model candidate. Let
+      // recovery handle it instead of silently marking its scenarios as skipped.
+      const stored = await this.partStore.store({
+        workspaceRoot: task.workspaceRoot,
+        taskId: task.id,
+        methodId: wave.methodId,
+        sourceClassName,
+        waveIndex: waveCheckpoint.waveIndex,
+        partIndex: part.partIndex,
+        partBatchId: part.partBatchId,
+        scenarioIds: part.scenarioIds,
+        candidateId: candidate.candidateId,
+        code: candidate.testCode
+      });
+      Object.assign(checkpointPart, {
+        status: 'SUCCEEDED',
+        childSessionId: result.childSessionId,
+        candidateId: stored.candidateId,
+        isolatedFilePath: stored.filePath,
+        fileSha256: stored.sha256,
+        failureReason: null
+      });
     };
+    let refreshWaveProgressDeadline: (() => void) | null = null;
     const onProgress = async (event: MethodGenerationWaveEvent): Promise<void> => {
       if (event.eventSequence <= activeWave.eventSequence) return;
+      refreshWaveProgressDeadline?.();
       activeWave = applyMethodGenerationWaveEvent(activeWave, event);
       waveSessionId = activeWave.waveSessionId;
       const terminalParts = event.partResult
@@ -855,7 +927,9 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
     };
     const locallyCompletedWaveTurn = async ():
       Promise<MethodGenerationWaveTurnResult | null> => {
-      if (!activeWave.waveSessionId) return null;
+      // An explicit recovery identity means the previous turn failed or was
+      // cancelled. Reconcile that turn with the Agent before consuming its Parts.
+      if (!activeWave.waveSessionId || activeWave.recoveryRequestId) return null;
       let terminalParts: MethodGenerationWavePartResult[];
       try {
         terminalParts = await terminalPartsFromCheckpoint();
@@ -884,7 +958,56 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         }
       };
     };
-    const recoverMissingWaveSession = async (forceNewRequest = false) => {
+    const resetTerminalWaveIfPartScratchIsUnavailable = async (): Promise<boolean> => {
+      if (!activeWave.waveSessionId && !activeWave.recoveryRequestId) return false;
+      const terminal = activeWave.parts.length === wave.parts.length
+        && activeWave.parts.every((part) => (
+          part.status === 'SUCCEEDED'
+            || part.status === 'FAILED'
+            || part.status === 'CANCELLED'
+        ));
+      if (!terminal) return false;
+      try {
+        for (const part of activeWave.parts) {
+          if (part.status === 'SUCCEEDED') await terminalPartFromCheckpoint(part);
+        }
+        // A model-failed Part is intentionally absent from recovery input. Its
+        // absence must not discard the successfully persisted sibling Parts.
+        return false;
+      } catch {
+        // A complete terminal checkpoint whose durable Part files are gone cannot be
+        // replayed safely after a client restart. Start this Wave from the model again.
+      }
+      activeWave = await this.options.checkpoints.saveActiveMethodWave(task.id, {
+        ...activeWave,
+        waveSessionId: null,
+        recoveryRequestId: null,
+        eventSequence: 0,
+        initialUsageRecorded: false,
+        parts: activeWave.parts.map((part) => ({
+          partIndex: part.partIndex,
+          partBatchId: part.partBatchId,
+          scenarioIds: [...part.scenarioIds],
+          status: 'PENDING' as const,
+          eventSequence: 0,
+          childSessionId: null,
+          candidateId: null,
+          isolatedFilePath: null,
+          fileSha256: null,
+          failureReason: null,
+          aggregateUsage: null,
+          modelCallCount: 0,
+          usageReportedCallCount: 0
+        }))
+      });
+      waveSessionId = null;
+      await this.clearStoredWaveParts(task, wave, waveCheckpoint.waveIndex);
+      return true;
+    };
+    const recoverMissingWaveSession = async (
+      forceNewRequest = false,
+      operationSignal: AbortSignal = signal
+    ) => {
       const recoveryRequestId = forceNewRequest
         ? this.randomUUID()
         : activeWave.recoveryRequestId ?? this.randomUUID();
@@ -907,19 +1030,65 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         },
         context.modelContext,
         onProgress,
-        signal
+        operationSignal
       );
     };
-    const recoverWaveSession = async (forceNewRequest = false) => {
+    const recoverWaveSession = async (
+      forceNewRequest = false,
+      operationSignal: AbortSignal = signal
+    ) => {
       try {
-        return await recoverMissingWaveSession(forceNewRequest);
+        return await recoverMissingWaveSession(forceNewRequest, operationSignal);
       } catch (error) {
         if (!forceNewRequest
           && error instanceof MethodGenerationRequestError
           && error.code === 'METHOD_GENERATION_WAVE_IDEMPOTENCY_CONFLICT') {
-          return recoverMissingWaveSession(true);
+          return recoverMissingWaveSession(true, operationSignal);
         }
         throw error;
+      }
+    };
+    const runWaveTurnWithProgressTimeout = async (
+      operation: (operationSignal: AbortSignal) => Promise<MethodGenerationWaveTurnResult>
+    ): Promise<MethodGenerationWaveTurnResult> => {
+      const controller = new AbortController();
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      let timeoutError: MethodGenerationRequestError | null = null;
+      const clearProgressTimeout = (): void => {
+        if (!timeout) return;
+        clearTimeout(timeout);
+        timeout = null;
+      };
+      const abortFromTask = (): void => {
+        controller.abort(signal.reason);
+      };
+      const armProgressTimeout = (): void => {
+        clearProgressTimeout();
+        timeout = setTimeout(() => {
+          timeoutError = new MethodGenerationRequestError(
+            'MODEL_WAVE_IDLE_TIMEOUT',
+            '模型生成长时间没有返回进度，已停止本轮生成，请稍后继续执行。'
+          );
+          controller.abort(timeoutError);
+        }, this.methodGenerationWaveProgressTimeoutMilliseconds);
+        if (typeof timeout.unref === 'function') timeout.unref();
+      };
+      const previousRefreshWaveProgressDeadline = refreshWaveProgressDeadline;
+      refreshWaveProgressDeadline = armProgressTimeout;
+      signal.addEventListener('abort', abortFromTask, { once: true });
+      try {
+        if (signal.aborted) abortFromTask();
+        else armProgressTimeout();
+        return await operation(controller.signal);
+      } catch (error) {
+        if (timeoutError && controller.signal.aborted && !signal.aborted) {
+          throw timeoutError;
+        }
+        throw error;
+      } finally {
+        clearProgressTimeout();
+        signal.removeEventListener('abort', abortFromTask);
+        refreshWaveProgressDeadline = previousRefreshWaveProgressDeadline;
       }
     };
     let turn;
@@ -929,33 +1098,77 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           const localTurn = await locallyCompletedWaveTurn();
           if (localTurn) return localTurn;
           try {
-            return await this.options.agent.resumeMethodGenerationWaveStream(
-              activeWave.waveSessionId,
-              startRequest,
-              activeWave.eventSequence,
-              onProgress,
-              signal
-            );
+            return await runWaveTurnWithProgressTimeout((operationSignal) => (
+              this.options.agent.resumeMethodGenerationWaveStream(
+                activeWave.waveSessionId as string,
+                startRequest,
+                activeWave.eventSequence,
+                onProgress,
+                operationSignal
+              )
+            ));
           } catch (error) {
             if (error instanceof MethodGenerationWaveNotFoundError) {
-              return recoverWaveSession();
+              if (await resetTerminalWaveIfPartScratchIsUnavailable()) {
+                return runWaveTurnWithProgressTimeout((operationSignal) => (
+                  this.options.agent.streamMethodGenerationWave(
+                    startRequest, context.modelContext, onProgress, operationSignal
+                  )
+                ));
+              }
+              return runWaveTurnWithProgressTimeout((operationSignal) => (
+                recoverWaveSession(false, operationSignal)
+              ));
             }
             if (error instanceof MethodGenerationRequestError
               && error.code.startsWith('MODEL_')) {
-              return recoverWaveSession(true);
+              if (await resetTerminalWaveIfPartScratchIsUnavailable()) {
+                return runWaveTurnWithProgressTimeout((operationSignal) => (
+                  this.options.agent.streamMethodGenerationWave(
+                    startRequest, context.modelContext, onProgress, operationSignal
+                  )
+                ));
+              }
+              return runWaveTurnWithProgressTimeout((operationSignal) => (
+                recoverWaveSession(true, operationSignal)
+              ));
             }
             throw error;
           }
         }
-        if (activeWave.recoveryRequestId) return recoverWaveSession();
-        return this.options.agent.streamMethodGenerationWave(
+        if (activeWave.recoveryRequestId) {
+          if (await resetTerminalWaveIfPartScratchIsUnavailable()) {
+            return runWaveTurnWithProgressTimeout((operationSignal) => (
+              this.options.agent.streamMethodGenerationWave(
+              startRequest,
+              context.modelContext,
+              onProgress,
+                operationSignal
+              )
+            ));
+          }
+          return runWaveTurnWithProgressTimeout((operationSignal) => (
+            recoverWaveSession(false, operationSignal)
+          ));
+        }
+        return runWaveTurnWithProgressTimeout((operationSignal) => (
+          this.options.agent.streamMethodGenerationWave(
             startRequest,
             context.modelContext,
             onProgress,
-            signal
-          );
+            operationSignal
+          )
+        ));
       });
     } catch (error) {
+      if (
+        error instanceof MethodGenerationRequestError
+        && error.code === 'MODEL_WAVE_IDLE_TIMEOUT'
+        && waveSessionId
+      ) {
+        void this.options.agent.cancelMethodGenerationWave(waveSessionId)
+          .catch(() => undefined);
+      }
       if (signal.aborted && waveSessionId) {
         const cancelledWaveSessionId = waveSessionId;
         if (isClassTaskPauseRequestedError(signal.reason)) {
@@ -987,6 +1200,22 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
             // Preserve the original generation error; recovery will reconcile the session.
           }
         }
+      }
+      if (
+        error instanceof MethodGenerationRequestError
+        && error.code.startsWith('MODEL_')
+        && activeWave.parts.some((part) => (
+          part.status === 'SUCCEEDED'
+            || part.status === 'FAILED'
+            || part.status === 'CANCELLED'
+        ))
+      ) {
+        activeWave = await this.options.checkpoints.saveActiveMethodWave(task.id, {
+          ...activeWave,
+          waveSessionId: error.code === 'MODEL_WAVE_IDLE_TIMEOUT' ? null : activeWave.waveSessionId,
+          recoveryRequestId: this.randomUUID()
+        });
+        waveSessionId = null;
       }
       throw error;
     }
@@ -1190,10 +1419,12 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       acceptedPartIndexes.has(part.partIndex) ? part.scenarioIds : []
     ));
     const candidateId = rebuildableCandidateId ?? this.randomUUID();
+    const retainedRepairAttempts = rebuildableCandidateId
+      ? existingCandidate?.llmRepairAttemptsUsed ?? 0 : 0;
     const candidate: MethodCandidate = {
       candidateId,
-      candidateVersion: 1,
-      repairAttempt: 0,
+      candidateVersion: retainedRepairAttempts + 1,
+      repairAttempt: retainedRepairAttempts,
       methodId: wave.methodId,
       batchId: wave.waveBatchId,
       batchIndex: waveCheckpoint.waveIndex,
@@ -1215,6 +1446,11 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
     let execution: CandidateExecutionFeedback;
     let candidateCheckpoint: WaveCandidateCheckpoint;
     let retainedEmpty = false;
+    const rebuiltCheckpoint = (written: OwnedCandidateFile): WaveCandidateCheckpoint => (
+      rebuildableCandidateId && existingCandidate
+        ? updateWaveCandidateCheckpoint(existingCandidate, written, 'READY_FOR_MAVEN')
+        : waveCandidateCheckpoint(task, wave, candidateId, written, 'READY_FOR_MAVEN')
+    );
     if (this.options.mavenReadyQueue) {
       let projectFilePath: string;
       ({ owned, candidateCheckpoint, projectFilePath } = await this.options.moduleLock
@@ -1224,7 +1460,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
             const written = await this.writeCandidate(task, context, candidate, null);
             let saved = await this.options.checkpoints.saveWaveCandidate(
               task.id,
-              waveCandidateCheckpoint(task, wave, candidateId, written, 'READY_FOR_MAVEN')
+              rebuiltCheckpoint(written)
             );
             const isolated = await this.moveQueuedWaveCandidate({
               task,
@@ -1265,7 +1501,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           const written = await this.writeCandidate(task, context, candidate, null);
           const saved = await this.options.checkpoints.saveWaveCandidate(
             task.id,
-            waveCandidateCheckpoint(task, wave, candidateId, written, 'READY_FOR_MAVEN')
+            rebuiltCheckpoint(written)
           );
           await this.clearStoredWaveParts(task, wave, waveCheckpoint.waveIndex);
           const result = await this.executeMaven(
@@ -1301,6 +1537,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         checkpoint: candidateCheckpoint,
         signal
       });
+      if (repaired.quarantined) return quarantinedWaveOutcome(wave);
       ({ owned, execution, candidateCheckpoint, retainedEmpty } = repaired);
     }
     const methods = this.structure.findTestMethods(owned.code);
@@ -1389,7 +1626,22 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
     execution: CandidateExecutionFeedback;
     candidateCheckpoint: WaveCandidateCheckpoint;
     retainedEmpty: boolean;
+    quarantined?: boolean;
   }> {
+    const discarded = await this.discardAbnormalWaveTests(input);
+    if (discarded.removed) {
+      input = { ...input, ...discarded, candidate: {
+        ...input.candidate, testCode: discarded.owned.code,
+        generatedCodeSha256: discarded.owned.sha256,
+        ordinaryTestMethodCount: this.structure.findTestMethods(discarded.owned.code).length
+      } };
+      if (discarded.execution.status === 'passed' && discarded.execution.testReport) {
+        return { ...discarded, candidateCheckpoint: discarded.checkpoint, retainedEmpty: false };
+      }
+      if (this.structure.findTestMethods(discarded.owned.code).length === 0) {
+        return this.stabilizeMergedWaveCandidate(input);
+      }
+    }
     const plannedTestMethodNames = this.structure
       .findTestMethods(input.owned.code)
       .map((method) => method.name);
@@ -1454,9 +1706,56 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
     let checkpoint = input.checkpoint;
     let sessionTerminal = false;
 
+    const continueAfterInvalidOutput = async () => {
+      await this.cancelAgentSession(input.task.id, sessionId);
+      sessionTerminal = true;
+      // A bounded output failure consumes this attempt. Rebuild from the last
+      // accepted file, never from a rejected candidate or a terminal session.
+      if (!checkpoint.unlimitedRepair
+        && checkpoint.llmRepairAttemptsUsed < (checkpoint.repairAttemptLimit as number)) {
+        return this.repairMergedWaveCandidate({
+          ...input,
+          candidate: {
+            ...candidate,
+            candidateVersion: checkpoint.llmRepairAttemptsUsed + 1,
+            repairAttempt: checkpoint.llmRepairAttemptsUsed,
+            testCode: owned.code,
+            generatedCodeSha256: owned.sha256,
+            ordinaryTestMethodCount: this.structure.findTestMethods(owned.code).length
+          },
+          owned,
+          execution,
+          checkpoint
+        });
+      }
+      return this.stabilizeMergedWaveCandidate({
+        task: input.task,
+        context: input.context,
+        owned,
+        execution,
+        checkpoint,
+        signal: input.signal
+      });
+    };
+
     try {
       while (execution.status !== 'passed') {
         throwIfAborted(input.signal);
+        if (new AbnormalTestPrunerService().remove({
+          code: owned.code,
+          generatedTestClassName: qualifiedName(input.context.packageName, owned.testClassName),
+          execution
+        }).removedMethods.length > 0) {
+          // Rebase the session's planned identities after deterministic deletion.
+          // A newly timed-out repair must not consume another model attempt.
+          await this.cancelAgentSession(input.task.id, sessionId);
+          sessionTerminal = true;
+          return this.repairMergedWaveCandidate({
+            ...input, owned, execution, checkpoint,
+            candidate: { ...candidate, testCode: owned.code, generatedCodeSha256: owned.sha256,
+              ordinaryTestMethodCount: this.structure.findTestMethods(owned.code).length }
+          });
+        }
         if (!checkpoint.unlimitedRepair
           && checkpoint.llmRepairAttemptsUsed >= (checkpoint.repairAttemptLimit as number)) {
           await this.cancelAgentSession(input.task.id, sessionId);
@@ -1487,27 +1786,31 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           targetProductionFilePath: input.task.sourceFilePath
         });
         const analyzerStartedAt = performance.now();
-        const repairContext = await this.resolveRepairContext(
-          input.context,
-          page,
-          diagnostic,
-          owned.code,
-          input.signal
-        );
+        const repairContext = await this.atomic(input.task.id, 'ANALYZE_METHOD', () => (
+          this.resolveRepairContext(
+            input.context,
+            page,
+            diagnostic,
+            owned.code,
+            input.signal
+          )
+        ));
         const analyzerDurationMs = elapsedMilliseconds(analyzerStartedAt);
         let mavenDurationMs: number | null = null;
         if (input.context.ragContext) {
-          ragRepairAttempt = await this.prepareRagRepairAttempt(
-            input.context,
-            page,
-            sessionId,
-            eventSequence,
-            candidate,
-            owned,
-            execution,
-            repairContext,
-            input.signal
-          );
+          ragRepairAttempt = await this.atomic(input.task.id, 'ANALYZE_METHOD', () => (
+            this.prepareRagRepairAttempt(
+              input.context,
+              page,
+              sessionId,
+              eventSequence,
+              candidate,
+              owned,
+              execution,
+              repairContext,
+              input.signal
+            )
+          ));
         }
 
         checkpoint = await this.options.checkpoints.saveWaveCandidate(
@@ -1565,16 +1868,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
             throw error;
           }
           modelRepairAttemptOpen = false;
-          await this.cancelAgentSession(input.task.id, sessionId);
-          sessionTerminal = true;
-          return this.stabilizeMergedWaveCandidate({
-            task: input.task,
-            context: input.context,
-            owned,
-            execution,
-            checkpoint,
-            signal: input.signal
-          });
+          return await continueAfterInvalidOutput();
         }
         eventSequence = resumed.eventSequence;
         if (resumed.kind === 'completed') {
@@ -1694,6 +1988,10 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
               );
               modelRepairAttemptOpen = false;
             } catch (error) {
+              if (isRepairOutputRetryExhaustedError(error)) {
+                modelRepairAttemptOpen = false;
+                return await continueAfterInvalidOutput();
+              }
               await rollbackOpenModelRepairAttempt();
               throw error;
             }
@@ -1854,6 +2152,108 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
     }
   }
 
+  private async discardAbnormalWaveTests(input: {
+    task: ClassTaskSnapshot; context: SingleMethodGenerationContext;
+    owned: OwnedCandidateFile; execution: CandidateExecutionFeedback;
+    checkpoint: WaveCandidateCheckpoint; signal: AbortSignal;
+  }) {
+    let owned = input.owned;
+    let execution = input.execution;
+    let checkpoint = input.checkpoint;
+    let removed = false;
+    while (true) {
+      throwIfAborted(input.signal);
+      const result = new AbnormalTestPrunerService().remove({
+        code: owned.code, generatedTestClassName: qualifiedName(input.context.packageName, owned.testClassName), execution
+      });
+      if (result.removedMethods.length === 0) return { owned, execution, checkpoint, removed };
+      ({ owned, execution, checkpoint } = await this.options.moduleLock.runExclusive(input.task.moduleKey, async () => {
+        if (checkpoint.managedFile?.location === 'ISOLATED') {
+          const active = await this.moveQueuedWaveCandidate({
+            task: input.task, candidateId: checkpoint.candidateId, owned, checkpoint,
+            targetPath: waveCandidateProjectPath(input.task, input.context, owned.testClassName),
+            targetLocation: 'PROJECT', status: 'MODEL_REPAIR'
+          });
+          owned = active.owned;
+          checkpoint = active.checkpoint;
+        }
+        await this.recordRemovedAbnormalTests(input.task, checkpoint, owned, result.removedMethods, execution);
+        const replacement = this.options.writer.prepareReplacement({
+          workspaceRoot: input.task.workspaceRoot, filePath: owned.filePath, content: result.code
+        });
+        const written = await this.options.writer.replacePreparedGeneratedTest({
+          workspaceRoot: input.task.workspaceRoot, filePath: owned.filePath,
+          expectedSha256: owned.sha256, prepared: replacement
+        });
+        owned = { ...owned, code: replacement.content, sha256: written.sha256 };
+        checkpoint = await this.options.checkpoints.saveWaveCandidate(input.task.id,
+          updateWaveCandidateCheckpoint(checkpoint, owned, checkpoint.stableRepair.phase === 'NOT_STARTED'
+            ? 'MODEL_REPAIR' : 'STABLE_REPAIR'));
+        const nextExecution = await this.executeMaven(input.task, input.context, owned,
+          'pruned_method_candidate', input.signal);
+        return { owned, execution: nextExecution, checkpoint };
+      }, input.signal));
+      removed = true;
+    }
+  }
+
+  private async recordRemovedAbnormalTests(
+    task: ClassTaskSnapshot, checkpoint: WaveCandidateCheckpoint, owned: OwnedCandidateFile,
+    removedMethods: RemovedAbnormalTest[], execution: CandidateExecutionFeedback
+  ): Promise<void> {
+    const record = { taskId: task.id, candidateId: checkpoint.candidateId,
+      occurredAt: new Date().toISOString(), sourceSha256: owned.sha256, removedMethods, execution };
+    const path = `${waveCandidateFailurePath(task, checkpoint.candidateId, owned.testClassName)}.${owned.sha256}.removed-tests.json`;
+    await new AtomicJsonStore<typeof record>(path, value => {
+      const parsed = value as typeof record;
+      if (parsed?.candidateId !== record.candidateId || parsed.sourceSha256 !== record.sourceSha256
+        || !Array.isArray(parsed.removedMethods) || parsed.execution?.status !== 'test_failed') {
+        throw new Error('Removed abnormal test evidence is invalid.');
+      }
+      return parsed;
+    }, () => { throw new Error('Removed abnormal test evidence is missing.'); }).write(record);
+  }
+
+  private async recordStableRepairChange(
+    task: ClassTaskSnapshot, checkpoint: WaveCandidateCheckpoint, owned: OwnedCandidateFile,
+    change: StableRepairChangeEvidence
+  ): Promise<void> {
+    if (change.code !== owned.code
+      || createHash('sha256').update(change.code, 'utf8').digest('hex') !== owned.sha256
+      || change.execution.status === 'passed') {
+      throw new Error('Stable repair evidence does not match the failing owned source.');
+    }
+    const record = {
+      taskId: task.id, candidateId: checkpoint.candidateId,
+      waveId: checkpoint.waveId, methodId: checkpoint.methodId,
+      occurredAt: new Date().toISOString(), fileSha256: owned.sha256,
+      sourceCode: change.code,
+      replacementSha256: createHash('sha256').update(change.nextCode, 'utf8').digest('hex'),
+      phase: change.phase, iteration: change.iteration,
+      newMemberIds: [...change.newMemberIds],
+      annotatedMemberIds: [...change.annotatedMemberIds],
+      llmRepairAttemptsUsed: checkpoint.llmRepairAttemptsUsed,
+      repairAttemptLimit: checkpoint.repairAttemptLimit,
+      execution: change.execution
+    };
+    const path = `${waveCandidateFailurePath(task, checkpoint.candidateId, owned.testClassName)}.${owned.sha256}.${change.iteration}.stable-repair.json`;
+    await new AtomicJsonStore<typeof record>(path, value => {
+      const parsed = value as typeof record;
+      if (parsed?.taskId !== task.id || parsed.candidateId !== checkpoint.candidateId
+        || parsed.waveId !== checkpoint.waveId || parsed.fileSha256 !== owned.sha256
+        || typeof parsed.sourceCode !== 'string'
+        || createHash('sha256').update(parsed.sourceCode, 'utf8').digest('hex') !== owned.sha256
+        || parsed.replacementSha256 !== record.replacementSha256
+        || parsed.phase !== change.phase || parsed.iteration !== change.iteration
+        || !Array.isArray(parsed.newMemberIds) || parsed.newMemberIds.length === 0
+        || !Array.isArray(parsed.annotatedMemberIds)
+        || !parsed.execution || parsed.execution.status === 'passed') {
+        throw new Error('Stable repair failure evidence is invalid.');
+      }
+      return parsed;
+    }, () => { throw new Error('Stable repair failure evidence is missing.'); }).write(record);
+  }
+
   private async stabilizeMergedWaveCandidate(input: {
     task: ClassTaskSnapshot;
     context: SingleMethodGenerationContext;
@@ -1866,7 +2266,10 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
     execution: CandidateExecutionFeedback;
     candidateCheckpoint: WaveCandidateCheckpoint;
     retainedEmpty: boolean;
+    quarantined?: boolean;
   }> {
+    const discarded = await this.discardAbnormalWaveTests(input);
+    input = { ...input, ...discarded };
     return this.options.moduleLock.runExclusive(input.task.moduleKey, async () => {
       let owned = input.owned;
       let checkpoint = input.checkpoint;
@@ -1903,6 +2306,12 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         annotatedMemberIds: checkpoint.stableRepair.annotatedMemberIds,
         initialIteration: checkpoint.stableRepair.iteration,
         signal: input.signal,
+        onDiscardAbnormalTests: (methods, evidence) => this.recordRemovedAbnormalTests(
+          input.task, checkpoint, owned, methods, evidence
+        ),
+        onBeforeRepairChange: (change) => this.recordStableRepairChange(
+          input.task, checkpoint, owned, change
+        ),
         replaceCandidate: async (code) => {
           const replacement = this.options.writer.prepareReplacement({
             workspaceRoot: input.task.workspaceRoot,
@@ -1950,18 +2359,53 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           );
         }
       });
-      if (result.status === 'external_project_blocked') {
-        throw new Error(
-          'Stable repair stopped because Maven failure is outside the generated candidate.'
+      if (result.status === 'external_project_blocked' || result.status === 'retained_empty') {
+        if (result.blockedScope === 'candidate' || result.status === 'retained_empty') {
+          const isolationPath = waveCandidateFailurePath(input.task,
+            checkpoint.candidateId, owned.testClassName);
+          // Persist evidence before moving the source. A crash can safely retry
+          // this transaction; no failed source is presented as a passing test.
+          await this.candidateFailureStore(input.task.id, checkpoint.candidateId,
+            `${isolationPath}.failure.json`, owned.sha256).write({
+              taskId: input.task.id, candidateId: checkpoint.candidateId,
+              waveId: checkpoint.waveId, methodId: checkpoint.methodId,
+              occurredAt: new Date().toISOString(), fileSha256: owned.sha256,
+              llmRepairAttemptsUsed: checkpoint.llmRepairAttemptsUsed,
+              repairAttemptLimit: checkpoint.repairAttemptLimit,
+              execution: result.execution
+            });
+          const isolated = await this.moveQueuedWaveCandidate({ task: input.task,
+            candidateId: checkpoint.candidateId, owned, checkpoint,
+            targetPath: isolationPath, targetLocation: 'ISOLATED', status: 'BLOCKED' });
+          owned = isolated.owned;
+          checkpoint = await this.options.checkpoints.saveWaveCandidate(input.task.id,
+            updateWaveCandidateCheckpoint(isolated.checkpoint, owned, 'QUARANTINED'));
+          return { owned, execution: result.execution, candidateCheckpoint: checkpoint,
+            retainedEmpty: false, quarantined: true };
+        }
+        throw new MethodGenerationRequestError(
+          'METHOD_GENERATION_PROJECT_BLOCKED',
+          'Maven 错误无法通过安全的局部修复解决，已保留剩余测试和公共代码。'
         );
       }
       return {
         owned,
         execution: result.execution,
         candidateCheckpoint: checkpoint,
-        retainedEmpty: result.status === 'retained_empty'
+        retainedEmpty: false
       };
     }, input.signal);
+  }
+
+  private candidateFailureStore(taskId: string, candidateId: string, path: string, hash: string) {
+    return new AtomicJsonStore<WaveCandidateFailureRecord>(path, (value) => {
+      const record = value as WaveCandidateFailureRecord;
+      if (!record || record.taskId !== taskId || record.candidateId !== candidateId
+        || record.fileSha256 !== hash || !record.execution || record.execution.status === 'passed') {
+        throw new Error('Quarantined candidate failure evidence is invalid.');
+      }
+      return record;
+    }, () => { throw new Error('Quarantined candidate failure evidence is missing.'); });
   }
 
   async execute(
@@ -3027,7 +3471,11 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           prepared.requestedFqns,
           refreshSignal,
           prepared.requestedMethods ?? [],
-          scopedMethodIds
+          scopedMethodIds,
+          {
+            analysisSessionId: context.analysisSessionId,
+            reportPairId: context.reportPairId
+          }
         ),
         this.ragIndexRefreshWaitMilliseconds,
         signal
@@ -3882,6 +4330,10 @@ function validatePublishedWaveRecoveryBundle(
   }
 }
 
+function quarantinedWaveOutcome(wave: SingleMethodWorkWave | ClassScenarioWorkWave): MethodWaveExecutionOutcome {
+  return { completedScenarioIds: [], skippedScenarioIds: [...wave.selectedScenarioIds], candidateIds: [] };
+}
+
 function recoveredWaveOutcome(
   wave: SingleMethodWorkWave,
   acceptedPartIndexes: ReadonlySet<number>,
@@ -4602,6 +5054,12 @@ function compactWaveFailure(error: unknown): string {
     .slice(0, 1_000) || 'Wave Part failed.';
 }
 
+function waveCandidateFailurePath(task: ClassTaskSnapshot, candidateId: string, testClassName: string): string {
+  return resolve(task.workspaceRoot, '.ai-unit-test', 'method-wave-failures',
+    createHash('sha256').update(task.id, 'utf8').digest('hex').slice(0, 24),
+    candidateId, `${testClassName}.java`);
+}
+
 function mergeWaveCheckpointUsage(
   parts: readonly MethodGenerationWavePartResult[]
 ): ModelTokenUsage | null {
@@ -4632,7 +5090,8 @@ function mergeWaveCheckpointUsage(
 
 function isRepairOutputRetryExhaustedError(error: unknown): boolean {
   return error instanceof MethodGenerationRequestError
-    && error.code === 'GENERATED_TEST_INVALID';
+    && (error.code === 'GENERATED_TEST_INVALID'
+      || error.code === 'GENERATED_TEST_INCOMPLETE');
 }
 
 function preferredPartModelFailure(
@@ -4910,7 +5369,7 @@ function mergeRepairContexts(
   return {
     ...diagnostic,
     analyzerStatus,
-    analyzerWarnings: warnings.map(boundedWarning).slice(0, 64),
+    analyzerWarnings: [...new Set(warnings.map(boundedWarning))].slice(0, 64),
     sourceSha256,
     targetMethod,
     stackMethods,

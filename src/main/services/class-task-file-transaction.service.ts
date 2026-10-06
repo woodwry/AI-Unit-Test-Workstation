@@ -852,6 +852,13 @@ function validateArtifactValues(
       || method.jacocoOrder < 0
       || !Number.isInteger(method.ordinaryTestMethodCount)
       || method.ordinaryTestMethodCount < 0
+      || ((method.waveIndex === undefined) !== (method.sourceBatchIds === undefined))
+      || (method.waveIndex !== undefined && (
+        !Number.isSafeInteger(method.waveIndex) || method.waveIndex < 1
+        || !Array.isArray(method.sourceBatchIds) || method.sourceBatchIds.length < 1
+        || method.sourceBatchIds.some((id) => typeof id !== 'string' || !id.trim())
+        || new Set(method.sourceBatchIds).size !== method.sourceBatchIds.length
+      ))
     ))
     || methodResults.reduce((sum, method) => sum + method.ordinaryTestMethodCount, 0)
       !== ordinaryTestMethodCount
@@ -880,7 +887,10 @@ function cloneArtifact(artifact: GeneratedClassTaskArtifact): GeneratedClassTask
 function cloneMethodResults(
   methodResults: readonly GeneratedSourceMethodResult[]
 ): GeneratedSourceMethodResult[] {
-  return methodResults.map((method) => ({ ...method }));
+  return methodResults.map((method) => ({
+    ...method,
+    ...(method.sourceBatchIds ? { sourceBatchIds: [...method.sourceBatchIds] } : {})
+  }));
 }
 
 function normalizePath(value: string): string {

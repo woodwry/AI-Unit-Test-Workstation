@@ -67,6 +67,59 @@ test('高级请求参数按 JSON 类型写入创建请求，空配置不增加�
   assert.equal('requestParameters' in buildCreateModelInterfaceRequest(direct()), false);
 });
 
+test('连接测试使用未保存的参数草稿，并且不要求接口名称', () => {
+  assert.equal(typeof modelInterfaceFormState.buildModelInterfaceConnectionTestRequest, 'function');
+  assert.deepEqual(modelInterfaceFormState.buildModelInterfaceConnectionTestRequest(direct({
+    name: '', id: 'existing', apiKey: '', requestParameters: [
+      { name: 'thinking', value: '{"type":"enabled"}' },
+      { name: 'reasoning_effort', value: 'max' }
+    ]
+  })), { interfaceId: 'existing', baseUrl: 'https://models.example.test/v1',
+    model: 'gpt-test', credentialMode: 'direct',
+    requestParameters: { thinking: { type: 'enabled' }, reasoning_effort: 'max' } });
+});
+
+test('新接口的连接测试支持环境变量，拒绝格式错误的高级参数', () => {
+  assert.equal(typeof modelInterfaceFormState.buildModelInterfaceConnectionTestRequest, 'function');
+  const build = modelInterfaceFormState.buildModelInterfaceConnectionTestRequest;
+  assert.deepEqual(build(direct({ id: 'new', credentialMode: 'environment',
+    environmentVariableName: ' TEST_MODEL_KEY ' })), {
+    baseUrl: 'https://models.example.test/v1', model: 'gpt-test',
+    credentialMode: 'environment', environmentVariableName: 'TEST_MODEL_KEY'
+  });
+  assert.throws(() => build(direct({ requestParameters: [
+    { name: 'thinking', value: '{broken}' }
+  ] })), /JSON/);
+  assert.throws(() => build(direct({ apiKey: '' })), /API Key/);
+});
+
+test('高级请求参数接受裸文本，并保留数字、布尔值和结构化 JSON 类型', () => {
+  const draft = direct({ requestParameters: [
+    { name: 'mode', value: ' enabled ' },
+    { name: 'effort', value: 'max' },
+    { name: 'label', value: '单元测试' },
+    { name: 'max_tokens', value: '256000' },
+    { name: 'enabled', value: 'false' },
+    { name: 'optional', value: 'null' },
+    { name: 'options', value: '{"type":"enabled"}' },
+    { name: 'stop', value: '["END"]' },
+    { name: 'string_number', value: '"123"' }
+  ] });
+  assert.equal(validateModelInterfaceDraft(draft), null);
+  assert.deepEqual(buildCreateModelInterfaceRequest(draft).requestParameters, {
+    mode: 'enabled', effort: 'max', label: '单元测试', max_tokens: 256000,
+    enabled: false, optional: null, options: { type: 'enabled' }, stop: ['END'], string_number: '123'
+  });
+});
+
+test('格式错误的对象、数组或带引号字符串仍提示错误，不静默转换成文本', () => {
+  for (const value of ['{"type":enabled}', '["END",]', '"max', '   ']) {
+    const draft = direct({ requestParameters: [{ name: 'option', value }] });
+    assert.ok(validateModelInterfaceDraft(draft));
+    assert.throws(() => buildCreateModelInterfaceRequest(draft));
+  }
+});
+
 test('高级请求参数拒绝保留名、危险名、重复名、无效名称和无效 JSON', () => {
   const cases = [
     [{ name: 'stream', value: 'true' }],
@@ -74,7 +127,7 @@ test('高级请求参数拒绝保留名、危险名、重复名、无效名称�
     [{ name: '__proto__', value: '{}' }],
     [{ name: 'max tokens', value: '100' }],
     [{ name: 'top_p', value: '0.8' }, { name: 'TOP_P', value: '0.7' }],
-    [{ name: 'max_tokens', value: 'not-json' }]
+    [{ name: 'options', value: '{invalid-json}' }]
   ];
 
   for (const requestParameters of cases) {
@@ -114,9 +167,24 @@ test('接口视图能恢复为可编辑的 JSON 参数草稿', () => {
   assert.deepEqual(draft.requestParameters, [
     { name: 'max_tokens', value: '16384' },
     { name: 'vendor', value: '{"mode":"strict"}' },
-    { name: 'label', value: '"java"' }
+    { name: 'label', value: 'java' }
   ]);
   assert.equal(draft.apiKey, '');
+});
+
+test('恢复参数时普通字符串显示为裸文本，容易混淆类型的字符串能完整往返', () => {
+  const values = {
+    mode: 'enabled', effort: 'max', booleanText: 'true', numberText: '123', nullText: 'null',
+    objectText: '{"type":"enabled"}', brokenJsonText: '{text}', emptyText: '', spacedText: ' max '
+  };
+  const draft = modelInterfaceFormState.buildModelInterfaceDraft({
+    id: '11111111-1111-4111-8111-111111111111', ...direct(), hasStoredApiKey: true,
+    requestParameters: values, createdAt: '2026-10-03T00:00:00Z', updatedAt: '2026-10-03T00:00:00Z'
+  });
+  assert.deepEqual(draft.requestParameters.slice(0, 2), [
+    { name: 'mode', value: 'enabled' }, { name: 'effort', value: 'max' }
+  ]);
+  assert.deepEqual(buildUpdateModelInterfaceRequest(draft).requestParameters, values);
 });
 
 test('高级请求参数变化会将编辑草稿标记为未保存', () => {

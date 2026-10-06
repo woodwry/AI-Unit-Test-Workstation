@@ -6,6 +6,50 @@ import test from 'node:test';
 
 import { TestWriterService } from '../src/main/services/test-writer.service.ts';
 
+test('formal rename ignores old class names in comments and literals without changing that text', () => {
+  const workspaceRoot = join(tmpdir(), 'ai-unit-test-writer-rename');
+  const code = [
+    '// Archived declaration: class ArchivedTest {}',
+    '/** Previous file: TaskTmp10Test.java */',
+    'public class TaskTmp10Test {',
+    '  String label = "TaskTmp10Test";',
+    '  String block = """',
+    '    class TaskTmp10Test {}',
+    '    """;',
+    '  // failure recorded for TaskTmp10Test',
+    '}',
+    ''
+  ].join('\n');
+  const prepared = new TestWriterService().prepareReplacement({
+    workspaceRoot,
+    filePath: join(workspaceRoot, 'Task95Test.java'),
+    content: code
+  });
+  assert.equal(prepared.content, code.replace(
+    'public class TaskTmp10Test {', 'public class Task95Test {'
+  ));
+});
+
+test('formal rename preserves UTF-16 offsets after supplementary characters', () => {
+  const workspaceRoot = join(tmpdir(), 'ai-unit-test-writer-rename');
+  const code = '// 🧪 old TaskTmp10Test\npublic class TaskTmp10Test {}\n';
+  const prepared = new TestWriterService().prepareReplacement({
+    workspaceRoot,
+    filePath: join(workspaceRoot, 'Task95Test.java'),
+    content: code
+  });
+  assert.equal(prepared.content, '// 🧪 old TaskTmp10Test\npublic class Task95Test {}\n');
+});
+
+test('unsafe executable self references have a recoverable formalization error code', () => {
+  const workspaceRoot = join(tmpdir(), 'ai-unit-test-writer-rename');
+  assert.throws(() => new TestWriterService().prepareReplacement({
+    workspaceRoot,
+    filePath: join(workspaceRoot, 'Task95Test.java'),
+    content: 'public class TaskTmp10Test { TaskTmp10Test() {} }'
+  }), (error) => error.code === 'METHOD_GENERATION_TEST_RENAME_UNSAFE');
+});
+
 test('writes the next test beside a module target when the backend suggests a workspace-root path', async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), 'ai-unit-test-writer-'));
 

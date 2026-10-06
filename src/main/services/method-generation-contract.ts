@@ -559,7 +559,7 @@ function nullableInteger(
   return value === null ? null : integer(value, minimum, maximum);
 }
 
-function usage(value: unknown): ModelTokenUsage | null {
+export function usage(value: unknown): ModelTokenUsage | null {
   if (value === null) return null;
   const item = recordWithOptional(
     value,
@@ -664,7 +664,7 @@ function decodeProgress(
   return item as MethodGenerationProgress;
 }
 
-function decodeCompletion(
+export function decodeCompletion(
   value: unknown,
   expected?: MethodGenerationIdentity
 ): MethodGenerationCompletion {
@@ -683,7 +683,7 @@ function decodeCompletion(
   return item as MethodGenerationCompletion;
 }
 
-function decodeFailure(value: unknown): MethodGenerationFailure {
+export function decodeFailure(value: unknown): MethodGenerationFailure {
   const item = record(value, ['code', 'message', 'stage']);
   const code = text(item.code, 128);
   if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(code)) invalid();
@@ -692,7 +692,7 @@ function decodeFailure(value: unknown): MethodGenerationFailure {
   return item as MethodGenerationFailure;
 }
 
-function decodeModelCall(
+export function decodeModelCall(
   value: unknown,
   expectedSessionId: string,
   expected?: MethodGenerationIdentity
@@ -1505,7 +1505,7 @@ export function validateRecoverMethodGenerationRequest(
   }
 }
 
-function validateExecutionFeedback(value: unknown): CandidateExecutionFeedback {
+export function validateExecutionFeedback(value: unknown): CandidateExecutionFeedback {
   const item = recordWithOptional(value, ['status', 'mavenExecutions'], ['testReport']);
   const status = member(item.status, new Set<CandidateExecutionFeedback['status']>([
     'compile_failed', 'test_failed', 'passed'
@@ -1629,7 +1629,7 @@ function validateStackFrame(value: unknown): void {
   integer(item.sourceLine, 1, 2 ** 31 - 1);
 }
 
-function validateRepairContext(
+export function validateRepairContext(
   value: unknown,
   executionStatus: CandidateExecutionFeedback['status']
 ): MethodGenerationRepairContext {

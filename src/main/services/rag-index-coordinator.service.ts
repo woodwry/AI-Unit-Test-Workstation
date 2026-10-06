@@ -51,7 +51,19 @@ export type RagIndexSubscription = {
   release(): Promise<void>;
 };
 
+export type RagIndexAnalysisIdentity = {
+  analysisSessionId: string;
+  reportPairId: string;
+};
+
 export type RagIndexCoordinatorOptions = {
+  globalKnowledgeLookup?: (input: {
+    context: RagRepairContext;
+    embeddingContext: RagEmbeddingModelContext;
+    requestedFqns: string[];
+    requestedMethods: RagMethodSelector[];
+    signal?: AbortSignal;
+  }) => Promise<{ missingFqns: string[]; missingMethods: RagMethodSelector[] }>;
   globalKnowledge: (
     context: RagRepairContext,
     embeddingContext: RagEmbeddingModelContext,
@@ -69,6 +81,7 @@ export type RagIndexCoordinatorOptions = {
 };
 
 type SubscriptionState = {
+  knownFiles: Map<string, string>;
   requestedMethods: RagMethodSelector[];
   context: RagRepairContext;
   embeddingContext: RagEmbeddingModelContext;
@@ -83,6 +96,7 @@ type SubscriptionState = {
 export class RagIndexCoordinator {
   private readonly globalKnowledge: RagIndexCoordinatorOptions['globalKnowledge'];
   private readonly globalKnowledgeRefresh: RagIndexCoordinatorOptions['globalKnowledgeRefresh'];
+  private readonly globalKnowledgeLookup: RagIndexCoordinatorOptions['globalKnowledgeLookup'];
   private readonly analyzer: RagIndexAnalyzerPort;
   private readonly telemetry: NonNullable<RagIndexCoordinatorOptions['telemetry']>;
   private readonly clock: () => number;
@@ -93,6 +107,7 @@ export class RagIndexCoordinator {
   constructor(options: RagIndexCoordinatorOptions) {
     this.globalKnowledge = options.globalKnowledge;
     this.globalKnowledgeRefresh = options.globalKnowledgeRefresh;
+    this.globalKnowledgeLookup = options.globalKnowledgeLookup;
     this.analyzer = options.analyzer;
     this.telemetry = options.telemetry ?? (() => undefined);
     this.clock = options.clock ?? (() => Date.now());
@@ -106,6 +121,7 @@ export class RagIndexCoordinator {
     const context = validateRagRepairContext(input.context);
     context.activeIndex = await this.globalKnowledge(context, input.embeddingContext, input.signal);
     const state: SubscriptionState = {
+      knownFiles: new Map(),
       requestedMethods: [],
       context,
       embeddingContext: input.embeddingContext,
@@ -121,6 +137,7 @@ export class RagIndexCoordinator {
       ready: Promise.resolve(globalResult(context)),
       release: async () => {
         state.released = true;
+        state.knownFiles.clear();
         this.activeStates.delete(state);
       }
     };
@@ -134,71 +151,116 @@ export class RagIndexCoordinator {
     diagnosticFqns: readonly string[],
     signal?: AbortSignal,
     diagnosticMethods: readonly RagMethodSelector[] = [],
-    methodIds?: readonly string[]
+    methodIds?: readonly string[],
+    analysisIdentity?: RagIndexAnalysisIdentity
   ): Promise<RagIndexPreparationResult> {
     const state = this.subscriptionStates.get(subscription);
     if (!state || state.released) {
       throw new TypeError('RAG index subscription is no longer active.');
     }
+    const analysisSessionId = analysisIdentity?.analysisSessionId ?? state.analysisSessionId;
+    const reportPairId = analysisIdentity?.reportPairId ?? state.reportPairId;
     const activeSignal = signal ?? state.signal;
     const startedAt = this.clock();
     let snapshotSessionId: string | null = null;
     let pageCount = 0;
     let addedCount = 0;
+    let failurePhase = 'validate-request';
     try {
-      const requestedMethods = uniqueMethods(diagnosticMethods);
-      const requestedFqns = [...new Set(diagnosticFqns)].sort();
+      let requestedMethods = uniqueMethods(diagnosticMethods);
+      let requestedFqns = [...new Set(diagnosticFqns)].sort();
       const scopedMethodIds = normalizeMethodIds(methodIds ?? []);
-      const effectiveMethodIds = scopedMethodIds.length > 0
+      let effectiveMethodIds = scopedMethodIds.length > 0
         ? scopedMethodIds
         : state.methodIds;
+      if (this.globalKnowledgeLookup && (requestedMethods.length || requestedFqns.length)) {
+        failurePhase = 'lookup-knowledge';
+        throwIfAborted(activeSignal);
+        const missing = await this.globalKnowledgeLookup({
+          context: state.context, embeddingContext: state.embeddingContext,
+          requestedFqns, requestedMethods,
+          ...(activeSignal ? { signal: activeSignal } : {})
+        });
+        throwIfAborted(activeSignal);
+        if (state.released) throw new Error('RAG index subscription is no longer active.');
+        if (!missing.missingFqns.length && !missing.missingMethods.length) {
+          const result = globalResult(state.context);
+          this.record(result, startedAt);
+          return result;
+        }
+        requestedFqns = missing.missingFqns;
+        requestedMethods = missing.missingMethods;
+        // The actual diagnostic roots drive supplementation. Existing target roots
+        // must not cause a new extraction merely because local code changed.
+        effectiveMethodIds = [];
+      }
       const request = validateResolveRagSourceSetRequest({
-        reportPairId: state.reportPairId,
+        reportPairId,
         methodIds: effectiveMethodIds,
         requestedMethods,
         requestedFqns,
         ...state.context.scope
       });
       throwIfAborted(activeSignal);
-      const sourceSet = await this.resolveSourceSet(state.analysisSessionId, request, activeSignal);
+      failurePhase = 'resolve-source-set';
+      const sourceSet = await this.resolveSourceSet(analysisSessionId, request, activeSignal);
       throwIfAborted(activeSignal);
+      failurePhase = 'create-snapshot';
       const snapshot = await this.analyzer.createRagSourceSnapshotSession({
-        analysisSessionId: state.analysisSessionId,
-        reportPairId: state.reportPairId,
+        analysisSessionId,
+        reportPairId,
         methodIds: effectiveMethodIds,
         requestedFqns: request.requestedFqns,
         requestedMethods,
         requestedSourceSetFingerprint: sourceSet.requestedSourceSetFingerprint,
         ...state.context.scope,
-        knownFiles: [],
+        knownFiles: [...state.knownFiles].map(([fileId, rawSha256]) => ({ fileId, rawSha256 })),
         priorScopeFileIds: []
       }, activeSignal);
       snapshotSessionId = snapshot.sessionId;
+      const publishedFiles = new Map(state.knownFiles);
       for (let pageIndex = 0; ; pageIndex += 1) {
         throwIfAborted(activeSignal);
+        failurePhase = 'read-snapshot';
         const page = await this.analyzer.getRagSourceSnapshotPage(
           snapshot.sessionId,
           pageIndex,
           50,
           activeSignal
         );
+        failurePhase = 'publish-snapshot';
         const ensured = await this.globalKnowledgeRefresh({
           context: state.context,
           page,
           embeddingContext: state.embeddingContext,
           ...(activeSignal ? { signal: activeSignal } : {})
         });
+        throwIfAborted(activeSignal);
+        if (state.released) throw new Error('RAG index subscription is no longer active.');
+        for (const file of page.upserts) {
+          publishedFiles.delete(file.fileId);
+          publishedFiles.set(file.fileId, file.rawSha256);
+        }
+        for (const fileId of page.deletedFileIds) publishedFiles.delete(fileId);
         pageCount += 1;
         addedCount += ensured.addedMethodCount;
         if (!page.hasMore) break;
       }
       await this.closeSnapshot(snapshotSessionId);
       snapshotSessionId = null;
-      state.context.activeIndex = await this.globalKnowledge(
+      failurePhase = 'activate-index';
+      const activeIndex = await this.globalKnowledge(
         state.context,
         state.embeddingContext,
         activeSignal
       );
+      throwIfAborted(activeSignal);
+      if (state.released) throw new Error('RAG index subscription is no longer active.');
+      state.context.activeIndex = activeIndex;
+      // Only remember files after all pages and activation succeed. An aborted or
+      // degraded publication must resend its source on the next attempt.
+      while (publishedFiles.size > 10_000) publishedFiles.delete(publishedFiles.keys().next().value!);
+      state.knownFiles = publishedFiles;
       state.requestedFqns = request.requestedFqns;
       state.requestedMethods = requestedMethods;
       const result: RagIndexPreparationResult = {
@@ -215,6 +277,16 @@ export class RagIndexCoordinator {
         if (activeSignal) throw abortReason(activeSignal, error);
         throw error;
       }
+      const errorCode = error && typeof error === 'object' && 'code' in error
+        && typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(error.code)
+        ? error.code : null;
+      this.telemetry('rag_index_preparation_failure', {
+        phase: failurePhase,
+        errorType: error instanceof TypeError ? 'TypeError' : 'Error',
+        errorCode,
+        category: error instanceof TypeError && error.message === 'RAG 索引契约响应无效。'
+          ? 'LOCAL_RAG_CONTRACT_INVALID' : 'REQUEST_FAILED'
+      });
       const result = degradedRefreshResult(state.context);
       this.record(result, startedAt);
       return result;
@@ -222,7 +294,10 @@ export class RagIndexCoordinator {
   }
 
   async releaseAll(): Promise<void> {
-    for (const state of this.activeStates) state.released = true;
+    for (const state of this.activeStates) {
+      state.released = true;
+      state.knownFiles.clear();
+    }
     this.activeStates.clear();
     this.resolutions.clear();
   }

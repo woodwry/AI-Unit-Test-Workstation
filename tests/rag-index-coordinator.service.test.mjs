@@ -65,7 +65,17 @@ function input(overrides = {}) {
   };
 }
 
-function harness({ refreshError = null } = {}) {
+function sourceFile() {
+  return {
+    fileId: 'methods-v1:example:Item.java', rawSha256: '7'.repeat(64),
+    origin: 'PROJECT_PRODUCTION', projectRelativePath: 'src/main/java/Item.java',
+    mavenCoordinate: null, dependencyFingerprint: null, sourceLineBasis: 'ORIGINAL_SOURCE',
+    classpathOrder: 0, normalizedSha256: '8'.repeat(64), decommentedSource: 'class Item {}',
+    parseStatus: 'RESOLVED', types: [], methods: [], chunks: []
+  };
+}
+
+function harness({ refreshError = null, upserts = [], beforeRefresh, beforeActivation, lookup } = {}) {
   const prepareCalls = [];
   const resolveCalls = [];
   const snapshotCalls = [];
@@ -75,13 +85,16 @@ function harness({ refreshError = null } = {}) {
   const requestedFqns = ['com.example.Dependency', 'com.example.Order'];
   const fingerprint = resolveRagSourceSetFingerprint(requestedFqns);
   const coordinator = new RagIndexCoordinator({
+    ...(lookup ? { globalKnowledgeLookup: lookup } : {}),
     async globalKnowledge(repairContext, modelContext) {
+      if (generation > 0) await beforeActivation?.();
       prepareCalls.push({ repairContext: structuredClone(repairContext), modelContext });
       generation += 1;
       return activeIndex(requestedFqns, generation);
     },
     async globalKnowledgeRefresh(value) {
       refreshCalls.push(value.page.pageIndex);
+      await beforeRefresh?.(value.page.pageIndex);
       if (refreshError) throw refreshError;
       return {
         status: value.page.pageIndex === 0 ? 'published' : 'reused',
@@ -118,7 +131,7 @@ function harness({ refreshError = null } = {}) {
           sessionId,
           pageIndex,
           pageSize,
-          upserts: [],
+          upserts: pageIndex === 0 ? upserts : [],
           unchangedFileIds: [],
           deletedFileIds: [],
           hasMore: pageIndex === 0,
@@ -139,6 +152,43 @@ function harness({ refreshError = null } = {}) {
     cancelledSessions
   };
 }
+
+test('database hits bypass source resolution and extraction even when local source has changed', async () => {
+  const lookupCalls = [];
+  const h = harness({ lookup: async (value) => {
+    lookupCalls.push(value);
+    return { missingFqns: [], missingMethods: [] };
+  } });
+  const subscription = await h.coordinator.subscribeInitial(input());
+  const result = await h.coordinator.refresh(subscription, ['com.example.Dependency'], undefined,
+    [{ ownerFqn: 'com.example.Dependency', methodName: 'load', descriptor: '()V', sourceLine: 99 }]);
+  assert.equal(result.status, 'reused');
+  assert.equal(lookupCalls.length, 1);
+  assert.equal(h.resolveCalls.length, 0);
+  assert.equal(h.snapshotCalls.length, 0);
+  assert.equal(h.refreshCalls.length, 0);
+  assert.equal('sourceSha256' in lookupCalls[0], false);
+});
+
+test('lookup misses scope repair extraction to missing diagnostic methods', async () => {
+  const missing = { ownerFqn: 'com.example.Dependency', methodName: 'newLoad', descriptor: '()V', sourceLine: null };
+  const h = harness({ lookup: async () => ({ missingFqns: [], missingMethods: [missing] }) });
+  const subscription = await h.coordinator.subscribeInitial(input());
+  await h.coordinator.refresh(subscription, ['com.example.Dependency'], undefined, [
+    { ...missing, methodName: 'load' }, missing
+  ]);
+  assert.deepEqual(h.resolveCalls[0].request.requestedMethods, [missing]);
+  assert.deepEqual(h.resolveCalls[0].request.methodIds, []);
+  assert.deepEqual(h.snapshotCalls[0].requestedMethods, [missing]);
+});
+
+test('failed database lookup degrades without treating failure as a miss', async () => {
+  const h = harness({ lookup: async () => { throw new Error('database unavailable'); } });
+  const subscription = await h.coordinator.subscribeInitial(input());
+  assert.equal((await h.coordinator.refresh(subscription, ['com.example.Dependency'])).status, 'degraded');
+  assert.equal(h.resolveCalls.length, 0);
+  assert.equal(h.snapshotCalls.length, 0);
+});
 
 test('initial subscription prepares the tenant PostgreSQL knowledge identity', async () => {
   const h = harness();
@@ -181,6 +231,79 @@ test('diagnostic refresh snapshots only requested source and appends every page 
   assert.equal(subscription.context.activeIndex?.indexVersion, 2);
 });
 
+test('successful refresh supplies published file hashes to the next incremental snapshot', async () => {
+  const file = sourceFile();
+  const h = harness({ upserts: [file] });
+  const subscription = await h.coordinator.subscribeInitial(input());
+  await h.coordinator.refresh(subscription, ['com.example.Dependency']);
+  await h.coordinator.refresh(subscription, ['com.example.Dependency']);
+  assert.deepEqual(h.snapshotCalls[1].knownFiles, [{ fileId: file.fileId, rawSha256: file.rawSha256 }]);
+  assert.deepEqual(h.snapshotCalls[1].priorScopeFileIds, []);
+  const other = await h.coordinator.subscribeInitial(input());
+  await h.coordinator.refresh(other, ['com.example.Dependency']);
+  assert.deepEqual(h.snapshotCalls[2].knownFiles, []);
+});
+
+test('failed publication does not mark source files as indexed on the next attempt', async () => {
+  const h = harness({ refreshError: new Error('publication failed'), upserts: [sourceFile()] });
+  const subscription = await h.coordinator.subscribeInitial(input());
+  await h.coordinator.refresh(subscription, ['com.example.Dependency']);
+  await h.coordinator.refresh(subscription, ['com.example.Dependency']);
+  assert.deepEqual(h.snapshotCalls[1].knownFiles, []);
+});
+
+test('failure on a later page or activation resends every file on the next attempt', async () => {
+  for (const phase of ['later-page', 'activation']) {
+    let fail = true;
+    const h = harness({
+      upserts: [sourceFile()],
+      beforeRefresh(pageIndex) {
+        if (phase === 'later-page' && fail && pageIndex === 1) throw new Error('page failed');
+      },
+      beforeActivation() {
+        if (phase === 'activation' && fail) throw new Error('activation failed');
+      }
+    });
+    const subscription = await h.coordinator.subscribeInitial(input());
+    assert.equal((await h.coordinator.refresh(subscription, ['com.example.Dependency'])).status, 'degraded');
+    fail = false;
+    await h.coordinator.refresh(subscription, ['com.example.Dependency']);
+    assert.deepEqual(h.snapshotCalls[1].knownFiles, []);
+    await h.coordinator.refresh(subscription, ['com.example.Dependency']);
+    assert.deepEqual(h.snapshotCalls[2].knownFiles, [{ fileId: sourceFile().fileId, rawSha256: sourceFile().rawSha256 }]);
+  }
+});
+
+test('aborted activation preserves the active identity and resends source on retry', async () => {
+  const controller = new AbortController();
+  let abort = true;
+  const h = harness({
+    upserts: [sourceFile()],
+    beforeActivation() { if (abort) controller.abort(new Error('user stopped')); }
+  });
+  const subscription = await h.coordinator.subscribeInitial(input());
+  const previous = structuredClone(subscription.context.activeIndex);
+  await assert.rejects(h.coordinator.refresh(subscription, ['com.example.Dependency'], controller.signal), /user stopped/);
+  assert.deepEqual(subscription.context.activeIndex, previous);
+  abort = false;
+  await h.coordinator.refresh(subscription, ['com.example.Dependency']);
+  assert.deepEqual(h.snapshotCalls[1].knownFiles, []);
+});
+
+test('releasing a subscription during publication prevents successful preparation', async () => {
+  let subscription;
+  const h = harness({
+    upserts: [sourceFile()],
+    async beforeRefresh() { await subscription.release(); }
+  });
+  subscription = await h.coordinator.subscribeInitial(input());
+  const previous = structuredClone(subscription.context.activeIndex);
+  assert.equal((await h.coordinator.refresh(subscription, ['com.example.Dependency'])).status, 'degraded');
+  assert.deepEqual(subscription.context.activeIndex, previous);
+  assert.deepEqual(h.cancelledSessions, [SNAPSHOT_SESSION_ID]);
+  await assert.rejects(h.coordinator.refresh(subscription, ['com.example.Dependency']), /no longer active/);
+});
+
 test('diagnostic refresh can scope analyzer work to the current repair methods', async () => {
   const h = harness();
   const subscription = await h.coordinator.subscribeInitial(input());
@@ -195,6 +318,32 @@ test('diagnostic refresh can scope analyzer work to the current repair methods',
   assert.equal(h.resolveCalls.length, 1);
   assert.deepEqual(h.resolveCalls[0].request.methodIds, [SECOND_METHOD_ID]);
   assert.deepEqual(h.snapshotCalls[0].methodIds, [SECOND_METHOD_ID]);
+});
+
+test('diagnostic refresh uses the current analysis identity without rebinding the subscription', async () => {
+  const h = harness();
+  const subscription = await h.coordinator.subscribeInitial(input());
+  const previousIndex = structuredClone(subscription.context.activeIndex);
+  const currentIdentity = {
+    analysisSessionId: '44444444-4444-4444-8444-444444444444',
+    reportPairId: '9'.repeat(64)
+  };
+  const result = await h.coordinator.refresh(
+    subscription, ['com.example.Dependency'], undefined, [], [SECOND_METHOD_ID], currentIdentity
+  );
+
+  assert.equal(result.status, 'published');
+  assert.equal(h.resolveCalls[0].analysisSessionId, currentIdentity.analysisSessionId);
+  assert.equal(h.resolveCalls[0].request.reportPairId, currentIdentity.reportPairId);
+  assert.equal(h.snapshotCalls[0].analysisSessionId, currentIdentity.analysisSessionId);
+  assert.equal(h.snapshotCalls[0].reportPairId, currentIdentity.reportPairId);
+  assert.equal(subscription.context.activeIndex.workspaceId, previousIndex.workspaceId);
+  assert.equal(subscription.context.activeIndex.scopeId, previousIndex.scopeId);
+  await h.coordinator.refresh(subscription, ['com.example.Order']);
+  assert.equal(h.resolveCalls[1].analysisSessionId, ANALYSIS_SESSION_ID);
+  assert.equal(h.resolveCalls[1].request.reportPairId, REPORT_PAIR_ID);
+  assert.equal(h.snapshotCalls[1].analysisSessionId, ANALYSIS_SESSION_ID);
+  assert.equal(h.snapshotCalls[1].reportPairId, REPORT_PAIR_ID);
 });
 
 test('diagnostic refresh does not carry the previous diagnostic scope into the next request', async () => {

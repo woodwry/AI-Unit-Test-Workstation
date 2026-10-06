@@ -181,3 +181,30 @@ test('does not turn an unstructured class-name mention into a Surefire failure',
   assert.deepEqual(result.attributedFailureCandidateIds, []);
   assert.ok(Object.values(result.results).every((item) => item.status === 'UNPROVEN'));
 });
+
+test('an explicitly crashed fork overrides partial passing XML only for its named candidate', () => {
+  const result = new MavenBatchDiagnosticAttributionService().attributeSurefire({
+    candidates, artifacts: [{ fileName: 'TEST-batch.xml', content:
+      '<testsuite><testcase classname="demo.ATmp1Test" name="works"/>'
+        + '<testcase classname="demo.BTmp1Test" name="earlierPassed"/></testsuite>' }],
+    stdout: '[ERROR] The forked VM terminated without properly saying goodbye.\n[ERROR] Crashed tests:\n[ERROR] demo.BTmp1Test', stderr: ''
+  });
+  assert.equal(result.results[candidates[0].candidateId].status, 'PASSED');
+  assert.equal(result.results[candidates[1].candidateId].status, 'TEST_FAILED');
+  assert.equal(result.results[candidates[2].candidateId].status, 'UNPROVEN');
+  assert.deepEqual(result.attributedFailureCandidateIds, [candidates[1].candidateId]);
+});
+
+test('a fatal dump overrides partial XML while harmless dump warnings retain a passed candidate', () => {
+  for (const [content, expected] of [
+    ['java.lang.OutOfMemoryError: heap space\n\tat demo.BTmp1Test.hangs(BTmp1Test.java:4)', 'TEST_FAILED'],
+    ['Corrupted channel warning from demo.BTmp1Test', 'PASSED']
+  ]) {
+    const result = new MavenBatchDiagnosticAttributionService().attributeSurefire({
+      candidates, artifacts: [{ fileName: 'TEST-batch.xml', content:
+        '<testsuite><testcase classname="demo.BTmp1Test" name="earlierPassed"/></testsuite>' },
+      { fileName: 'jvm.dumpstream', content }], stdout: '', stderr: ''
+    });
+    assert.equal(result.results[candidates[1].candidateId].status, expected);
+  }
+});

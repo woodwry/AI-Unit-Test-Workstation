@@ -101,7 +101,8 @@ function createHarness() {
 test('registers every frozen request channel and removes only those handlers on dispose', () => {
   const harness = createHarness();
   const requestChannels = Object.values(CLASS_TASK_CHANNELS)
-    .filter((channel) => channel !== CLASS_TASK_CHANNELS.snapshotChanged);
+    .filter((channel) => channel !== CLASS_TASK_CHANNELS.snapshotChanged
+      && channel !== CLASS_TASK_CHANNELS.methodCatalogChanged);
 
   assert.deepEqual([...harness.handlers.keys()].sort(), [...requestChannels].sort());
   harness.dispose();

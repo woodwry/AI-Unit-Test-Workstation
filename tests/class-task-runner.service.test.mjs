@@ -49,6 +49,37 @@ test('runner skips methods already represented by generated artifacts when prepa
   assert.deepEqual(executed, ['C']);
   assert.deepEqual((await checkpoints.taskProgress('Task')).completedMethodIds, ['A', 'B', 'C']);
 });
+test('class Wave retry rechecks artifact-only completion while retaining methods completed by its Wave ledger', async (t) => {
+  const publishedTask = task('Task', 'RUNNING', { generatedArtifacts: [{
+    id: 'historical', filePath: 'D:\\workspace\\Task1Test.java', testClassName: 'Task1Test',
+    ordinaryTestMethodCount: 1, methodIds: ['B'], sha256: 'a'.repeat(64),
+    sealed: true, accepted: false, createdAt: '2026-08-09T00:00:00.000Z', updatedAt: '2026-08-09T00:00:00.000Z'
+  }] });
+  const { checkpoints } = await checkpointsFor(t, publishedTask);
+  await checkpoints.prepareRun('Task', { reset: false, catalogIdentity: CATALOG_IDENTITY,
+    resolvedMethodOrder: ['A', 'B', 'C'], completedMethodIdsFromArtifacts: ['B'] });
+  await checkpoints.completeClassMethodsWithoutWave('Task', ['A']);
+  await checkpoints.commitWaveMethod('Task', 'A', CATALOG_IDENTITY);
+  const requests = [];
+  const runner = new ClassTaskRunnerService({ checkpoints, methodExecution: {
+    async nextClassWave(_task, request) {
+      requests.push(request.methods.map((method) => method.methodId));
+      return { waveBatchId: null, reportPairId: 'pair', methodId: request.methods[0].methodId,
+        hasWork: false, selectedMethodIds: [], selectedScenarioIds: [], remainingScenarioCount: 0,
+        remainingScenarioCountByMethod: {}, completedMethodIds: request.methods.map((method) => method.methodId),
+        parts: [], warnings: [] };
+    },
+    async executeWave() { throw new Error('no-work analysis must not generate a candidate'); },
+    async execute() { throw new Error('class Wave must not execute legacy batches'); }
+  } });
+  assert.equal(await runner.run(publishedTask, ['A', 'B', 'C'], CATALOG_IDENTITY,
+    new AbortController().signal), 'COMPLETED');
+  assert.deepEqual(requests, [['B', 'C']], 'B has only historical tests, so its current uncovered scenarios must be checked');
+  const wave = await checkpoints.taskWaveProgress('Task');
+  assert.equal(wave.methods.A.remainingScenarioCount, 0);
+  assert.equal(wave.methods.B.remainingScenarioCount, 0);
+});
+
 test('incomplete planning without cached scenarios pauses once and keeps the method unfinished', async (t) => {
   const { checkpoints, state } = await checkpointsFor(t);
   let requests = 0;
@@ -3325,7 +3356,7 @@ test('adapter saves a READY overlay selection while a sibling remains PRELOADING
   assert.equal(persisted[preloadingId].state, 'PRELOADING');
 });
 
-test('saving a new selection on a completed task resets stale execution results', async (t) => {
+test('saving a new selection after accepting a completed task resets stale execution results', async (t) => {
   const taskId = '11111111-1111-4111-8111-111111111111';
   const directory = await mkdtemp(join(tmpdir(), 'class-completed-selection-reset-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -3347,7 +3378,7 @@ test('saving a new selection on a completed task resets stale execution results'
           methodIds: ['old'],
           sha256: 'a'.repeat(64),
           sealed: true,
-          accepted: false,
+          accepted: true,
           createdAt: '2026-08-09T00:00:00.000Z',
           updatedAt: '2026-08-09T00:00:00.000Z'
         }],

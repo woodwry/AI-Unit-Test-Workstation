@@ -13,6 +13,7 @@ import { ModelInterfaceDeleteDialog } from './ModelInterfaceDeleteDialog';
 import {
   buildCreateModelInterfaceRequest,
   buildModelInterfaceDraft,
+  buildModelInterfaceConnectionTestRequest,
   buildUpdateModelInterfaceRequest,
   isModelInterfaceDraftDirty,
   reduceModelInterfaceEditorState,
@@ -154,15 +155,21 @@ export function WorkspaceModelSettingsSection({
     finally { setOperationBusy(false); }
   }
   async function testConnection(): Promise<void> {
+    setShowRequestParameterErrors(true);
+    let request;
+    try {
+      request = buildModelInterfaceConnectionTestRequest(draft);
+    } catch (error) {
+      dispatchEditorState({ type: 'connection-result-shown', connectionResult: {
+        ok: false, code: 'invalid_configuration',
+        message: error instanceof Error ? error.message : '接口配置无效。'
+      } });
+      return;
+    }
     setOperationBusy(true);
     dispatchEditorState({ type: 'messages-cleared' });
     try {
-      const result = await window.workstation.testModelInterfaceConnection({
-        ...(editingId && editingId !== 'new' ? { interfaceId: editingId } : {}),
-        baseUrl: draft.baseUrl, model: draft.model, credentialMode: draft.credentialMode,
-        ...(draft.environmentVariableName.trim() ? { environmentVariableName: draft.environmentVariableName.trim() } : {}),
-        ...(draft.credentialMode === 'direct' && draft.apiKey ? { apiKey: draft.apiKey } : {})
-      });
+      const result = await window.workstation.testModelInterfaceConnection(request);
       dispatchEditorState({ type: 'connection-result-shown', connectionResult: result });
     } catch { dispatchEditorState({ type: 'connection-result-shown', connectionResult: { ok: false, code: 'network_error', message: '连接测试失败。' } }); }
     finally { setOperationBusy(false); }
@@ -260,7 +267,7 @@ export function WorkspaceModelSettingsSection({
               </div>
               {draft.requestParameters.length > 0 ? (
                 <>
-                  <div className="model-interface-parameter-heading" aria-hidden="true"><span>参数名</span><span>参数值（JSON）</span><span /></div>
+                  <div className="model-interface-parameter-heading" aria-hidden="true"><span>参数名</span><span>参数值</span><span /></div>
                   <div className="model-interface-parameter-list">
                     {draft.requestParameters.map((parameter, index) => {
                       const error = showRequestParameterErrors ? requestParameterValidation.errors[index] : undefined;

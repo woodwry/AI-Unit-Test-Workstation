@@ -55,8 +55,11 @@ export function ClassTaskResultPage({
   const view = useMemo(() => buildCoverageView(result), [result]);
   const methodRows = useMemo(() => buildClassTaskResultMethodRows(result), [result]);
   const summary = useMemo(() => buildClassTaskResultSummary(result), [result]);
-  const status = resolveClassTaskResultStatus(task.state);
-  const showActions = shouldShowClassTaskResultActions(result);
+  const status = resolveClassTaskResultStatus(
+    task.state,
+    result.artifacts.some((artifact) => !artifact.accepted)
+  );
+  const showActions = shouldShowClassTaskResultActions(result, task.state);
   const selectedMetric = dialogMetric === null ? null : view[dialogMetric];
   const accepted = result.artifacts.length > 0
     && result.artifacts.every((artifact) => artifact.accepted);

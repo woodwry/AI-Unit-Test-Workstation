@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+import { GeneratedTestWatchdogService } from './generated-test-watchdog.service.ts';
 import type {
   BuildSettingsValidationResult,
   BuildToolchainSettings,
@@ -18,7 +19,6 @@ import {
 } from './maven-command.ts';
 
 const COMMAND_STDIO_DRAIN_GRACE_MS = 1_000;
-const GENERATED_SUREFIRE_TIMEOUT_MS = 120_000;
 
 /**
  * Maven 在中文 Windows 控制台下可能输出 GBK/GB18030 字节。
@@ -41,6 +41,29 @@ export class CommandCancelledError extends Error {
 }
 
 export class ShellService {
+  private readonly generatedTestMethodTimeoutSeconds: number;
+
+  constructor(generatedTestMethodTimeoutSeconds = 120) {
+    if (!Number.isSafeInteger(generatedTestMethodTimeoutSeconds) || generatedTestMethodTimeoutSeconds <= 0) {
+      throw new TypeError('Generated test method timeout must be a positive integer.');
+    }
+    this.generatedTestMethodTimeoutSeconds = generatedTestMethodTimeoutSeconds;
+  }
+
+  private generatedTestRuntimeProperties(reportsDirectory?: string): Record<string, string> {
+    return {
+      'junit.jupiter.execution.timeout.test.method.default': `${this.generatedTestMethodTimeoutSeconds} s`,
+      'junit.jupiter.execution.timeout.thread.mode.default': 'SAME_THREAD',
+      'junit.jupiter.execution.timeout.mode': 'enabled',
+      'junit.jupiter.extensions.autodetection.enabled': 'true',
+      'ai.unit.test.method.watchdog.seconds': String(this.generatedTestMethodTimeoutSeconds),
+      'ai.unit.test.method.watchdog.reports': reportsDirectory ?? 'target/surefire-reports',
+      // Bound cleanup of non-daemon threads left by a completed test fork.
+      'surefire.exitTimeout': '1',
+      forkCount: '1'
+    };
+  }
+
   async validateBuildSettings(
     settings: BuildToolchainSettings,
     workingDirectory: string = process.cwd(),
@@ -162,7 +185,7 @@ export class ShellService {
     );
   }
 
-  runMavenModuleTestsWithJacoco(
+  async runMavenModuleTestsWithJacoco(
     moduleRoot: string,
     settings: BuildToolchainSettings,
     executionDataPath: string,
@@ -172,6 +195,10 @@ export class ShellService {
     if (!executionDataPath.trim() || !surefireReportsDirectory.trim()) {
       throw new Error('模块预加载的 JaCoCo exec 和 Surefire 目录不能为空。');
     }
+    // Maven's incremental test compilation does not remove bytecode when its
+    // source is deleted. A module-wide preload must rebuild current tests so
+    // Surefire cannot discover an orphaned test from a previous run.
+    await this.resetModuleTestOutput(moduleRoot, options.signal);
     return this.runMaven(
       moduleRoot,
       settings,
@@ -273,6 +300,7 @@ export class ShellService {
         {
           testClassNames,
           properties: {
+            ...this.generatedTestRuntimeProperties(surefireReportsDirectory),
             // 定向覆盖率任务必须真实执行测试，覆盖父 POM 中可能存在的 skip 配置。
             'maven.test.skip': 'false',
             skipTests: 'false',
@@ -311,6 +339,7 @@ export class ShellService {
         {
           testClassNames: [testClassName],
           properties: {
+            ...this.generatedTestRuntimeProperties(surefireReportsDirectory),
             'maven.test.skip': 'false',
             skipTests: 'false',
             ...(surefireReportsDirectory
@@ -369,12 +398,6 @@ export class ShellService {
     if (!surefireReportsDirectory.trim()) {
       throw new Error('Surefire 报告目录不能为空');
     }
-    const timeoutDiagnostic = [
-      `[ERROR] Generated test validation timed out after ${GENERATED_SUREFIRE_TIMEOUT_MS / 1_000} seconds.`,
-      '[ERROR] The generated test likely contains an infinite loop, unbounded recursion, deadlock, or blocking call.',
-      '[ERROR] Timed out tests:',
-      ...testClassNames.map((className) => `[ERROR] ${className}`)
-    ].join('\n');
     return this.runMaven(
       workspaceRoot,
       settings,
@@ -384,26 +407,35 @@ export class ShellService {
         {
           testClassNames,
           properties: {
+            ...this.generatedTestRuntimeProperties(surefireReportsDirectory),
             'maven.test.skip': 'false',
             skipTests: 'false',
             'surefire.reportsDirectory': surefireReportsDirectory
           }
         }
       ),
-      {
-        ...options,
-        timeoutMilliseconds: GENERATED_SUREFIRE_TIMEOUT_MS,
-        timeoutDiagnostic
-      }
+      options
     );
   }
 
-  private runMaven(
+  private async runMaven(
     workspaceRoot: string,
     settings: BuildToolchainSettings,
     args: string[],
     options: CommandExecutionOptions = {}
   ): Promise<CommandResult> {
+    if (args.some(arg => arg.startsWith('-Dai.unit.test.method.watchdog.seconds='))) {
+      const failure = await new GeneratedTestWatchdogService().install(
+        workspaceRoot,
+        (sources, output) => this.runCommand(
+          join(settings.javaHome, 'bin', process.platform === 'win32' ? 'javac.exe' : 'javac'),
+          ['-source', '8', '-target', '8', '-encoding', 'UTF-8', '-d', output, ...sources],
+          workspaceRoot, settings, options
+        ),
+        options.signal
+      );
+      if (failure) return failure;
+    }
     return this.runCommand(resolveMavenExecutable(settings), args, workspaceRoot, settings, options);
   }
 
@@ -564,6 +596,31 @@ export class ShellService {
         onAbort();
       }
     });
+  }
+
+  private async resetModuleTestOutput(moduleRoot: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new CommandCancelledError();
+    const root = resolve(moduleRoot);
+    const output = join(root, 'target', 'test-classes');
+    for (const path of [join(root, 'target'), output]) {
+      let stat;
+      try {
+        stat = await fs.lstat(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+      if (stat.isSymbolicLink()) throw new Error('测试编译目录包含链接，无法安全清理。');
+      if (!stat.isDirectory()) throw new Error('测试编译产物路径不是目录。');
+    }
+    const canonicalRoot = await fs.realpath(root);
+    const canonicalOutput = await fs.realpath(output);
+    if (!this.isInside(canonicalRoot, canonicalOutput)) {
+      throw new Error('测试编译目录超出当前 Maven 模块，无法安全清理。');
+    }
+    if (signal?.aborted) throw new CommandCancelledError();
+    // Retain production classes, previous reports, coverage, and task state.
+    await fs.rm(output, { recursive: true, force: true });
   }
 
   private async requireDirectory(path: string, label: string): Promise<void> {

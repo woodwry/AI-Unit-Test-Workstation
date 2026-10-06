@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { setTimeout as realDelay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -161,6 +162,64 @@ test('builds one module-wide JaCoCo command without clean or a test selector', a
   assert.equal(captured.options.signal, signal);
 });
 
+test('module preload rebuilds test output after source deletion while retaining production and task artifacts', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'preload-deleted-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const compiledTest = join(root, 'target/test-classes/demo/DeletedTest.class');
+  const retainedPaths = ['src/test/java/demo/CurrentTest.java', 'target/classes/demo/Target.class',
+    'target/ai-unit-test/jacoco/task/previous.exec', '.ai-unit-test/checkpoint.json',
+    'target/surefire-reports/TEST-demo.DeletedTest.xml'];
+  for (const path of [compiledTest, ...retainedPaths.map(path => join(root, path))]) {
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, 'retained');
+  }
+  const service = new ShellService();
+  service.runMaven = async (workspaceRoot, actualSettings, args) => {
+    await assert.rejects(access(compiledTest), { code: 'ENOENT' });
+    for (const path of retainedPaths) assert.equal(await readFile(join(root, path), 'utf8'), 'retained');
+    assert.equal(args.includes('clean'), false);
+    return { exitCode: 0, stdout: '', stderr: '', cwd: workspaceRoot, command: 'mvn test-compile jacoco:prepare-agent surefire:test' };
+  };
+  const result = await service.runMavenModuleTestsWithJacoco(root, settings,
+    join(root, 'target/ai-unit-test/jacoco/preload/new.exec'), join(root, 'target/ai-unit-test/surefire/preload/new'));
+  assert.equal(result.exitCode, 0);
+});
+
+test('a cancelled module preload retains compiled tests and does not start Maven', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'preload-cancelled-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const compiledTest = join(root, 'target/test-classes/CurrentTest.class');
+  await mkdir(join(compiledTest, '..'), { recursive: true });
+  await writeFile(compiledTest, 'compiled');
+  const controller = new AbortController();
+  controller.abort();
+  const service = new ShellService();
+  service.runMaven = async () => { throw new Error('cancelled preload must not start Maven'); };
+  await assert.rejects(service.runMavenModuleTestsWithJacoco(root, settings,
+    join(root, 'target/new.exec'), join(root, 'target/reports'), { signal: controller.signal }),
+  { name: 'CommandCancelledError' });
+  assert.equal(await readFile(compiledTest, 'utf8'), 'compiled');
+});
+
+for (const linkName of ['target', 'target/test-classes']) {
+test(`module preload refuses to clear linked output (${linkName})`, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'preload-link-'));
+  const outside = await mkdtemp(join(tmpdir(), 'preload-link-target-'));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); });
+  const preserved = join(outside, linkName === 'target' ? 'test-classes/ForeignTest.class' : 'ForeignTest.class');
+  await mkdir(join(preserved, '..'), { recursive: true });
+  await writeFile(preserved, 'foreign');
+  const linkPath = join(root, linkName);
+  await mkdir(join(linkPath, '..'), { recursive: true });
+  await symlink(outside, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+  const service = new ShellService();
+  service.runMaven = async () => ({ exitCode: 0 });
+  await assert.rejects(service.runMavenModuleTestsWithJacoco(root, settings,
+    join(root, 'new.exec'), join(root, 'reports')), /linked|链接/u);
+  assert.equal(await readFile(preserved, 'utf8'), 'foreign');
+});
+}
+
 test('generated-test compile and Surefire keep one ordered selector for multiple classes', async () => {
   const service = new ShellService();
   const calls = [];
@@ -200,12 +259,28 @@ test('generated-test compile and Surefire keep one ordered selector for multiple
   ]);
   assert.equal(calls[0].options.timeoutMilliseconds, undefined);
   assert.equal(calls[0].options.timeoutDiagnostic, undefined);
-  assert.equal(calls[1].options.timeoutMilliseconds, 120_000);
-  assert.match(calls[1].options.timeoutDiagnostic, /timed out after 120 seconds/i);
-  assert.match(calls[1].options.timeoutDiagnostic, /Timed out tests:/);
-  for (const className of classNames) {
-    assert.match(calls[1].options.timeoutDiagnostic, new RegExp(className.replaceAll('.', '\\.')));
-  }
+  assert.equal(calls[1].options.timeoutMilliseconds, undefined);
+  assert.equal(calls[1].options.timeoutDiagnostic, undefined);
+  assert.ok(calls[1].args.includes('-Djunit.jupiter.execution.timeout.test.method.default=120 s'));
+  assert.ok(calls[1].args.includes('-Djunit.jupiter.execution.timeout.thread.mode.default=SAME_THREAD'));
+  assert.ok(calls[1].args.includes('-Djunit.jupiter.execution.timeout.mode=enabled'));
+  assert.ok(calls[1].args.includes('-Djunit.jupiter.extensions.autodetection.enabled=true'));
+  assert.ok(calls[1].args.includes('-Dai.unit.test.method.watchdog.seconds=120'));
+});
+
+test('candidate tests and formal JaCoCo use the same per-method runtime and watchdog', async () => {
+  const service = new ShellService();
+  const calls = [];
+  service.runMaven = async (_root, _settings, args, options) => {
+    calls.push({ args, options });
+    return { command: 'mvn test', cwd: 'D:/module', exitCode: 0, stdout: '', stderr: '' };
+  };
+  await service.runMavenGeneratedSurefireTest('D:/module', settings, 'demo.Test', 'D:/module/target/reports');
+  await service.runMavenDirectTestsWithJacocoAppend('D:/module', settings, ['demo.Test'], 'D:/module/target/test.exec', 'D:/module/target/reports');
+  const runtime = args => args.filter(arg => /(?:junit\.jupiter|ai\.unit\.test\.method\.watchdog|surefire\.exitTimeout|forkCount)/u.test(arg));
+  assert.deepEqual(runtime(calls[1].args), runtime(calls[0].args));
+  assert.ok(runtime(calls[1].args).length >= 6);
+  assert.equal(calls[1].options.timeoutMilliseconds, undefined);
 });
 
 test('returns a bounded failure and preserves output when a command times out', async () => {
@@ -230,6 +305,44 @@ test('returns a bounded failure and preserves output when a command times out', 
   assert.match(result.stderr, /Generated test validation timed out/);
   assert.match(result.stderr, /com\.example\.HangingTest/);
   assert.ok(Date.now() - startedAt < 5_000);
+});
+
+test('Maven has no whole-class deadline and can still be cancelled by the user', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'generated-test-no-timeout-'));
+  const marker = join(root, 'started.txt');
+  const controller = new AbortController();
+  const service = new ShellService();
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  service.runMaven = (_workspace, _settings, _args, options) => service.runCommand(
+    process.execPath,
+    ['-e', "require('node:fs').writeFileSync(process.argv[1], 'started'); setInterval(() => {}, 1000);", marker],
+    process.cwd(),
+    { mavenHome: tmpdir(), javaHome: tmpdir() },
+    options
+  );
+  const execution = service.runMavenGeneratedSurefireTest(
+    root, settings, 'com.example.LongRunningTest', root, { signal: controller.signal }
+  );
+  let settled = false;
+  void execution.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    let started = false;
+    for (let attempt = 0; attempt < 100 && !started; attempt += 1) {
+      started = await readFile(marker, 'utf8').then(() => true, () => false);
+      if (!started) await realDelay(20);
+    }
+    assert.equal(started, true, 'the real child process must have started');
+    t.mock.timers.tick(121_000);
+    await realDelay(100);
+    assert.equal(settled, false, 'elapsed time must not terminate generated tests');
+    controller.abort();
+    await assert.rejects(execution, { name: 'CommandCancelledError' });
+  } finally {
+    controller.abort();
+    await execution.catch(() => undefined);
+    t.mock.timers.reset();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('extracts a bounded public Maven diagnostic without bearer credentials', () => {

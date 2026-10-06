@@ -92,6 +92,14 @@ export function buildClassTaskResultProgress(
   result: ClassTaskResultSnapshot,
   summary: ClassTaskResultSummary
 ): ClassTaskResultProgressView {
+  if (task.state === 'READY' && result.artifacts.some((artifact) => !artifact.accepted)) {
+    return {
+      heading: '已有结果待处理',
+      description: `已保留 ${summary.generatedMethodCount} 个方法的结果、${summary.generatedTestMethodCount} 条测试记录，请先接受或撤回。`,
+      methodCountLabel: `${summary.generatedMethodCount} 个已有结果`,
+      totalMethodCount: summary.generatedMethodCount
+    };
+  }
   const totalMethodCount = task.methodOrder.length > 0
     ? task.methodOrder.length
     : summary.generatedMethodCount;

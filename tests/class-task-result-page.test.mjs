@@ -15,9 +15,21 @@ test('only normal completion and user termination receive the approved result la
 });
 
 test('accept and revoke actions require a successful formal file and a permitted transaction', () => {
-  assert.equal(shouldShowClassTaskResultActions({ artifacts: [], canAccept: true, canRevoke: true }), false);
-  assert.equal(shouldShowClassTaskResultActions({ artifacts: [{}], canAccept: false, canRevoke: false }), false);
-  assert.equal(shouldShowClassTaskResultActions({ artifacts: [{}], canAccept: true, canRevoke: true }), true);
+  assert.equal(shouldShowClassTaskResultActions({ state: 'COMPLETED', artifacts: [], canAccept: true, canRevoke: true }), false);
+  assert.equal(shouldShowClassTaskResultActions({ state: 'COMPLETED', artifacts: [{}], canAccept: false, canRevoke: false }), false);
+  assert.equal(shouldShowClassTaskResultActions({ state: 'COMPLETED', artifacts: [{}], canAccept: true, canRevoke: true }), true);
+});
+
+test('active and paused generation hides decisions even when result permissions are stale', () => {
+  const result = { state: 'COMPLETED', artifacts: [{}], canAccept: true, canRevoke: true };
+  for (const state of ['PRELOADING', 'RUNNING', 'PAUSE_REQUESTED', 'PAUSED', 'STOPPING']) {
+    assert.equal(shouldShowClassTaskResultActions({ ...result, state }), false, state);
+    assert.equal(shouldShowClassTaskResultActions(result, state), false, `stale result during ${state}`);
+  }
+  for (const state of ['COMPLETED', 'TERMINATED', 'FAILED', 'INTERRUPTED']) {
+    assert.equal(shouldShowClassTaskResultActions({ ...result, state }, state), true, state);
+  }
+  assert.equal(shouldShowClassTaskResultActions({ ...result, state: 'RUNNING' }, 'COMPLETED'), false);
 });
 
 test('a background result decision hides both actions and previews acceptance without mutating the loaded snapshot', () => {

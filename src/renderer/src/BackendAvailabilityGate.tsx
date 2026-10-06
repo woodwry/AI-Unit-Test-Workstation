@@ -9,6 +9,7 @@ import {
 import type { ManagedBackendRuntimeStatus } from '../../shared/types';
 
 const BACKEND_PROBE_INTERVAL_MS = 5_000;
+const BACKEND_PROBE_FAILURE_THRESHOLD = 3;
 
 type BackendAvailabilityPhase = 'checking' | 'available' | 'unavailable' | 'retrying';
 
@@ -59,39 +60,67 @@ export function BackendAvailabilityGate({
   const hasConnectedRef = useRef(false);
   const retryingRef = useRef(false);
   const probeSequenceRef = useRef(0);
+  const probeInFlightRef = useRef<number | null>(null);
+  const probeQueuedRef = useRef(false);
+  const probeFailuresRef = useRef(0);
 
   useEffect(() => {
     activeRef.current = true;
     return () => {
       activeRef.current = false;
       probeSequenceRef.current += 1;
+      probeQueuedRef.current = false;
     };
   }, []);
 
   const markUnavailable = useCallback((): void => {
     probeSequenceRef.current += 1;
     retryingRef.current = false;
+    probeQueuedRef.current = false;
+    probeFailuresRef.current = BACKEND_PROBE_FAILURE_THRESHOLD;
     if (activeRef.current) setPhase('unavailable');
   }, []);
 
-  const probe = useCallback(async (): Promise<void> => {
+  const probe = useCallback(async (requested = false): Promise<void> => {
+    if (retryingRef.current && !requested) return;
+    if (probeInFlightRef.current !== null) {
+      if (requested) probeQueuedRef.current = true;
+      return;
+    }
     const sequence = probeSequenceRef.current + 1;
     probeSequenceRef.current = sequence;
+    probeInFlightRef.current = sequence;
+    const recordFailure = (): void => {
+      probeFailuresRef.current += 1;
+      const explicitlyRetrying = retryingRef.current;
+      retryingRef.current = false;
+      // A single missed background health check must not hide a live workbench.
+      if (!hasConnectedRef.current || explicitlyRetrying
+          || probeFailuresRef.current >= BACKEND_PROBE_FAILURE_THRESHOLD) {
+        setPhase('unavailable');
+      }
+    };
     try {
       const available = await window.workstation.probeBackendAvailability();
       if (!activeRef.current || probeSequenceRef.current !== sequence) return;
-      retryingRef.current = false;
       if (!available) {
-        setPhase('unavailable');
+        recordFailure();
         return;
       }
+      retryingRef.current = false;
+      probeFailuresRef.current = 0;
       hasConnectedRef.current = true;
       setHasConnected(true);
       setPhase('available');
     } catch {
       if (!activeRef.current || probeSequenceRef.current !== sequence) return;
-      retryingRef.current = false;
-      setPhase('unavailable');
+      recordFailure();
+    } finally {
+      if (probeInFlightRef.current === sequence) probeInFlightRef.current = null;
+      if (probeQueuedRef.current && activeRef.current) {
+        probeQueuedRef.current = false;
+        void probe(true);
+      }
     }
   }, []);
 
@@ -102,7 +131,7 @@ export function BackendAvailabilityGate({
     const applyRuntimeStatus = (status: ManagedBackendRuntimeStatus | null): void => {
       if (disposed) return;
       if (status === null || status.state === 'ready') {
-        void probe();
+        void probe(true);
         return;
       }
       if (status.state === 'failed' || status.state === 'stopped') {
@@ -142,10 +171,10 @@ export function BackendAvailabilityGate({
   }, [markUnavailable, probe]);
 
   useEffect(() => {
-    if (phase !== 'available') return undefined;
+    // Keep checking through outages so recovery does not require a manual retry.
     const timer = window.setInterval(() => void probe(), BACKEND_PROBE_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [phase, probe]);
+  }, [probe]);
 
   const retry = useCallback((): void => {
     if (retryingRef.current) return;
@@ -161,7 +190,7 @@ export function BackendAvailabilityGate({
           }
           return;
         }
-        void probe();
+        void probe(true);
       })
       .catch(() => markUnavailable());
   }, [markUnavailable, probe]);

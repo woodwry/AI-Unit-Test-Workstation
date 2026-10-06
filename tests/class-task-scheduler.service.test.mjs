@@ -8,6 +8,20 @@ import { ClassTaskCheckpointService } from '../src/main/services/class-task-chec
 import { ClassTaskRunnerService } from '../src/main/services/class-task-runner.service.ts';
 import { ClassTaskSchedulerService } from '../src/main/services/class-task-scheduler.service.ts';
 import { decodeMethodGenerationEvent, MethodGenerationRequestError } from '../src/main/services/method-generation-contract.ts';
+import { TaskJacocoMavenError } from '../src/main/services/task-jacoco-session.service.ts';
+
+test('formal coverage Maven failures retain their typed cause and sanitized command in the task error', () => {
+  const scheduler = new ClassTaskSchedulerService({});
+  const error = new TaskJacocoMavenError({
+    command: 'mvn surefire:test -Dtoken=private-value', cwd: 'D:/module', exitCode: 1,
+    stdout: '[ERROR] UnnecessaryStubbingException', stderr: ''
+  }, 'D:/module/target/evidence');
+  const publicError = scheduler.publicError(task('first'), error);
+  assert.equal(publicError.code, 'TASK_JACOCO_MAVEN_FAILED');
+  assert.match(publicError.message, /UnnecessaryStubbingException/);
+  assert.match(publicError.command, /mvn surefire:test/);
+  assert.doesNotMatch(publicError.command, /private-value/);
+});
 
 function task(id, state = 'READY', overrides = {}) {
   return {

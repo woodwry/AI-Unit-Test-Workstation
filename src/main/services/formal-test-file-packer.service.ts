@@ -8,6 +8,7 @@ import type {
   GeneratedSourceMethodResult
 } from '../../shared/class-task-contracts.ts';
 import type { MethodTestBundle } from './class-task-runner.service.ts';
+import type { CandidateExecutionFeedback } from './method-generation-contract.ts';
 import type {
   ClassTaskFileTransactionService
 } from './class-task-file-transaction.service.ts';
@@ -76,6 +77,9 @@ export type FormalTestFilePackerOptions = {
   structure?: JavaTestStructureService;
   excludedEnvironmentVariables?: readonly string[];
   idFactory?: () => string;
+  onBeforeFormalVerification?: (artifact: Pick<GeneratedClassTaskArtifact, 'filePath' | 'testClassName' | 'ordinaryTestMethodCount' | 'sha256'>) => Promise<void>;
+  onFormalVerified?: (artifact: Pick<GeneratedClassTaskArtifact, 'filePath' | 'testClassName' | 'ordinaryTestMethodCount' | 'sha256'>,
+    execution: CandidateExecutionFeedback) => Promise<void>;
 };
 
 export class FormalTestFilePackerService {
@@ -556,7 +560,6 @@ export class FormalTestFilePackerService {
     ) {
       throw new Error('Persisted formal artifacts contain an invalid unsealed tail.');
     }
-    const restoredWaveCountByMethodId = new Map<string, number>();
     const restoredMethodIdentity = new Map<
       string,
       Pick<GeneratedSourceMethodResult, 'methodName' | 'displaySignature'>
@@ -578,10 +581,13 @@ export class FormalTestFilePackerService {
             displaySignature: methodResult.displaySignature
           });
         }
-        const waveIndex = (restoredWaveCountByMethodId.get(methodId) ?? 0) + 1;
-        restoredWaveCountByMethodId.set(methodId, waveIndex);
         this.completedBundleKeys.add(legacyMethodBundleKey(methodId));
-        this.completedBundleKeys.add(waveMethodBundleKey(methodId, waveIndex));
+        if (methodResult?.waveIndex && methodResult.sourceBatchIds?.length) {
+          this.completedBundleKeys.add(waveMethodBundleKey(
+            methodId, methodResult.waveIndex, methodResult.sourceBatchIds
+          ));
+        }
+        if (methodResult?.fullSource) this.completedBundleKeys.add(fullSourceBundleKey(methodId, methodResult.fullSource));
       }
     }
     const readOnly = artifacts.some((artifact) => artifact.accepted);
@@ -672,6 +678,7 @@ export class FormalTestFilePackerService {
   ): Promise<void> {
     throwIfAborted(signal);
     if (artifact.ordinaryTestMethodCount === 0) return;
+    await this.options.onBeforeFormalVerification?.(artifact);
     const packageName = packageNameOf(this.options.qualifiedClassName);
     const qualifiedTestClassName = packageName
       ? `${packageName}.${artifact.testClassName}`
@@ -694,6 +701,7 @@ export class FormalTestFilePackerService {
         testClassName: artifact.testClassName,
         qualifiedTestClassName,
         ordinaryTestMethodCount: artifact.ordinaryTestMethodCount,
+        onVerified: (execution) => this.options.onFormalVerified?.(artifact, execution) ?? Promise.resolve(),
         ...(this.options.excludedEnvironmentVariables
           ? {
               excludedEnvironmentVariables:
@@ -720,6 +728,7 @@ export class FormalTestFilePackerService {
     });
     throwIfAborted(signal);
     assertFormalVerificationPassed(artifact, execution);
+    await this.options.onFormalVerified?.(artifact, execution);
   }
 
   private async rollbackNewReservation(
@@ -945,7 +954,10 @@ function cloneArtifact(
     ...artifact,
     methodIds: [...artifact.methodIds],
     ...(artifact.methodResults
-      ? { methodResults: artifact.methodResults.map((method) => ({ ...method })) }
+      ? { methodResults: artifact.methodResults.map((method) => ({
+          ...method,
+          ...(method.sourceBatchIds ? { sourceBatchIds: [...method.sourceBatchIds] } : {})
+        })) }
       : {})
   };
 }
@@ -967,7 +979,12 @@ function methodResultFromBundle(bundle: MethodTestBundle): GeneratedSourceMethod
     methodName: bundle.methodName,
     displaySignature: bundle.displaySignature,
     jacocoOrder: bundle.jacocoOrder,
-    ordinaryTestMethodCount: bundle.ordinaryTestMethodCount
+    ordinaryTestMethodCount: bundle.ordinaryTestMethodCount,
+    ...(bundle.fullSource ? { fullSource: { ...bundle.fullSource } } : {}),
+    ...(bundle.waveIndex === undefined ? {} : {
+      waveIndex: bundle.waveIndex,
+      sourceBatchIds: [...bundle.sourceBatchIds]
+    })
   };
 }
 
@@ -1012,17 +1029,24 @@ function sourceMethodIdOf(bundle: MethodTestBundle): string {
 }
 
 function methodBundleKey(bundle: MethodTestBundle): string {
+  if (bundle.fullSource) return fullSourceBundleKey(bundle.methodId, bundle.fullSource);
   return bundle.waveIndex === undefined
     ? legacyMethodBundleKey(bundle.methodId)
-    : waveMethodBundleKey(sourceMethodIdOf(bundle), bundle.waveIndex);
+    : waveMethodBundleKey(sourceMethodIdOf(bundle), bundle.waveIndex, bundle.sourceBatchIds);
 }
 
 function legacyMethodBundleKey(methodId: string): string {
   return `legacy:${methodId}`;
 }
 
-function waveMethodBundleKey(sourceMethodId: string, waveIndex: number): string {
-  return `wave:${sourceMethodId}:${waveIndex}`;
+function waveMethodBundleKey(
+  sourceMethodId: string, waveIndex: number, sourceBatchIds: readonly string[]
+): string {
+  return JSON.stringify(['wave', sourceMethodId, waveIndex, [...sourceBatchIds].sort()]);
+}
+
+function fullSourceBundleKey(methodId: string, source: { factsId: string; candidateId: string }): string {
+  return JSON.stringify(['full_source', methodId, source.factsId, source.candidateId]);
 }
 
 function mustPublishIndependently(

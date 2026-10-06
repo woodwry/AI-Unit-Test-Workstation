@@ -15,6 +15,7 @@ import {
 import { ClassTaskRunnerService } from './class-task-runner.service.ts';
 import { MethodGenerationRequestError } from './method-generation-contract.ts';
 import { sanitizePublicText } from './maven-command.ts';
+import { TaskJacocoMavenError } from './task-jacoco-session.service.ts';
 
 const RUN_ALL_ELIGIBLE_STATES = new Set<ClassTaskState>([
   'READY', 'COMPLETED', 'TERMINATED', 'INTERRUPTED'
@@ -405,7 +406,7 @@ export class ClassTaskSchedulerService {
     const message = error instanceof Error ? error.message : String(error);
     const errorCode = error && typeof error === 'object' && 'code' in error
       && typeof error.code === 'string'
-      && /^(?:MODEL|ANALYSIS|METHOD_GENERATION|RAG|REPORT|BRANCH_SNAPSHOT)_[A-Z0-9_]{1,121}$/.test(error.code)
+      && /^(?:MODEL|ANALYSIS|METHOD_GENERATION|RAG|REPORT|BRANCH_SNAPSHOT|TASK_JACOCO)_[A-Z0-9_]{1,121}$/.test(error.code)
       ? error.code
       : 'CLASS_TASK_EXECUTION_FAILED';
     return {
@@ -413,7 +414,7 @@ export class ClassTaskSchedulerService {
       message: sanitizePublicText(message),
       moduleName: task.qualifiedClassName,
       modulePath: task.moduleDisplayPath,
-      command: null,
+      command: error instanceof TaskJacocoMavenError ? error.command : null,
       occurredAt: this.clock().toISOString()
     };
   }

@@ -49,7 +49,7 @@ export function validateSelectModelInterfaceRequest(value: unknown): SelectModel
 
 export function validateModelInterfaceConnectionTestRequest(value: unknown): ModelInterfaceConnectionTestRequest {
   const request = requirePlainObject(value, '大模型连接测试请求无效');
-  requireOnlyKeys(request, ['interfaceId', 'baseUrl', 'model', 'credentialMode', 'environmentVariableName', 'apiKey']);
+  requireOnlyKeys(request, ['interfaceId', 'baseUrl', 'model', 'credentialMode', 'environmentVariableName', 'apiKey', 'requestParameters']);
   if (request.interfaceId !== undefined && (typeof request.interfaceId !== 'string' || !request.interfaceId.trim())) {
     throw new Error('大模型接口 ID 无效');
   }
@@ -58,11 +58,13 @@ export function validateModelInterfaceConnectionTestRequest(value: unknown): Mod
   if (request.credentialMode !== 'direct' && request.credentialMode !== 'environment') throw new Error('凭证方式无效');
   if (request.credentialMode === 'environment' && !MODEL_INTERFACE_ENV_PATTERN.test(String(request.environmentVariableName ?? '').trim())) throw new Error('环境变量名无效');
   if (request.credentialMode === 'direct' && request.apiKey !== undefined && typeof request.apiKey !== 'string') throw new Error('API Key 无效');
+  const requestParameters = normalizeOptionalModelRequestParameters(request.requestParameters);
   return {
     ...(typeof request.interfaceId === 'string' ? { interfaceId: request.interfaceId.trim() } : {}),
     baseUrl, model: request.model.trim(), credentialMode: request.credentialMode,
     ...(request.environmentVariableName !== undefined ? { environmentVariableName: String(request.environmentVariableName).trim() } : {}),
-    ...(typeof request.apiKey === 'string' ? { apiKey: request.apiKey } : {})
+    ...(typeof request.apiKey === 'string' ? { apiKey: request.apiKey } : {}),
+    ...(requestParameters ? { requestParameters } : {})
   };
 }
 

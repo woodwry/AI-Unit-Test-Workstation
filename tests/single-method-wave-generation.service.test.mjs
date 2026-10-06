@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -11,7 +11,8 @@ import { ClassTaskFileTransactionService } from '../src/main/services/class-task
 import { ClassTaskPauseRequestedError } from '../src/main/services/class-task-interruption.ts';
 import {
   MethodGenerationRequestError,
-  MethodGenerationWaveNotFoundError
+  MethodGenerationWaveNotFoundError,
+  validateResumeMethodGenerationRequest
 } from '../src/main/services/method-generation-contract.ts';
 import { SingleMethodGenerationService } from '../src/main/services/single-method-generation.service.ts';
 import { TestWriterService } from '../src/main/services/test-writer.service.ts';
@@ -434,6 +435,103 @@ function childModelEvent(part, sequence) {
   };
 }
 
+test('keeps an active Wave alive while its last Part reports real streaming progress', async (t) => {
+  const wave = workWave(2);
+  const first = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test', 'first'));
+  const second = succeeded(wave.parts[1], testCode('TaskServiceTmp1Part2Test', 'second'));
+  const completion = { parts: [first, second], succeededPartCount: 2, failedPartCount: 0, cancelledPartCount: 0 };
+  const h = await harness(t, {
+    wave,
+    serviceOverrides: { methodGenerationWaveProgressTimeoutMilliseconds: 150 },
+    async runWave({ onProgress, signal }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, first, 'part_succeeded'));
+      for (let index = 0; index < 5; index += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 45));
+        assert.equal(signal.aborted, false, 'ongoing output must renew the idle deadline');
+        await onProgress(waveEvent(index + 3, wave, 'part_event', {
+          partIndex: 2,
+          partBatchId: second.partBatchId,
+          scenarioIds: second.scenarioIds,
+          childSessionId: second.childSessionId,
+          childEvent: {
+            sessionId: second.childSessionId,
+            eventSequence: index + 1,
+            eventType: 'progress',
+            occurredAt: '2026-08-19T00:00:00Z',
+            progress: { repairAttempt: 0, stage: 'generating', completedTestMethods: 0, remainingTestMethods: 1 },
+            candidate: null, completion: null, error: null, modelCall: null
+          }
+        }));
+      }
+      await onProgress(terminalEvent(8, wave, second, 'part_succeeded'));
+      await onProgress(waveEvent(9, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 9, completion };
+    }
+  });
+  const outcome = await h.service.executeWave(
+    h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal
+  );
+  assert.deepEqual(outcome.completedScenarioIds, ['scenario-1', 'scenario-2']);
+  assert.equal(h.waveCancellations.length, 0);
+});
+
+test('still cancels an idle Wave and retains its already successful Part', async (t) => {
+  const wave = workWave(2);
+  const first = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test', 'first'));
+  const h = await harness(t, {
+    wave,
+    serviceOverrides: { methodGenerationWaveProgressTimeoutMilliseconds: 100 },
+    async runWave({ onProgress, signal }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, first, 'part_succeeded'));
+      await new Promise((_resolve, reject) => {
+        const keepAlive = setTimeout(() => reject(new Error('idle deadline did not fire')), 2_000);
+        signal.addEventListener('abort', () => {
+          clearTimeout(keepAlive);
+          reject(signal.reason);
+        }, { once: true });
+      });
+    }
+  });
+  await assert.rejects(h.service.executeWave(
+    h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal
+  ), (error) => error.code === 'MODEL_WAVE_IDLE_TIMEOUT');
+  assert.equal(h.savedWaves.at(-1).parts[0].status, 'SUCCEEDED');
+  assert.equal(h.waveCancellations.length, 1);
+  assert.equal(h.mavenInputs.length, 0);
+});
+
+test('does not skip a valid generated Part when saving its file fails', async (t) => {
+  const wave = workWave(1);
+  const part = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test', 'generated'));
+  const h = await harness(t, {
+    wave,
+    serviceOverrides: {
+      partStore: {
+        async store() { throw new Error('simulated storage conflict'); },
+        async clearWave() {}
+      }
+    },
+    async runWave({ onProgress }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, part, 'part_succeeded'));
+      const completion = { parts: [part], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    }
+  });
+  await assert.rejects(h.service.executeWave(
+    h.task, wave, { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal
+  ), /simulated storage conflict/);
+  assert.equal(h.mavenInputs.length, 0);
+});
+
 async function harness(t, {
   wave,
   runWave,
@@ -473,6 +571,7 @@ async function harness(t, {
   const waveSummaryLogs = [];
   const mavenBatchLogs = [];
   const candidateStates = new Map();
+  let currentAtomicStep = 'IDLE';
   const writer = new TestWriterService();
   let uuid = 500;
   const service = new SingleMethodGenerationService({
@@ -593,8 +692,8 @@ async function harness(t, {
       }
     },
     checkpoints: {
-      async beginAtomicStep() {},
-      async completeAtomicStep() {},
+      async beginAtomicStep(_taskId, step) { currentAtomicStep = step; },
+      async completeAtomicStep() { currentAtomicStep = 'IDLE'; },
       async saveInProgressBatch() {},
       async clearInProgressBatch() {},
       async commitBatch() {},
@@ -739,6 +838,7 @@ async function harness(t, {
   return {
     service,
     task,
+    atomicStep: () => currentAtomicStep,
     mavenInputs,
     savedWaves,
     savedCandidates,
@@ -1507,7 +1607,8 @@ test('restores missing successful Part files from a completed Agent Wave without
   assert.equal(h.mavenInputs.length, 1);
 });
 
-test('rebuilds a zero-attempt merged candidate whose cleanup removed its TMP identity', async (t) => {
+for (const [status, repairAttempts] of [['MODEL_REPAIR', 0], ['PASSED', 3]]) {
+test(`rebuilds a ${status} merged candidate whose cleanup removed its TMP identity with ${repairAttempts} attempts retained`, async (t) => {
   const wave = workWave(1);
   const partResult = succeeded(
     wave.parts[0],
@@ -1553,8 +1654,8 @@ test('rebuilds a zero-attempt merged candidate whose cleanup removed its TMP ide
     candidateId: staleCandidateId,
     methodId: wave.methodId,
     waveId: wave.waveBatchId,
-    status: 'MODEL_REPAIR',
-    llmRepairAttemptsUsed: 0,
+    status,
+    llmRepairAttemptsUsed: repairAttempts,
     repairAttemptLimit: 5,
     unlimitedRepair: false,
     lastMavenBatchId: 'maven-before-contract-failure',
@@ -1580,9 +1681,11 @@ test('rebuilds a zero-attempt merged candidate whose cleanup removed its TMP ide
   assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
   assert.equal(h.mavenInputs.length, 1);
   assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, repairAttempts);
 });
+}
 
-test('recreates only unfinished Parts when the persisted Agent Wave session is gone', async (t) => {
+test('recreates only unfinished Parts when the Agent session is gone and coverage report was rebuilt', async (t) => {
   const wave = workWave(2);
   const first = succeeded(
     wave.parts[0],
@@ -1601,8 +1704,14 @@ test('recreates only unfinished Parts when the persisted Agent Wave session is g
   const recoveredSessionId = '88888888-8888-4888-8888-888888888888';
   let initialCalls = 0;
   let recoveryRequest;
+  let currentReportPairId = REPORT_PAIR_ID;
+  const contextOverrides = {};
+  Object.defineProperty(contextOverrides, 'reportPairId', {
+    enumerable: true, get: () => currentReportPairId
+  });
   const h = await harness(t, {
     wave,
+    contextOverrides,
     async runWave({ onProgress }) {
       initialCalls += 1;
       await onProgress(waveEvent(1, wave, 'wave_started'));
@@ -1640,6 +1749,7 @@ test('recreates only unfinished Parts when the persisted Agent Wave session is g
     new AbortController().signal
   ), /simulated workstation crash/);
   const crashed = structuredClone(h.savedWaves.at(-1));
+  currentReportPairId = 'f'.repeat(64);
 
   const outcome = await h.service.executeWave(
     h.task,
@@ -2117,9 +2227,8 @@ test('recovers a published passing Wave after coverage refresh changes the repor
   assert.equal(outcome.bundle.code, testCode('TaskService5Test', 'generated'));
 });
 
-test('a persisted BLOCKED Wave preserves its source and does not call Agent or Maven again', async (t) => {
-  // Mutation caught: omitting BLOCKED from candidate recovery falls through to the
-  // initial Agent Wave path and repeats generation for a user-actionable project failure.
+test('retrying a BLOCKED Wave revalidates its preserved candidate without regenerating Parts', async (t) => {
+  // A repaired project or updated validator must not leave BLOCKED checkpoints permanent.
   const wave = workWave(1);
   let initialWaveCalls = 0;
   const h = await harness(t, {
@@ -2171,21 +2280,20 @@ test('a persisted BLOCKED Wave preserves its source and does not call Agent or M
     fileSha256: 'f'.repeat(64)
   });
 
-  await assert.rejects(
-    h.service.executeWave(
+  const outcome = await h.service.executeWave(
       h.task,
       wave,
       { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
       active,
       new AbortController().signal
-    ),
-    /preserved.*resolve.*manually/i
   );
 
   assert.equal(initialWaveCalls, 0);
-  assert.equal(h.mavenInputs.length, 0);
+  assert.equal(h.mavenInputs.length, 1);
   assert.equal(h.repairCalls.length, 0);
-  assert.equal(h.savedCandidates.length, 0);
+  assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.equal(h.savedCandidates.at(-1).stableRepair.phase, 'PASSED');
+  assert.deepEqual(outcome.candidateIds, [candidateId]);
   assert.equal(await readFile(filePath, 'utf8'), code);
 });
 
@@ -2909,7 +3017,7 @@ test('class Wave sends one mixed A3+B2 Part and returns source-method bundles wi
   assert.equal(outcome.bundles[0].code, outcome.bundles[1].code);
 });
 
-test('class Wave stable repair keeps a zero-test formalization bundle for an accepted method', async (t) => {
+test('class Wave isolates a zero-test candidate without publishing an accepted bundle', async (t) => {
   const slice = classMethodSlice(METHOD_ID, 'alpha', 'm1_', 1, 0);
   const wave = {
     waveBatchId: WAVE_ID,
@@ -2987,14 +3095,11 @@ test('class Wave stable repair keeps a zero-test formalization bundle for an acc
     new AbortController().signal
   );
 
-  assert.equal(outcome.bundles.length, 1);
-  assert.equal(outcome.bundles[0].sourceMethodId, METHOD_ID);
-  assert.equal(outcome.bundles[0].ordinaryTestMethodCount, 0);
-  assert.deepEqual(outcome.bundles[0].passedTestMethods, []);
-  assert.equal(outcome.candidateIds.length, 1);
-  assert.deepEqual(outcome.completedScenarioIds, wave.selectedScenarioIds);
-  assert.deepEqual(outcome.skippedScenarioIds, []);
-  assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.equal(outcome.bundles, undefined);
+  assert.deepEqual(outcome.candidateIds, []);
+  assert.deepEqual(outcome.completedScenarioIds, []);
+  assert.deepEqual(outcome.skippedScenarioIds, wave.selectedScenarioIds);
+  assert.equal(h.savedCandidates.at(-1).status, 'QUARANTINED');
   const finalCode = await readFile(h.savedCandidates.at(-1).managedFile.path, 'utf8');
   assert.match(finalCode, /\/\/ TODO/);
   assert.equal((finalCode.match(/^\s*@Test\b/gm) ?? []).length, 0);
@@ -3317,6 +3422,86 @@ test('class Wave repair analyzes and merges every production method with a faili
     [SECOND_METHOD_ID]
   );
 });
+
+for (const warningCase of [
+  {
+    name: 'shared Analyzer warnings across source methods',
+    messages: [['shared', 'first only'], ['shared', 'second only']],
+    expected: ['REPAIR_EVIDENCE: shared', 'REPAIR_EVIDENCE: first only', 'REPAIR_EVIDENCE: second only']
+  },
+  {
+    name: 'warnings that become equal after normalization',
+    messages: [['shared\n evidence'], ['shared evidence']],
+    expected: ['REPAIR_EVIDENCE: shared evidence']
+  },
+  {
+    name: 'duplicate warnings occupying the evidence limit',
+    messages: [Array(64).fill('shared'), ['second only']],
+    expected: ['REPAIR_EVIDENCE: shared', 'REPAIR_EVIDENCE: second only']
+  },
+  {
+    name: 'warnings that become equal after length bounding',
+    messages: [['x'.repeat(2_000) + ' first'], ['x'.repeat(2_000) + ' second']],
+    expected: ['REPAIR_EVIDENCE: ' + 'x'.repeat(1_983)]
+  }
+]) {
+  test(`class Wave repair accepts ${warningCase.name} at the real request contract`, async (t) => {
+    const wave = classWorkWave();
+    const names = ['m1_a1', 'm1_a2', 'm1_a3', 'm2_b1', 'm2_b2'];
+    const result = succeeded(wave.parts[0], testCodeWithMethods('TaskServiceTmp1Part1Test', names));
+    result.candidate.ordinaryTestMethodCount = names.length;
+    const completion = {
+      parts: [result], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0
+    };
+    let repairRequest;
+    const h = await harness(t, {
+      wave,
+      async runWave({ onProgress }) {
+        await onProgress(waveEvent(1, wave, 'wave_started'));
+        await onProgress(terminalEvent(2, wave, result, 'part_succeeded'));
+        await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+        return {
+          waveSessionId: '44444444-4444-4444-8444-444444444444',
+          eventSequence: 3,
+          completion
+        };
+      },
+      async mavenExecute() { return failedExecutionForTests(['m1_a1', 'm2_b1']); },
+      getMethodRepairContext(_sessionId, request) {
+        const index = wave.parts[0].methodSlices.findIndex((slice) => slice.methodId === request.methodId);
+        assert.ok(index >= 0);
+        return {
+          ...analyzerRepairContextForSlice(wave.parts[0].methodSlices[index]),
+          warnings: warningCase.messages[index].map((message) => ({ code: 'REPAIR_EVIDENCE', message }))
+        };
+      },
+      agentOverrides: {
+        async recoverMethodGenerationStream(request) {
+          return {
+            kind: 'candidate_ready',
+            sessionId: '77777777-7777-4777-8777-777777777777',
+            eventSequence: 1,
+            candidate: structuredClone(request.candidate)
+          };
+        },
+        async resumeMethodGenerationStream(_sessionId, request) {
+          validateResumeMethodGenerationRequest(request);
+          repairRequest = structuredClone(request);
+          throw new Error('stop after valid merged warning request');
+        }
+      }
+    });
+
+    await assert.rejects(h.service.executeWave(
+      h.task,
+      wave,
+      { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+      activeWaveCheckpoint(wave),
+      new AbortController().signal
+    ), /stop after valid merged warning request/);
+    assert.deepEqual(repairRequest.repairContext.analyzerWarnings, warningCase.expected);
+  });
+}
 
 test('class Wave repair retains all twenty-five production methods from failing tests', async (t) => {
   const slices = Array.from({ length: 25 }, (_, index) => {
@@ -4954,7 +5139,7 @@ test('a five-Part Wave with twenty-eight merged tests enters one seeded repair s
   assert.equal(outcome.completedScenarioIds.length, 5);
 });
 
-test('RAG Wave repair prepares indexed evidence and sends it on the single repair request', async (t) => {
+test('RAG Wave repair reports context preparation while indexing evidence before the repair request', async (t) => {
   const wave = classWorkWave();
   const methodNames = ['m1_a1', 'm1_a2', 'm1_a3', 'm2_b1', 'm2_b2'];
   const partCode = testCodeWithMethods('TaskServiceTmp1Part1Test', methodNames);
@@ -5007,6 +5192,7 @@ test('RAG Wave repair prepares indexed evidence and sends it on the single repai
   let seed;
   let candidateId;
   const refreshes = [];
+  const preparationSteps = [];
   const h = await harness(t, {
     wave,
     taskOverrides: { ragEnabled: true },
@@ -5017,12 +5203,14 @@ test('RAG Wave repair prepares indexed evidence and sends it on the single repai
     },
     serviceOverrides: {
       ragIndexCoordinator: {
-        async refresh(subscription, requestedFqns, _signal, requestedMethods, methodIds) {
+        async refresh(subscription, requestedFqns, _signal, requestedMethods, methodIds, analysisIdentity) {
+          preparationSteps.push({ stage: 'RAG', step: h.atomicStep() });
           refreshes.push({
             subscription,
             requestedFqns: [...requestedFqns],
             requestedMethods: structuredClone(requestedMethods),
-            methodIds: [...(methodIds ?? [])]
+            methodIds: [...(methodIds ?? [])],
+            analysisIdentity
           });
           return {
             status: 'reused',
@@ -5051,6 +5239,7 @@ test('RAG Wave repair prepares indexed evidence and sends it on the single repai
       };
     },
     getMethodRepairContext(_sessionId, request) {
+      preparationSteps.push({ stage: 'context', step: h.atomicStep() });
       assert.equal(request.methodId, SECOND_METHOD_ID);
       return analyzerRepairContextForSlice(wave.parts[0].methodSlices[1]);
     },
@@ -5147,6 +5336,10 @@ test('RAG Wave repair prepares indexed evidence and sends it on the single repai
   );
 
   assert.equal(h.ragPrepareRequests.length, 1);
+  assert.deepEqual(preparationSteps, [
+    { stage: 'context', step: 'ANALYZE_METHOD' },
+    { stage: 'RAG', step: 'ANALYZE_METHOD' }
+  ], 'repair preparation must report its active stage instead of IDLE');
   assert.deepEqual(refreshes, [{
     subscription: ragSubscription,
     requestedFqns: ['demo.DirectDependency'],
@@ -5156,7 +5349,11 @@ test('RAG Wave repair prepares indexed evidence and sends it on the single repai
       descriptor: wave.parts[0].methodSlices[1].batch.method.descriptor,
       sourceLine: null
     }],
-    methodIds: [SECOND_METHOD_ID]
+    methodIds: [SECOND_METHOD_ID],
+    analysisIdentity: {
+      analysisSessionId: '55555555-5555-4555-8555-555555555555',
+      reportPairId: REPORT_PAIR_ID
+    }
   }]);
   assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 1);
 });
@@ -5556,7 +5753,7 @@ test('Agent exhaustion after a scope-changing Maven attempt stabilizes that atte
   }]);
 });
 
-test('Wave stable repair retains an empty compiled test class without Surefire XML', async (t) => {
+test('Wave stable repair preserves an empty candidate as a failed batch without claiming successful scenarios', async (t) => {
   const wave = workWave(1);
   const partCode = [
     'package demo;',
@@ -5613,13 +5810,216 @@ test('Wave stable repair retains an empty compiled test class without Surefire X
 
   assert.equal(h.repairCalls.length, 0);
   assert.equal(h.mavenInputs.length, 2);
-  assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.equal(h.savedCandidates.at(-1).status, 'QUARANTINED');
   assert.equal(h.savedCandidates.at(-1).stableRepair.phase, 'PASSED');
   const finalCode = await readFile(h.savedCandidates.at(-1).managedFile.path, 'utf8');
   assert.match(finalCode, /\/\/ TODO 当前测试方法需要修复/);
   assert.equal((finalCode.match(/@Test\b/g) ?? []).length, 1);
   assert.equal((finalCode.match(/^\s*@Test\b/gm) ?? []).length, 0);
-  assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
+  assert.deepEqual(outcome.completedScenarioIds, []);
+  assert.deepEqual(outcome.skippedScenarioIds, ['scenario-1']);
+  assert.deepEqual(outcome.candidateIds, []);
+});
+
+for (const [type, mode] of [
+  ['java.util.concurrent.TimeoutException', 'direct'],
+  ['java.util.concurrent.TimeoutException', 'queued'],
+  ['java.util.concurrent.TimeoutException', 'paused']
+]) {
+test(`Wave deletes a proven abnormal test (${type}, ${mode}) and revalidates without spending a model repair`, async (t) => {
+  const wave = workWave(1);
+  wave.parts[0].methodTestPlan.minimumTestCount = 2;
+  wave.parts[0].methodTestPlan.testPathGroups.push({
+    ...structuredClone(wave.parts[0].methodTestPlan.testPathGroups[0]),
+    groupId: 'group-1-b', ordinal: 2
+  });
+  wave.parts[0].methodTestPlan.testMethodPlans.push({
+    testMethodPlanId: 'plan-1-b', methodId: METHOD_ID, ordinal: 2,
+    pathGroupIds: ['group-1-b'], status: 'COMPLETE'
+  });
+  const code = 'package demo;\nimport org.junit.jupiter.api.Test;\n'
+    + 'public class TaskServiceTmp1Part1Test {\n'
+    + '  @Test void broken() { while (true) {} }\n'
+    + '  @Test void remainsActive() { org.junit.jupiter.api.Assertions.assertTrue(true); }\n}\n';
+  const part = { ...succeeded(wave.parts[0], code),
+    candidate: { ...candidate(wave.parts[0], code), ordinaryTestMethodCount: 2 } };
+  const completion = { parts: [part], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  const controller = new AbortController();
+  let generated = 0;
+  const timeoutFailure = () => {
+    const failed = failedExecution('broken', type.endsWith('TimeoutException')
+      ? 'broken() timed out after 120 seconds' : 'GC overhead limit exceeded');
+    failed.testReport.failureDetails[0].kind = 'error';
+    failed.testReport.failureDetails[0].type = type;
+    failed.testReport.failures = 0;
+    failed.testReport.errors = 1;
+    failed.mavenExecutions.at(-1).surefireReports = [{ fileName: 'TEST-demo.TaskServiceTmp1Test.xml',
+      content: '<testsuite name="demo.TaskServiceTmp1Test" tests="1" errors="1" failures="0" skipped="0">'
+        + '<testcase classname="demo.TaskServiceTmp1Test" name="broken" time="120">'
+        + '<error type="java.util.concurrent.TimeoutException" message="broken() timed out after 120 seconds"/></testcase></testsuite>' }];
+    return failed;
+  };
+  const h = await harness(t, {
+    wave,
+    async runWave({ onProgress }) {
+      generated += 1;
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, part, 'part_succeeded'));
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    },
+    async mavenExecute(input, { callIndex, workspaceRoot }) {
+      if (callIndex === 1 && mode !== 'queued') return timeoutFailure();
+      if (mode === 'paused' && callIndex === 2) {
+        controller.abort(new ClassTaskPauseRequestedError());
+        throw controller.signal.reason;
+      }
+      if (mode !== 'paused') assert.equal(input.scope, 'pruned_method_candidate');
+      const effective = await readFile(join(workspaceRoot, 'module/src/test/java/demo/TaskServiceTmp1Test.java'), 'utf8');
+      assert.doesNotMatch(effective, /broken|while \(true\)/);
+      assert.match(effective, /void remainsActive\(\)/);
+      return passedExecution(1, 'pruned_method_candidate');
+    },
+    serviceOverrides: mode !== 'queued' ? {} : {
+      mavenReadyQueue: { async enqueue(request) {
+        await request.onBatchStart('batch-timeout');
+        await request.activate();
+        await request.isolate();
+        return { candidateId: request.candidateId, ...timeoutFailure() };
+      } }
+    },
+    agentOverrides: {
+      async recoverMethodGenerationStream() { throw new Error('an attributed OOM must be deleted before model repair'); }
+    }
+  });
+  const pending = h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), controller.signal);
+  let outcome;
+  if (mode === 'paused') {
+    await assert.rejects(pending, { name: 'ClassTaskPauseRequestedError' });
+    const paused = h.savedCandidates.at(-1);
+    const effective = await readFile(paused.managedFile.path, 'utf8');
+    assert.equal(paused.managedFile.sha256, sha256(effective));
+    assert.doesNotMatch(effective, /void broken/);
+    outcome = await h.service.executeWave(h.task, wave,
+      { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+      h.savedWaves.at(-1), new AbortController().signal);
+  } else outcome = await pending;
+  assert.equal(generated, 1);
+  assert.equal(h.mavenInputs.length, mode === 'queued' ? 1 : mode === 'paused' ? 3 : 2);
+  assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 0);
+  assert.deepEqual(outcome.bundle.passedTestMethods, ['remainsActive']);
+  const failureRoot = join(h.task.workspaceRoot, '.ai-unit-test/method-wave-failures');
+  const records = (await readdir(failureRoot, { recursive: true })).filter(name => name.endsWith('.removed-tests.json'));
+  assert.equal(records.length, 1);
+  const record = JSON.parse(await readFile(join(failureRoot, records[0]), 'utf8'));
+  assert.equal(record.removedMethods[0].name, 'broken');
+  assert.match(record.removedMethods[0].code, /while \(true\)/);
+  assert.equal(record.execution.testReport.failureDetails[0].type, type);
+});
+}
+
+test('a timeout introduced by a model repair is deleted before another model request', async (t) => {
+  const wave = workWave(1);
+  wave.parts[0].methodTestPlan.minimumTestCount = 2;
+  wave.parts[0].methodTestPlan.testPathGroups.push({
+    ...structuredClone(wave.parts[0].methodTestPlan.testPathGroups[0]), groupId: 'group-1-b', ordinal: 2
+  });
+  wave.parts[0].methodTestPlan.testMethodPlans.push({
+    testMethodPlanId: 'plan-1-b', methodId: METHOD_ID, ordinal: 2, pathGroupIds: ['group-1-b'], status: 'COMPLETE'
+  });
+  const code = testCodeWithMethods('TaskServiceTmp1Part1Test', ['broken', 'remainsActive']);
+  const part = { ...succeeded(wave.parts[0], code), candidate: { ...candidate(wave.parts[0], code), ordinaryTestMethodCount: 2 } };
+  const completion = { parts: [part], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  let seed;
+  let repairs = 0;
+  const h = await harness(t, {
+    wave, taskOverrides: { repairAttemptLimit: 6 },
+    async runWave({ onProgress }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, part, 'part_succeeded'));
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    },
+    getMethodRepairContext() { throw new Error('fallback context'); },
+    async mavenExecute(input, { callIndex, workspaceRoot }) {
+      if (callIndex === 1) return failedExecution('broken');
+      if (callIndex === 2) {
+        const failed = failedExecution('broken', 'broken() timed out after 120 seconds');
+        failed.testReport.failureDetails[0].type = 'java.util.concurrent.TimeoutException';
+        failed.mavenExecutions.at(-1).surefireReports = [{ fileName: 'TEST-demo.TaskServiceTmp1Test.xml',
+          content: '<testsuite name="demo.TaskServiceTmp1Test" tests="1" errors="1" failures="0" skipped="0">'
+            + '<testcase classname="demo.TaskServiceTmp1Test" name="broken" time="120">'
+            + '<error type="java.util.concurrent.TimeoutException" message="broken() timed out after 120 seconds"/></testcase></testsuite>' }];
+        return failed;
+      }
+      assert.equal(input.scope, 'pruned_method_candidate');
+      const effective = await readFile(join(workspaceRoot, 'module/src/test/java/demo/TaskServiceTmp1Test.java'), 'utf8');
+      assert.doesNotMatch(effective, /void broken/);
+      return passedExecution(1, 'pruned_method_candidate');
+    },
+    agentOverrides: {
+      async recoverMethodGenerationStream(request) {
+        seed = request.candidate;
+        return { kind: 'candidate_ready', sessionId: '88888888-8888-4888-8888-888888888888', eventSequence: 1, candidate: seed };
+      },
+      async resumeMethodGenerationStream(_sessionId, request) {
+        if (request.execution.status === 'passed') throw new Error('pruned source must not keep the old method identities');
+        if (++repairs > 1) throw new Error('timeout must be deleted before another model request');
+        return { kind: 'candidate_ready', sessionId: '88888888-8888-4888-8888-888888888888', eventSequence: 2,
+          candidate: { ...seed, candidateVersion: 2, repairAttempt: 1 } };
+      }
+    }
+  });
+  const outcome = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal);
+  assert.equal(repairs, 1);
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 1);
+  assert.deepEqual(outcome.bundle.passedTestMethods, ['remainsActive']);
+});
+
+test('deleting the only timed-out test quarantines an empty candidate and skips its scenario', async (t) => {
+  const wave = workWave(1);
+  const part = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test'));
+  const completion = { parts: [part], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  const h = await harness(t, {
+    wave,
+    async runWave({ onProgress }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, part, 'part_succeeded'));
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    },
+    async mavenExecute(_input, { callIndex }) {
+      if (callIndex > 1) return compilableEmptyExecution();
+      const failed = failedExecution('generated', 'generated() timed out after 120 seconds');
+      failed.testReport.failureDetails[0].type = 'java.util.concurrent.TimeoutException';
+      failed.mavenExecutions.at(-1).surefireReports = [{ fileName: 'TEST-demo.TaskServiceTmp1Test.xml',
+        content: '<testsuite name="demo.TaskServiceTmp1Test" tests="1" errors="1" failures="0" skipped="0">'
+          + '<testcase classname="demo.TaskServiceTmp1Test" name="generated" time="120">'
+          + '<error type="java.util.concurrent.TimeoutException" message="generated() timed out after 120 seconds"/></testcase></testsuite>' }];
+      return failed;
+    },
+    agentOverrides: { async recoverMethodGenerationStream() { throw new Error('empty timeout candidate needs no model repair'); } }
+  });
+  const outcome = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal);
+  assert.equal(h.savedCandidates.at(-1).status, 'QUARANTINED');
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 0);
+  assert.deepEqual(outcome.completedScenarioIds, []);
+  assert.deepEqual(outcome.skippedScenarioIds, ['scenario-1']);
+  assert.equal(outcome.bundle, undefined);
+  const finalCode = await readFile(h.savedCandidates.at(-1).managedFile.path, 'utf8');
+  assert.doesNotMatch(finalCode, /void generated/);
+  const evidenceRoot = join(h.task.workspaceRoot, '.ai-unit-test/method-wave-failures');
+  const records = (await readdir(evidenceRoot, { recursive: true })).filter(name => name.endsWith('.removed-tests.json'));
+  assert.equal(records.length, 1);
+  const record = JSON.parse(await readFile(join(evidenceRoot, records[0]), 'utf8'));
+  assert.match(record.removedMethods[0].code, /void generated/);
 });
 
 test('finite Wave repair exhaustion enters deterministic stable repair without another model call', async (t) => {
@@ -5682,6 +6082,20 @@ test('finite Wave repair exhaustion enters deterministic stable repair without a
     async mavenExecute(input, { callIndex, workspaceRoot }) {
       if (callIndex <= 2) return failedExecution('broken');
       assert.equal(input.scope, 'pruned_method_candidate');
+      const auditRoot = join(workspaceRoot, '.ai-unit-test/method-wave-failures');
+      const auditFiles = (await readdir(auditRoot, { recursive: true }).catch(error => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+      })).filter(name => name.endsWith('.stable-repair.json'));
+      assert.equal(auditFiles.length, 1, 'the pre-prune source and fresh Maven failure must already be durable');
+      const audit = JSON.parse(await readFile(join(auditRoot, auditFiles[0]), 'utf8'));
+      assert.equal(audit.taskId, TASK_ID);
+      assert.equal(audit.fileSha256, sha256(audit.sourceCode));
+      assert.match(audit.sourceCode, /^\s*@Test void broken/m);
+      assert.equal(audit.execution.testReport.failureDetails[0].testName, 'broken');
+      assert.equal(audit.execution.mavenExecutions[1].surefireReports[0].content, '<testsuite />');
+      assert.equal(audit.iteration, 1);
+      assert.match(audit.newMemberIds[0], /^test:broken:/);
       const code = await readFile(join(
         workspaceRoot,
         'module',
@@ -5741,7 +6155,8 @@ test('finite Wave repair exhaustion enters deterministic stable repair without a
   assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
 });
 
-test('invalid repair output after Agent retries falls back to deterministic stable repair', async (t) => {
+for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE']) {
+test(`${outputErrorCode} exhausts the configured repair budget before stable repair`, async (t) => {
   const wave = workWave(1);
   wave.parts[0].methodTestPlan.minimumTestCount = 2;
   wave.parts[0].methodTestPlan.testPathGroups.push({
@@ -5822,7 +6237,7 @@ test('invalid repair output after Agent retries falls back to deterministic stab
       async resumeMethodGenerationStream() {
         repairResumeCount += 1;
         throw new MethodGenerationRequestError(
-          'GENERATED_TEST_INVALID',
+          outputErrorCode,
           '单方法生成失败：模型输出包含 import 白名单外的类型。'
         );
       }
@@ -5837,12 +6252,250 @@ test('invalid repair output after Agent retries falls back to deterministic stab
     new AbortController().signal
   );
 
-  assert.equal(repairResumeCount, 1);
+  assert.equal(repairResumeCount, 5);
   assert.equal(h.mavenInputs.length, 2);
   assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
-  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 1);
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 5);
   assert.equal(h.savedCandidates.at(-1).stableRepair.phase, 'PASSED');
   assert.equal(h.savedCandidates.at(-1).stableRepair.iteration, 1);
   assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
+});
+}
+
+for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE']) {
+test(`${outputErrorCode} rebuilds a failed repair session with the remaining budget and accepted candidate`, async (t) => {
+  const wave = workWave(1);
+  const partResult = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test'));
+  const completion = { parts: [partResult], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  const seeds = [];
+  let resumes = 0;
+  const h = await harness(t, {
+    wave,
+    taskOverrides: { repairAttemptLimit: 6 },
+    async runWave({ onProgress }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, partResult, 'part_succeeded'));
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    },
+    getMethodRepairContext() { throw new Error('fallback context'); },
+    async mavenExecute(_input, { callIndex }) {
+      return callIndex === 1 ? failedExecution('generated') : passedExecution();
+    },
+    agentOverrides: {
+      async recoverMethodGenerationStream(request) {
+        seeds.push(structuredClone(request.candidate));
+        return { kind: 'candidate_ready', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 1, candidate: request.candidate };
+      },
+      async resumeMethodGenerationStream(_sessionId, request) {
+        if (request.execution.status === 'passed') return {
+          kind: 'completed', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 3,
+          completion: { methodId: METHOD_ID, batchId: WAVE_ID, stopReason: 'verified', bestCandidateId: seeds.at(-1).candidateId,
+            aggregateUsage: null, modelCallCount: 1, usageReportedCallCount: 0 }
+        };
+        resumes += 1;
+        if (resumes === 1) throw new MethodGenerationRequestError(outputErrorCode, 'rejected repair output');
+        const seed = seeds.at(-1);
+        assert.equal(request.repairAttempt, 1, 'failed attempt must be consumed when reseeding');
+        return { kind: 'candidate_ready', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 2,
+          candidate: { ...seed, candidateVersion: seed.candidateVersion + 1, repairAttempt: seed.repairAttempt + 1 } };
+      }
+    }
+  });
+  const outcome = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal);
+  assert.equal(resumes, 2);
+  assert.equal(seeds.length, 2);
+  assert.equal(seeds[1].testCode, seeds[0].testCode);
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 2);
+  assert.equal(h.savedCandidates.at(-1).stableRepair.phase, 'NOT_STARTED');
+  assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
+});
+}
+
+for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE']) {
+test(`${outputErrorCode} after rejecting a changed test identity consumes one repair and continues the Wave`, async (t) => {
+  const wave = workWave(1);
+  const partResult = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test'));
+  const completion = { parts: [partResult], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  const seeds = [];
+  let resumes = 0;
+  const h = await harness(t, {
+    wave,
+    taskOverrides: { repairAttemptLimit: 6 },
+    async runWave({ onProgress }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, partResult, 'part_succeeded'));
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    },
+    getMethodRepairContext() { throw new Error('fallback context'); },
+    async mavenExecute(_input, { callIndex }) {
+      return callIndex === 1 ? failedExecution('generated') : passedExecution();
+    },
+    agentOverrides: {
+      async recoverMethodGenerationStream(request) {
+        seeds.push(structuredClone(request.candidate));
+        return { kind: 'candidate_ready', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 1, candidate: request.candidate };
+      },
+      async resumeMethodGenerationStream(_sessionId, request) {
+        if (request.execution.status === 'passed') return {
+          kind: 'completed', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 3,
+          completion: { methodId: METHOD_ID, batchId: WAVE_ID, stopReason: 'verified', bestCandidateId: seeds.at(-1).candidateId,
+            aggregateUsage: null, modelCallCount: 1, usageReportedCallCount: 0 }
+        };
+        resumes += 1;
+        const seed = seeds.at(-1);
+        if (resumes === 2) {
+          assert.equal(request.feedbackKind, 'candidate_rejected');
+          throw new MethodGenerationRequestError(outputErrorCode, 'rejected repair output');
+        }
+        const code = resumes === 1 ? seed.testCode.replace('void generated()', 'void renamed()') : seed.testCode;
+        return { kind: 'candidate_ready', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 2,
+          candidate: { ...seed, candidateVersion: seed.candidateVersion + 1, repairAttempt: seed.repairAttempt + 1,
+            testCode: code, generatedCodeSha256: sha256(code) } };
+      }
+    }
+  });
+  const outcome = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal);
+  assert.equal(resumes, 3);
+  assert.equal(seeds.length, 2);
+  assert.equal(seeds[1].repairAttempt, 2);
+  assert.equal(seeds[1].testCode, seeds[0].testCode);
+  assert.equal(h.mavenInputs.length, 2);
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 3);
+  assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
+});
+}
+
+test('a candidate-local BLOCKED Wave uses remaining repairs instead of repeating stable repair', async (t) => {
+  const wave = workWave(1);
+  const seeds = [];
+  const h = await harness(t, {
+    wave,
+    taskOverrides: { repairAttemptLimit: 6 },
+    async runWave() { throw new Error('BLOCKED candidate must not regenerate Parts'); },
+    getMethodRepairContext() { throw new Error('fallback context'); },
+    async mavenExecute(_input, { callIndex, workspaceRoot }) {
+      if (callIndex > 1) return passedExecution();
+      const file = join(workspaceRoot, 'module/src/test/java/demo/TaskServiceTmp1Test.java');
+      return { status: 'compile_failed', mavenExecutions: [{ scope: 'method_candidate', phase: 'test_compile',
+        command: 'mvn test-compile', exitCode: 1, stdout: '', stderr: `[ERROR] ${file}:[3,1] cannot find symbol`, surefireReports: [] }] };
+    },
+    agentOverrides: {
+      async recoverMethodGenerationStream(request) {
+        seeds.push(structuredClone(request.candidate));
+        return { kind: 'candidate_ready', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 1, candidate: request.candidate };
+      },
+      async resumeMethodGenerationStream(_sessionId, request) {
+        if (request.execution.status === 'passed') return {
+          kind: 'completed', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 3,
+          completion: { methodId: METHOD_ID, batchId: WAVE_ID, stopReason: 'verified', bestCandidateId: seeds.at(-1).candidateId,
+            aggregateUsage: null, modelCallCount: 1, usageReportedCallCount: 0 }
+        };
+        const seed = seeds.at(-1);
+        return { kind: 'candidate_ready', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 2,
+          candidate: { ...seed, candidateVersion: seed.candidateVersion + 1, repairAttempt: seed.repairAttempt + 1 } };
+      }
+    }
+  });
+  const candidateId = '77777777-7777-4777-8777-777777777777';
+  const filePath = join(h.workspaceRoot, 'module/src/test/java/demo/TaskServiceTmp1Test.java');
+  const code = testCode('TaskServiceTmp1Test');
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, code, 'utf8');
+  h.candidateStates.set(candidateId, { candidateId, methodId: METHOD_ID, waveId: WAVE_ID, status: 'BLOCKED',
+    llmRepairAttemptsUsed: 1, repairAttemptLimit: 6, unlimitedRepair: false, lastMavenBatchId: null,
+    stableRepair: { phase: 'BLOCKED', iteration: 2, annotatedMemberIds: [] },
+    managedFile: { path: filePath, sha256: sha256(code), location: 'PROJECT' }, moveTransaction: null });
+  const active = activeWaveCheckpoint(wave);
+  Object.assign(active.parts[0], { status: 'SUCCEEDED', candidateId: '88888888-8888-4888-8888-888888888888',
+    isolatedFilePath: join(h.workspaceRoot, '.ai-unit-test/part.java'), fileSha256: 'f'.repeat(64) });
+  const outcome = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    active, new AbortController().signal);
+  assert.equal(seeds.length, 1);
+  assert.equal(seeds[0].repairAttempt, 1);
+  assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 2);
+  assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
+});
+
+test('an exhausted local Wave is preserved outside Maven and subsequent Waves continue', async (t) => {
+  const wave = workWave(1);
+  const partResult = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test'));
+  const completion = { parts: [partResult], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  let generationCalls = 0;
+  let acceptedWrittenCode;
+  let currentWave = wave;
+  const h = await harness(t, {
+    wave, taskOverrides: { repairAttemptLimit: 0 },
+    async runWave({ request, onProgress }) {
+      generationCalls += 1;
+      const result = generationCalls === 1 ? partResult : {
+        ...partResult, candidate: { ...partResult.candidate, batchIndex: request.waveIndex,
+          outputTestClassName: `TaskServiceTmp${request.waveIndex}Part1Test`,
+          testCode: testCode(`TaskServiceTmp${request.waveIndex}Part1Test`),
+          generatedCodeSha256: sha256(testCode(`TaskServiceTmp${request.waveIndex}Part1Test`)) }
+      };
+      const done = { ...completion, parts: [result] };
+      await onProgress({ ...waveEvent(1, currentWave, 'wave_started'), waveIndex: request.waveIndex });
+      await onProgress({ ...terminalEvent(2, currentWave, result, 'part_succeeded'), waveIndex: request.waveIndex });
+      await onProgress({ ...waveEvent(3, currentWave, 'wave_completed', { completion: done }), waveIndex: request.waveIndex });
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion: done };
+    },
+    async mavenExecute(input, { callIndex, workspaceRoot }) {
+      if (callIndex > 1) {
+        await assert.rejects(access(join(workspaceRoot, 'module/src/test/java/demo/TaskServiceTmp1Test.java')));
+        return passedExecution();
+      }
+      const file = join(workspaceRoot, 'module/src/test/java/demo/TaskServiceTmp1Test.java');
+      acceptedWrittenCode = await readFile(file, 'utf8');
+      return { status: 'compile_failed', mavenExecutions: [{ scope: 'method_candidate', phase: 'test_compile',
+        command: 'mvn test-compile', exitCode: 1, stdout: '', stderr: `[ERROR] ${file}:[3,1] invalid declaration`, surefireReports: [] }] };
+    },
+    agentOverrides: {
+      async recoverMethodGenerationStream(request) {
+        return { kind: 'candidate_ready', sessionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', eventSequence: 1, candidate: request.candidate };
+      }
+    }
+  });
+  const outcome = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal);
+  assert.deepEqual(outcome.completedScenarioIds, []);
+  assert.deepEqual(outcome.skippedScenarioIds, ['scenario-1']);
+  assert.deepEqual(outcome.candidateIds, []);
+  assert.equal(outcome.bundle, undefined);
+  const quarantined = h.savedCandidates.at(-1);
+  assert.equal(quarantined.status, 'QUARANTINED');
+  assert.equal(quarantined.managedFile.location, 'ISOLATED');
+  assert.equal(await readFile(quarantined.managedFile.path, 'utf8'), acceptedWrittenCode);
+  const failure = JSON.parse(await readFile(`${quarantined.managedFile.path}.failure.json`, 'utf8'));
+  assert.equal(failure.candidateId, quarantined.candidateId);
+  assert.equal(failure.execution.status, 'compile_failed');
+  assert.equal(failure.llmRepairAttemptsUsed, 0);
+
+  // Crash after quarantine but before committing the Wave: recovery must not
+  // put the failed source back in Maven or retry the exhausted model session.
+  const calls = h.mavenInputs.length;
+  const recovered = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    h.savedWaves.at(-1), new AbortController().signal);
+  assert.deepEqual(recovered, outcome);
+  assert.equal(h.mavenInputs.length, calls);
+  assert.equal(generationCalls, 1);
+
+  // A different Wave remains executable after the failed one.
+  const nextWave = { ...wave, waveBatchId: 'e'.repeat(64) };
+  currentWave = nextWave;
+  const next = await h.service.executeWave(h.task, nextWave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    { ...activeWaveCheckpoint(nextWave), waveIndex: 2 }, new AbortController().signal);
+  assert.deepEqual(next.completedScenarioIds, ['scenario-1']);
 });
 

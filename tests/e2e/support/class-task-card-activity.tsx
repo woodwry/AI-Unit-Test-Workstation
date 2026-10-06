@@ -36,7 +36,8 @@ function ActivityFixture(): JSX.Element {
   Object.assign(window, {
     updateTaskCard: (patch: Partial<ClassTaskSnapshot>) => setTask((current) => ({ ...current, ...patch }))
   });
-  return <ClassTaskCard task={task} attentionAcknowledged={false} commandBusy={false} onIntent={() => {}} />;
+  return <ClassTaskCard task={task} attentionAcknowledged={false} commandBusy={false}
+    onIntent={(intent) => Object.assign(window, { lastTaskCardIntent: intent })} />;
 }
 
 createRoot(document.getElementById('root')!).render(<ActivityFixture />);

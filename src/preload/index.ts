@@ -20,6 +20,7 @@ import type {
   BuildSettingsPathKind,
   CheckClassTaskMethodsRequest,
   ClassTaskSnapshot,
+  ClassTaskMethodCatalogChangedEvent,
   GetClassTaskMethodsRequest,
   GetClassTaskResultRequest,
   ListClassTasksRequest,
@@ -116,6 +117,15 @@ const api: AppApi = {
     ipcRenderer.on(CLASS_TASK_CHANNELS.snapshotChanged, listener);
     return () => {
       ipcRenderer.removeListener(CLASS_TASK_CHANNELS.snapshotChanged, listener);
+    };
+  },
+  onClassTaskMethodCatalogChanged: (callback: (event: ClassTaskMethodCatalogChangedEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, changed: ClassTaskMethodCatalogChangedEvent): void => {
+      callback(changed);
+    };
+    ipcRenderer.on(CLASS_TASK_CHANNELS.methodCatalogChanged, listener);
+    return () => {
+      ipcRenderer.removeListener(CLASS_TASK_CHANNELS.methodCatalogChanged, listener);
     };
   },
   getRagKnowledgeMethodSource: (request: RagKnowledgeMethodRequest) =>

@@ -218,14 +218,14 @@ export function validateClassMethodCatalog(value: unknown): ClassMethodCatalog {
 }
 
 export function validateClassTaskSnapshot(value: unknown): ClassTaskSnapshot {
-  const record = requireExactRecord(value, [
+  const record = requireRecordWithOptionalFields(value, [
     'id', 'workspaceRoot', 'sourceFilePath', 'qualifiedClassName', 'moduleKey', 'moduleDisplayPath',
     'state', 'preloadState', 'ragEnabled', 'repairAttemptLimit', 'unlimitedRepair', 'selectionMode',
     'selectedMethodIds', 'methodOrder', 'coveredMethodIds', 'currentMethodIndex',
     'currentAtomicStep', 'activeGenerationBatch', 'tokenUsage', 'modelCallCount',
     'usageReportedCallCount', 'generatedArtifacts', 'coverageBaseline', 'coverageCurrent', 'coverageContributions',
     'completionAttentionPending', 'startedAt', 'pausedAt', 'finishedAt', 'lastError', 'updatedAt'
-  ]);
+  ], ['executionMode']);
   const workspaceRoot = requireBoundedPath(record.workspaceRoot, 'workspaceRoot');
   const selectedMethodIds = requireIdentifierArray(record.selectedMethodIds, 'selectedMethodIds');
   const methodOrder = requireIdentifierArray(record.methodOrder, 'methodOrder');
@@ -281,6 +281,9 @@ export function validateClassTaskSnapshot(value: unknown): ClassTaskSnapshot {
     state: requireEnum(record.state, CLASS_TASK_STATES, '任务状态'),
     preloadState: requireEnum(record.preloadState, MODULE_PRELOAD_STATES, 'preloadState'),
     ragEnabled: requireBoolean(record.ragEnabled, 'ragEnabled'),
+    ...(record.executionMode === undefined ? {} : {
+      executionMode: requireEnum(record.executionMode, ['LEGACY_WAVE','FULL_SOURCE'] as const, 'executionMode')
+    }),
     ...repairConfiguration,
     selectionMode: requireEnum(record.selectionMode, METHOD_SELECTION_MODES, 'selectionMode'),
     selectedMethodIds,
@@ -399,8 +402,8 @@ export function validateClassTaskResultSnapshot(value: unknown): ClassTaskResult
           )
         }),
     ...tokenAccounting,
-    coverageBaseline: validateExactCoverageCounts(record.coverageBaseline),
-    coverageCurrent: validateExactCoverageCounts(record.coverageCurrent),
+    coverageBaseline: record.coverageBaseline === null ? null : validateExactCoverageCounts(record.coverageBaseline),
+    coverageCurrent: record.coverageCurrent === null ? null : validateExactCoverageCounts(record.coverageCurrent),
     coverageContributions,
     canAccept: requireBoolean(record.canAccept, 'canAccept'),
     canRevoke: requireBoolean(record.canRevoke, 'canRevoke')
@@ -494,9 +497,17 @@ function validateGeneratedArtifact(value: unknown, workspaceRoot?: string): Gene
 }
 
 function validateGeneratedSourceMethodResult(value: unknown): GeneratedSourceMethodResult {
-  const record = requireExactRecord(value, [
+  const record = requireRecordWithOptionalFields(value, [
     'methodId', 'methodName', 'displaySignature', 'jacocoOrder', 'ordinaryTestMethodCount'
-  ]);
+  ], ['waveIndex', 'sourceBatchIds', 'fullSource']);
+  if ((record.waveIndex === undefined) !== (record.sourceBatchIds === undefined)) {
+    throw new Error('method result Wave identity is incomplete');
+  }
+  const sourceBatchIds = record.sourceBatchIds === undefined
+    ? undefined : requireIdentifierArray(record.sourceBatchIds, 'method result sourceBatchIds');
+  if (sourceBatchIds?.length === 0) throw new Error('method result Wave has no verified source candidate');
+  const fullSource = record.fullSource === undefined ? undefined : requireExactRecord(record.fullSource, ['factsId','candidateId']);
+  if (fullSource && sourceBatchIds) throw new Error('完整源码来源不能带 Wave 身份');
   return {
     methodId: requireText(record.methodId, 'method result methodId', MAX_ID_LENGTH),
     methodName: requireText(record.methodName, 'method result methodName', MAX_NAME_LENGTH),
@@ -507,21 +518,31 @@ function validateGeneratedSourceMethodResult(value: unknown): GeneratedSourceMet
       'method result ordinaryTestMethodCount',
       0,
       MAX_LIST_ENTRIES
-    )
+    ),
+    ...(sourceBatchIds === undefined ? {} : {
+      waveIndex: requireInteger(record.waveIndex, 'method result waveIndex', 1),
+      sourceBatchIds
+    }),
+    ...(fullSource ? { fullSource: {
+      factsId: requireText(fullSource.factsId, 'factsId', 64), candidateId: requireUuid(fullSource.candidateId, 'candidateId')
+    } } : {})
   };
 }
 
 function validateClassTaskResultMethod(value: unknown): ClassTaskResultMethod {
-  const record = requireExactRecord(value, [
+  const record = requireRecordWithOptionalFields(value, [
     'methodId', 'methodName', 'displaySignature', 'jacocoOrder', 'ordinaryTestMethodCount',
     'artifactId', 'filePath', 'testClassName'
-  ]);
+  ], ['waveIndex', 'sourceBatchIds', 'fullSource']);
   const method = validateGeneratedSourceMethodResult({
     methodId: record.methodId,
     methodName: record.methodName,
     displaySignature: record.displaySignature,
     jacocoOrder: record.jacocoOrder,
-    ordinaryTestMethodCount: record.ordinaryTestMethodCount
+    ordinaryTestMethodCount: record.ordinaryTestMethodCount,
+    ...(record.waveIndex === undefined ? {} : { waveIndex: record.waveIndex }),
+    ...(record.sourceBatchIds === undefined ? {} : { sourceBatchIds: record.sourceBatchIds })
+    ,...(record.fullSource === undefined ? {} : { fullSource: record.fullSource })
   });
   return {
     ...method,
@@ -740,12 +761,13 @@ function validateRepairConfiguration(
 
 function requireIsoTimestamp(value: unknown, label: string): string {
   if (
-    typeof value !== 'string' || value.length > 64 || Number.isNaN(Date.parse(value)) ||
-    new Date(value).toISOString() !== value
+    typeof value !== 'string' || value.length > 64 ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value) ||
+    Number.isNaN(Date.parse(value))
   ) {
     throw new Error(`${label} 无效`);
   }
-  return value;
+  return new Date(value).toISOString();
 }
 
 function requireNullableTimestamp(value: unknown, label: string): string | null {

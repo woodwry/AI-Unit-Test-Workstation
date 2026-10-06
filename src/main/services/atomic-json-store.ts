@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export class AtomicJsonStoreCorruptError extends Error {
   readonly storagePath: string;
@@ -14,24 +15,31 @@ export class AtomicJsonStoreCorruptError extends Error {
 
 type StoreUpdater<T> = (value: T) => T | void | Promise<T | void>;
 type ReadFileFunction = (path: string, encoding: 'utf8') => Promise<string>;
+type RenameFunction = (source: string, destination: string) => Promise<void>;
+
+const TRANSIENT_RENAME_ERROR_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
+const ATOMIC_RENAME_RETRY_DELAYS_MS = [50, 100, 200, 400, 800, 1600];
 
 export class AtomicJsonStore<T> {
   private readonly storagePath: string;
   private readonly validate: (value: unknown) => T;
   private readonly emptyFactory: () => T;
   private readonly readFile: ReadFileFunction;
+  private readonly renameFile: RenameFunction;
   private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(
     storagePath: string,
     validate: (value: unknown) => T,
     emptyFactory: () => T,
-    readFile: ReadFileFunction = fs.readFile
+    readFile: ReadFileFunction = fs.readFile,
+    renameFile: RenameFunction = fs.rename
   ) {
     this.storagePath = storagePath;
     this.validate = validate;
     this.emptyFactory = emptyFactory;
     this.readFile = readFile;
+    this.renameFile = renameFile;
   }
 
   async read(): Promise<T> {
@@ -102,11 +110,11 @@ export class AtomicJsonStore<T> {
         backupTemp = join(directory, `${basename(this.storagePath)}.bak.${randomUUID()}.tmp`);
         const backup = `${JSON.stringify(existing.value, null, 2)}\n`;
         await writeSyncedFile(backupTemp, backup);
-        await fs.rename(backupTemp, `${this.storagePath}.bak`);
+        await this.renameWithTransientRetry(backupTemp, `${this.storagePath}.bak`);
         backupTemp = undefined;
       }
 
-      await fs.rename(mainTemp, this.storagePath);
+      await this.renameWithTransientRetry(mainTemp, this.storagePath);
     } finally {
       await Promise.all([
         fs.rm(mainTemp, { force: true }),
@@ -138,6 +146,21 @@ export class AtomicJsonStore<T> {
     this.operationQueue = pending.catch(() => undefined);
     return pending;
   }
+
+  private async renameWithTransientRetry(source: string, destination: string): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.renameFile(source, destination);
+        return;
+      } catch (error) {
+        const retryDelay = ATOMIC_RENAME_RETRY_DELAYS_MS[attempt];
+        if (retryDelay === undefined || !isTransientRenameError(error)) {
+          throw error;
+        }
+        await delay(retryDelay);
+      }
+    }
+  }
 }
 
 type ReadResult<T> =
@@ -158,4 +181,13 @@ async function writeSyncedFile(path: string, contents: string): Promise<void> {
 
 function isMissingPathError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error && error.code === 'ENOENT';
+}
+
+function isTransientRenameError(error: unknown): error is NodeJS.ErrnoException {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    typeof error.code === 'string' &&
+    TRANSIENT_RENAME_ERROR_CODES.has(error.code)
+  );
 }

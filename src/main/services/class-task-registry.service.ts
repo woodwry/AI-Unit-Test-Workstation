@@ -342,6 +342,10 @@ export function applyMethodSelection(
     || task.repairAttemptLimit !== repairAttemptLimit
     || task.unlimitedRepair !== unlimitedRepair;
 
+  if (executionConfigurationChanged && task.generatedArtifacts.some((artifact) => !artifact.accepted)) {
+    throw new Error('请先接受或撤回本次生成结果，再保存配置。');
+  }
+
   return {
     ...task,
     ...(executionConfigurationChanged

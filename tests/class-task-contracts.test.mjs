@@ -32,7 +32,8 @@ test('class task contracts expose the frozen v2 state vocabularies', () => {
     'PRUNE_FAILED_TESTS',
     'MERGE_METHOD_BATCHES',
     'PACK_FORMAL_FILE',
-    'JACOCO_REFRESH'
+    'JACOCO_REFRESH',
+    'WAITING_FOR_MODULE'
   ]);
 });
 
@@ -56,7 +57,8 @@ test('class task contract maps every named wrapper to its one fixed channel', ()
     revoke: 'class-task:revoke',
     retryModulePreload: 'module-preload:retry',
     stopModulePreload: 'module-preload:stop',
-    snapshotChanged: 'class-task:snapshot-changed'
+    snapshotChanged: 'class-task:snapshot-changed',
+    methodCatalogChanged: 'class-task:methods:changed'
   });
 });
 
@@ -89,6 +91,9 @@ test('class task preload exposes only named fixed-channel wrappers and listener 
     ));
   }
   assert.match(preload, /\bonClassTaskSnapshotChanged\b/);
+  assert.match(preload, /\bonClassTaskMethodCatalogChanged\b/);
+  assert.match(preload, /ipcRenderer\.on\(CLASS_TASK_CHANNELS\.methodCatalogChanged,\s*listener\)/);
+  assert.match(preload, /ipcRenderer\.removeListener\(CLASS_TASK_CHANNELS\.methodCatalogChanged,\s*listener\)/);
   assert.match(preload, /\bgetPathForFile\b/);
   assert.match(preload, /webUtils\.getPathForFile\(file\)/);
   assert.match(preload, /ipcRenderer\.on\(CLASS_TASK_CHANNELS\.snapshotChanged,\s*listener\)/);

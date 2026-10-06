@@ -358,7 +358,7 @@ export function MethodConfigurationTab({
           <div className="class-task-rag-control">
             <label
               className={`class-task-rag-option${ragUnconfigured ? ' unconfigured' : ''}`}
-              title="基于RAG提升单元测试质量"
+              title="按未覆盖场景分批生成，并使用知识库辅助修复；不勾选时将全部所选方法一次生成"
             >
               <input
                 type="checkbox"
@@ -386,7 +386,7 @@ export function MethodConfigurationTab({
               <span aria-hidden="true" className="class-task-rag-checkmark">
                 <Check size={10} strokeWidth={2.4} />
               </span>
-              <strong>RAG</strong>
+              <strong>深度覆盖</strong>
             </label>
           </div>
 

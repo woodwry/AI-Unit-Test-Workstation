@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { fullSourceFacts } from './fixtures/full-source.mjs';
 
 import {
   ClassTaskRuntimeService,
@@ -27,6 +29,7 @@ import { ClassTaskApplicationInterruptedError } from '../src/main/services/class
 import { ClassTaskFileTransactionService } from '../src/main/services/class-task-file-transaction.service.ts';
 import { MethodWavePartStoreService } from '../src/main/services/method-wave-part-store.service.ts';
 import { TestWriterService } from '../src/main/services/test-writer.service.ts';
+import { ShellService, CommandCancelledError } from '../src/main/services/shell.service.ts';
 
 const WORKSPACE = 'D:\\workspace';
 const TASK_ID = '11111111-1111-4111-8111-111111111111';
@@ -389,6 +392,69 @@ test('startup isolates a Wave move hash conflict without deleting files or block
   assert.equal(sibling?.state, 'READY');
   assert.equal(await readFile(sourcePath, 'utf8'), expectedCode);
   assert.equal(await readFile(targetPath, 'utf8'), conflictingCode);
+});
+
+test('startup reclaims unreferenced isolated Wave candidates and preserves recovery files', async (t) => {
+  // Missing orphan collection leaves candidates discarded by catalog reconciliation
+  // on disk; deleting all scratch instead would destroy paused repair recovery.
+  const h = await productionWaveRuntimeHarness(t);
+  const candidateRoot = waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-candidates');
+  const orphanPath = join(candidateRoot, '77777777-7777-4777-8777-777777777777', 'TaskTmp3Test.java');
+  const protectedPaths = [
+    join(candidateRoot, 'notes', 'keep.txt'),
+    join(dirname(candidateRoot), 'another-task', '77777777-7777-4777-8777-777777777777', 'TaskTmp3Test.java'),
+    join(waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-parts'), 'part.java'),
+    h.formalFilePath
+  ];
+  const candidates = {};
+  for (const [index, status] of ['BLOCKED', 'MODEL_REPAIR', 'PASSED'].entries()) {
+    const digit = String(index + 4);
+    const candidateId = `${digit.repeat(8)}-${digit.repeat(4)}-4${digit.repeat(3)}-8${digit.repeat(3)}-${digit.repeat(12)}`;
+    // A recorded managed path can differ from the candidate's conventional directory.
+    const directoryId = index === 1 ? '88888888-8888-4888-8888-888888888888' : candidateId;
+    const filePath = join(candidateRoot, directoryId, `TaskTmp${index + 1}Test.java`);
+    const code = `package example; public class TaskTmp${index + 1}Test {}\n`;
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, code);
+    protectedPaths.push(filePath);
+    candidates[candidateId] = {
+      candidateId, methodId: h.methodId, waveId: 'c'.repeat(64), status,
+      llmRepairAttemptsUsed: 0, repairAttemptLimit: 5, unlimitedRepair: false,
+      lastMavenBatchId: null,
+      stableRepair: { phase: 'NOT_STARTED', iteration: 0, annotatedMemberIds: [] },
+      managedFile: { path: filePath, sha256: createHash('sha256').update(code).digest('hex'), location: 'ISOLATED' },
+      moveTransaction: null
+    };
+  }
+  for (const filePath of [orphanPath, ...protectedPaths.slice(0, 4)]) {
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, 'preserved content');
+  }
+  await writeFile(join(h.storageDirectory, 'class-task-checkpoints-v2.json'), JSON.stringify({
+    version: 5, tasks: { [TASK_ID]: storedTaskCheckpoint({ candidates }) }
+  }));
+
+  await h.runtime.startup();
+
+  await assert.rejects(access(orphanPath), (error) => error?.code === 'ENOENT');
+  for (const filePath of protectedPaths) await access(filePath);
+});
+
+test('starting the next Wave reclaims isolated candidates dropped after startup', async (t) => {
+  const h = await productionWaveRuntimeHarness(t);
+  await h.runtime.startup();
+  const orphanPath = join(
+    waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-candidates'),
+    '77777777-7777-4777-8777-777777777777', 'TaskTmp6Test.java'
+  );
+  await mkdir(dirname(orphanPath), { recursive: true });
+  await writeFile(orphanPath, 'abandoned candidate');
+
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  await h.waveStarted.promise;
+  await assert.rejects(access(orphanPath), (error) => error?.code === 'ENOENT');
+  await h.runtime.beforeQuit();
+  assert.equal((await running).state, 'INTERRUPTED');
 });
 
 test('startup isolates an interrupted MAVEN_RUNNING Wave TMP before any class preload', async (t) => {
@@ -868,6 +934,24 @@ test('startup rechecks every persisted preload failure in the background', async
   assert.equal(events.some((entry) => entry.startsWith('run:')), false);
 });
 
+test('opening methods while a class is preloading does not start another preparation', async () => {
+  // Mutation caught: a renderer refresh during PRELOADING must not start prepare() again and
+  // turn the running preload into a PRELOAD_FAILED card.
+  const { runtime, coordinator, events, tasks } = harness([task()]);
+  await runtime.startup();
+  tasks.set(TASK_ID, task(TASK_ID, 'PRELOADING', { preloadState: 'RUNNING' }));
+  coordinator.peekPreparedMethodCatalog = () => null;
+  events.length = 0;
+
+  await assert.rejects(
+    runtime.getClassTaskMethods({ workspaceRoot: WORKSPACE, taskId: TASK_ID }),
+    /正在预加载/
+  );
+
+  assert.deepEqual(events, []);
+  assert.equal(tasks.get(TASK_ID).state, 'PRELOADING');
+  assert.equal(tasks.get(TASK_ID).preloadState, 'RUNNING');
+});
 test('opening methods rechecks a preload failure before reading its catalog', async () => {
   // Mutation caught: calling prepare() directly can return a catalog while leaving the card
   // in PRELOAD_FAILED with its stale Analyzer error.
@@ -1584,7 +1668,7 @@ test('remove is idempotent when a stale renderer repeats deletion for an absent 
   assert.deepEqual(await runtime.listClassTasks({ workspaceRoot: WORKSPACE }), []);
 });
 
-test('accept runs at a background boundary without changing an active task to paused', async () => {
+test('active generation exposes its files without allowing acceptance or revocation', async () => {
   const { runtime, coordinator, registry, events } = harness([
     task(TASK_ID, 'RUNNING', { generatedArtifacts: [generatedArtifact(false)] })
   ]);
@@ -1617,22 +1701,66 @@ test('accept runs at a background boundary without changing an active task to pa
     workspaceRoot: WORKSPACE,
     taskId: TASK_ID
   });
-  assert.equal(visibleResult.canAccept, true);
-  assert.equal(visibleResult.canRevoke, true);
-  const accepted = await runtime.acceptTaskResult({ workspaceRoot: WORKSPACE, taskId: TASK_ID });
+  assert.equal(visibleResult.canAccept, false);
+  assert.equal(visibleResult.canRevoke, false);
+  assert.deepEqual(visibleResult.artifacts, result.artifacts);
+  await assert.rejects(runtime.acceptTaskResult({ workspaceRoot: WORKSPACE, taskId: TASK_ID }));
 
-  assert.equal(accepted.state, 'RUNNING');
   assert.equal(registry.snapshot(TASK_ID).state, 'RUNNING');
-  assert.deepEqual(events, [
-    'result:' + TASK_ID,
-    'background-boundary:' + TASK_ID,
-    'accept:' + TASK_ID
-  ]);
+  assert.deepEqual(events, ['result:' + TASK_ID]);
   assert.equal(events.some((entry) => entry.startsWith('terminate:')), false);
   assert.equal(events.some((entry) => entry.startsWith('release-run:')), false);
 });
 
-test('revoke runs at a background boundary without changing an active task to paused', async () => {
+test('active generation rejects both decisions before queueing or touching result files', async () => {
+  for (const state of ['PRELOADING', 'RUNNING', 'PAUSE_REQUESTED', 'PAUSED', 'STOPPING']) {
+    for (const action of ['acceptTaskResult', 'revokeTaskResult']) {
+      const { runtime, registry, events } = harness([
+        task(TASK_ID, state, { generatedArtifacts: [generatedArtifact(false)] })
+      ]);
+      const before = registry.snapshot(TASK_ID);
+      await assert.rejects(runtime[action]({ workspaceRoot: WORKSPACE, taskId: TASK_ID }));
+      assert.deepEqual(registry.snapshot(TASK_ID), before);
+      assert.deepEqual(events, [], `${action} must not queue a background transaction during ${state}`);
+    }
+  }
+});
+
+test('a READY task with a recovered pending result cannot start another run', async () => {
+  const pending = task(TASK_ID, 'READY', {generatedArtifacts: [generatedArtifact(false)]});
+  const {runtime, events, registry} = harness([pending]);
+  await assert.rejects(runtime.runTask({workspaceRoot: WORKSPACE, taskId: TASK_ID}),
+    /请先接受或撤回本次生成结果/);
+  assert.equal(registry.snapshot(TASK_ID).state, 'READY');
+  assert.deepEqual(events.filter(event => /^(restart:|run:)/.test(event)), []);
+});
+
+test('result permissions follow the latest task state when generation restarts during the read', async () => {
+  const { runtime, coordinator, registry } = harness([task(TASK_ID, 'COMPLETED')]);
+  coordinator.getResult = async () => {
+    await registry.save({ ...registry.snapshot(TASK_ID), state: 'RUNNING' });
+    return { taskId: TASK_ID, state: 'COMPLETED', artifacts: [generatedArtifact(false)], canAccept: true, canRevoke: true };
+  };
+  const result = await runtime.getTaskResult({ workspaceRoot: WORKSPACE, taskId: TASK_ID });
+  assert.equal(result.state, 'RUNNING');
+  assert.equal(result.canAccept, false);
+  assert.equal(result.canRevoke, false);
+});
+
+test('stopped generation permits decisions without queueing background work', async () => {
+  for (const state of ['COMPLETED', 'TERMINATED', 'FAILED', 'INTERRUPTED']) {
+    for (const action of ['acceptTaskResult', 'revokeTaskResult']) {
+      const { runtime, registry, events } = harness([
+        task(TASK_ID, state, { generatedArtifacts: [generatedArtifact(false)] })
+      ]);
+      await runtime[action]({ workspaceRoot: WORKSPACE, taskId: TASK_ID });
+      assert.equal(registry.snapshot(TASK_ID).state, state);
+      assert.deepEqual(events, [`${action === 'acceptTaskResult' ? 'accept' : 'revoke'}:${TASK_ID}`]);
+    }
+  }
+});
+
+test('a running revoke request cannot change coverage or terminate generation', async () => {
   const { runtime, coordinator, registry, events } = harness([
     task(TASK_ID, 'RUNNING', { generatedArtifacts: [generatedArtifact(false)] })
   ]);
@@ -1663,15 +1791,11 @@ test('revoke runs at a background boundary without changing an active task to pa
     };
   };
 
-  const revoked = await runtime.revokeTaskResult({ workspaceRoot: WORKSPACE, taskId: TASK_ID });
+  await assert.rejects(runtime.revokeTaskResult({ workspaceRoot: WORKSPACE, taskId: TASK_ID }));
 
-  assert.equal(revoked.state, 'RUNNING');
   assert.equal(registry.snapshot(TASK_ID).state, 'RUNNING');
-  assert.deepEqual(revokeOptions, [{ preserveRun: true }]);
-  assert.deepEqual(events, [
-    'background-boundary:' + TASK_ID,
-    'revoke:' + TASK_ID
-  ]);
+  assert.deepEqual(revokeOptions, []);
+  assert.deepEqual(events, []);
   assert.equal(events.some((entry) => entry.startsWith('terminate:')), false);
   assert.equal(events.some((entry) => entry.startsWith('release-run:')), false);
 });
@@ -1690,7 +1814,7 @@ test('production composition restores empty state without starting backend, mode
     shellService: new Proxy({}, { get: (_target, key) => forbidden(`shell:${String(key)}`) }),
     mavenAnalysisContextService: { collect: forbidden('analysis-context') },
     testWriterService: {},
-    jacocoArtifactsService: {},
+    jacocoArtifactsService: { async readTaskResultCoverageRollback() { return null; }, async discardTaskResultCoverageRollback() {} },
     surefireReportService: {},
     buildSettingsService: { get: forbidden('build-settings') },
     modelInterfacesService: {
@@ -1856,7 +1980,9 @@ test('reopening an empty fully checkpointed paused task rebuilds its packer befo
         stderr: ''
       };
     },
-    runMavenModuleTestsWithJacoco: forbidden('module-tests'),
+    async runMavenModuleTestsWithJacoco() {
+      return successfulCommand('fake-mvn module-test', moduleRoot);
+    },
     runMavenDirectTestsWithJacoco: forbidden('direct-tests'),
     runMavenGeneratedTestCompile: forbidden('generated-compile'),
     runMavenGeneratedSurefireTest: forbidden('generated-test'),
@@ -2025,6 +2151,52 @@ test('production composition uses the Wave path and deletes its TMP only after f
   );
 });
 
+test('verified formal files publish the current method catalog before the task finishes in both modes', async (t) => {
+  for (const fullSource of [false, true]) {
+    const published = [];
+    let latestTask;
+    const h = await productionWaveRuntimeHarness(t, {
+      fullSource, markMethodCoveredAfterRefresh: !fullSource, trackCoverageFromMaven: !fullSource,
+      broadcast: snapshot => { latestTask = structuredClone(snapshot); },
+      onMethodCatalogChanged: event => published.push({ event, task: structuredClone(latestTask) })
+    });
+    await h.runtime.startup();
+    await h.runtime.getClassTaskMethods({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+    published.length = 0;
+    h.releaseWave.resolve();
+    h.releaseTmpDelete.resolve();
+    const completed = await h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+    assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+    const updates = published.filter(update => update.task.generatedArtifacts.length > 0);
+    assert.equal(updates.length, 1, 'Each verified formal file must publish its catalog, including zero coverage gain.');
+    const { event, task: snapshot } = updates[0];
+    assert.equal(snapshot.state, 'RUNNING');
+    assert.equal(event.workspaceRoot, h.workspaceRoot);
+    assert.equal(event.catalog.taskId, TASK_ID);
+    assert.equal(event.catalog.methods[0].coverageGap, fullSource);
+    assert.equal(event.catalog.methods[0].lineCovered, snapshot.coverageCurrent.lineCovered);
+    const live = await h.runtime.getClassTaskMethods({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+    assert.deepEqual(event.catalog, live);
+  }
+});
+
+test('a failed formal coverage refresh does not publish an old method catalog as a new result', async (t) => {
+  const published = [];
+  let latestTask;
+  const h = await productionWaveRuntimeHarness(t, {
+    fullSource: true, failCoverageRefreshAfterFormalOnce: true,
+    broadcast: snapshot => { latestTask = structuredClone(snapshot); },
+    onMethodCatalogChanged: event => published.push({ event, task: structuredClone(latestTask) })
+  });
+  await h.runtime.startup();
+  await h.runtime.getClassTaskMethods({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  published.length = 0;
+  h.releaseTmpDelete.resolve();
+  const failed = await h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(published.filter(update => update.task.generatedArtifacts.length > 0).length, 0);
+});
+
 test('a completed task fingerprints its generated formal test as a project file', async (t) => {
   const h = await productionWaveRuntimeHarness(t);
   await h.runtime.startup();
@@ -2050,6 +2222,131 @@ test('a completed task fingerprints its generated formal test as a project file'
     taskId: TASK_ID,
     fingerprint: baselineCatalog.fingerprint
   }).then((freshness) => freshness.current), false);
+});
+
+test('terminal tasks with accepted history and only commented pending tests can rerun', async () => {
+  for (const state of ['COMPLETED', 'TERMINATED']) {
+    const accepted = Array.from({ length: 40 }, (_, index) => ({
+      ...generatedArtifact(true), id: `accepted-${index}`
+    }));
+    const { runtime, events } = harness([task(TASK_ID, state, {
+      generatedArtifacts: [...accepted, {
+        ...generatedArtifact(false), ordinaryTestMethodCount: 0
+      }]
+    })]);
+    await runtime.runTask({ workspaceRoot: WORKSPACE, taskId: TASK_ID });
+    assert.deepEqual(
+      events.filter((entry) => /^(restart:|run:)/.test(entry)),
+      [`restart:${TASK_ID}`, `run:${TASK_ID}`]
+    );
+  }
+});
+
+test('a result without coverage remains visible and can be accepted or revoked', async (t) => {
+  for (const action of ['acceptTaskResult', 'revokeTaskResult']) {
+    const fixture = await completedResultFileFixture(t, 'TERMINATED', {
+      includeAcceptedArtifact: true, withoutCoverage: true, ordinaryTestMethodCount: 0
+    });
+    const request = { workspaceRoot: fixture.workspaceRoot, taskId: TASK_ID };
+    const result = await fixture.runtime.getTaskResult(request);
+    assert.equal(result?.artifacts.length, 2);
+    assert.equal(result?.canAccept, true);
+    assert.equal(result?.canRevoke, true);
+    assert.equal(result?.coverageBaseline, null);
+    assert.equal(result?.coverageCurrent, null);
+    const decided = await fixture.runtime[action](request);
+    assert.equal(decided.canAccept, false);
+    assert.equal(decided.canRevoke, false);
+    assert.equal(decided.coverageCurrent, null);
+    assert.equal(await readFile(fixture.acceptedTestFilePath, 'utf8'), fixture.acceptedTestFileContent);
+    assert.deepEqual(fixture.externalCalls, []);
+  }
+});
+
+test('restarting a terminal task preserves commented source and previously accepted files', async (t) => {
+  const fixture = await completedResultFileFixture(t, 'TERMINATED', {
+    includeAcceptedArtifact: true, withoutCoverage: true, ordinaryTestMethodCount: 0
+  });
+  await fixture.runtime.coordinator.restart(TASK_ID, undefined, { discardAcceptedArtifacts: true });
+  assert.equal(await readFile(fixture.testFilePath, 'utf8'), fixture.testFileContent);
+  assert.equal(await readFile(fixture.acceptedTestFilePath, 'utf8'), fixture.acceptedTestFileContent);
+  const [restarted] = await fixture.runtime.listClassTasks({ workspaceRoot: fixture.workspaceRoot });
+  assert.deepEqual(restarted.generatedArtifacts, []);
+  assert.deepEqual(fixture.externalCalls, []);
+});
+
+test('method preparation waits until a terminal restart has cleared the previous result', async (t) => {
+  const fixture = await completedResultFileFixture(t, 'TERMINATED', {
+    includeAcceptedArtifact: true, withoutCoverage: true, ordinaryTestMethodCount: 0
+  });
+  const coordinator = fixture.runtime.coordinator;
+  const restartBoundary = runtimeDeferred();
+  const releaseRestart = runtimeDeferred();
+  const checkpoints = coordinator.dependencies.checkpoints;
+  const prepareRun = checkpoints.prepareRun.bind(checkpoints);
+  checkpoints.prepareRun = async (...args) => {
+    restartBoundary.resolve();
+    await releaseRestart.promise;
+    return prepareRun(...args);
+  };
+  const observedArtifactCounts = [];
+  coordinator.dependencies.options.buildSettingsService.get = async () => {
+    observedArtifactCounts.push(coordinator.dependencies.registry.snapshot(TASK_ID).generatedArtifacts.length);
+    throw new Error('stop after observing preparation');
+  };
+  const restarting = coordinator.restart(TASK_ID, undefined, { discardAcceptedArtifacts: true });
+  await restartBoundary.promise;
+  const preparing = coordinator.prepare(TASK_ID).catch(() => undefined);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.deepEqual(observedArtifactCounts, [], 'preparation must not see the previous run during restart');
+  } finally {
+    releaseRestart.resolve();
+    await restarting;
+    await preparing;
+  }
+  assert.deepEqual(observedArtifactCounts, [0]);
+});
+
+test('reopening a task with pending formal artifacts refreshes coverage during preload', async (t) => {
+  // Mutation caught: preparing a reopened task with pending generated tests must not use
+  // the RUNNING-only atomic JaCoCo step while the card is still PRELOADING.
+  const h = await productionWaveRuntimeHarness(t);
+  await h.runtime.startup();
+
+  const running = h.runtime.runTask({
+    workspaceRoot: h.workspaceRoot,
+    taskId: TASK_ID
+  });
+  await h.waveStarted.promise;
+  h.releaseWave.resolve();
+  await h.tmpDeleteStarted.promise;
+  h.releaseTmpDelete.resolve();
+  const completed = await running;
+  assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+  assert.equal(completed.generatedArtifacts.length, 1);
+  assert.equal(completed.generatedArtifacts[0].accepted, false);
+  await h.runtime.beforeQuit();
+
+  const reopened = createProductionClassTaskRuntime(h.runtimeOptions);
+  t.after(async () => {
+    await reopened.beforeQuit();
+  });
+  await reopened.startup();
+
+  const methods = await reopened.getClassTaskMethods({
+    workspaceRoot: h.workspaceRoot,
+    taskId: TASK_ID,
+    forceReload: true
+  });
+  const snapshot = (await reopened.listClassTasks({ workspaceRoot: h.workspaceRoot }))
+    .find((candidate) => candidate.id === TASK_ID);
+
+  assert.equal(methods.taskId, TASK_ID);
+  assert.ok(snapshot);
+  assert.equal(snapshot.state, 'COMPLETED', snapshot.lastError?.message);
+  assert.equal(snapshot.currentAtomicStep, 'IDLE');
+  assert.equal(snapshot.lastError, null);
 });
 
 test('refreshing a completed pending result preserves its pre-generation baseline and delta', async (t) => {
@@ -2129,6 +2426,38 @@ test('long-running Wave generation keeps its Analyzer session alive', async (t) 
   assert.equal(ended.state, 'TERMINATED');
 });
 
+test('stalled Wave generation fails instead of staying RUNNING forever', async (t) => {
+  // Mutation caught: a Wave stream that records one successful Part and then never emits
+  // another event leaves the task stuck in MODEL_GENERATION until the user restarts it.
+  const h = await productionWaveRuntimeHarness(t, {
+    stallWaveAfterSucceededPart: true,
+    methodGenerationWaveProgressTimeoutMilliseconds: 25
+  });
+  await h.runtime.startup();
+
+  const running = h.runtime.runTask({
+    workspaceRoot: h.workspaceRoot,
+    taskId: TASK_ID
+  });
+  await h.waveStarted.promise;
+  h.releaseWave.resolve();
+  const outcome = await Promise.race([
+    running.then((snapshot) => ({ kind: 'settled', snapshot })),
+    new Promise((resolve) => setTimeout(() => resolve({ kind: 'timeout' }), 250))
+  ]);
+  if (outcome.kind === 'timeout') {
+    await h.runtime.terminateTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID })
+      .catch(() => undefined);
+    await running.catch(() => undefined);
+  }
+
+  assert.equal(outcome.kind, 'settled', 'stalled Wave generation should fail promptly');
+  assert.equal(outcome.snapshot.state, 'PAUSED');
+  assert.equal(outcome.snapshot.lastError?.code, 'MODEL_WAVE_IDLE_TIMEOUT');
+  assert.match(outcome.snapshot.lastError?.message ?? '', /模型生成长时间没有返回进度/);
+  assert.equal(h.waveStreamCalls.length, 1);
+});
+
 test('a healthy Analyzer heartbeat timeout keeps the task RUNNING and retries', async (t) => {
   const h = await productionWaveRuntimeHarness(t, {
     analysisSessionHeartbeatIntervalMilliseconds: 10,
@@ -2185,6 +2514,68 @@ test('a healthy busy Analyzer session keeps the task RUNNING and retries', async
   h.releaseTmpDelete.resolve();
   const completed = await running;
   assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+});
+
+test('a persistently busy healthy Analyzer session is rebuilt instead of retried forever', async (t) => {
+  const h = await productionWaveRuntimeHarness(t, {
+    failClassWaveUntilSessionRebuilt: true,
+    analysisResponseTimeoutRetryInitialDelayMilliseconds: 1,
+    analysisResponseTimeoutRetryMaxDelayMilliseconds: 4
+  });
+  await h.runtime.startup();
+  h.releaseWave.resolve();
+  h.releaseTmpDelete.resolve();
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  const result = await Promise.race([
+    running,
+    new Promise(resolve => setTimeout(() => resolve(null), 2_000))
+  ]);
+  if (!result) await h.runtime.terminateTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.ok(result, 'a healthy process must not allow an unusable analysis session to retry forever');
+  assert.equal(result.state, 'COMPLETED', result.lastError?.message);
+  assert.equal(h.analysisSessionCreationCount(), 2);
+  assert.equal(h.waveStreamCalls.length, 1);
+  assert.equal(h.analyzerCalls.filter(call => call.kind === 'wave').length, 5);
+});
+
+test('an unfinished heartbeat cannot hold a completed Wave at the stage boundary', async (t) => {
+  const h = await productionWaveRuntimeHarness(t, {
+    stallHeartbeatDuringWave: true,
+    analysisSessionHeartbeatIntervalMilliseconds: 5
+  });
+  await h.runtime.startup();
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  await h.waveStarted.promise;
+  await h.stalledHeartbeatStarted.promise;
+  h.releaseWave.resolve();
+  h.releaseTmpDelete.resolve();
+  const result = await Promise.race([
+    running,
+    new Promise(resolve => setTimeout(() => resolve(null), 2_000))
+  ]);
+  if (!result) await h.runtime.terminateTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.ok(result, 'completed business work must not wait indefinitely for its keepalive');
+  assert.equal(result.state, 'COMPLETED', result.lastError?.message);
+  assert.equal(h.waveStreamCalls.length, 1);
+});
+
+test('Analyzer creation recovery stops when every new session is cancelled', async (t) => {
+  const h = await productionWaveRuntimeHarness(t, {
+    failEveryAnalysisSessionCreation: true,
+    analysisResponseTimeoutRetryInitialDelayMilliseconds: 1,
+    analysisResponseTimeoutRetryMaxDelayMilliseconds: 4
+  });
+  await h.runtime.startup();
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  const result = await Promise.race([
+    running,
+    new Promise(resolve => setTimeout(() => resolve(null), 500))
+  ]);
+  if (!result) await h.runtime.terminateTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.ok(result, 'session creation recovery must also have a finite retry budget');
+  assert.equal(result.state, 'FAILED');
+  assert.equal(h.analysisSessionCreationCount(), 2);
+  assert.equal(h.waveStreamCalls.length, 0);
 });
 test('an expired Analyzer session while taking the first class Wave is rebuilt before model generation', async (t) => {
   const h = await productionWaveRuntimeHarness(t, {
@@ -2296,6 +2687,44 @@ test('a model call failure keeps successful Part scratch for the next retry', as
   await access(activeWave.parts[0].isolatedFilePath);
 });
 
+test('retrying a model failure restarts the Wave when checkpointed Part files are missing', async (t) => {
+  // Mutation caught: resuming a SUCCEEDED Part whose local Part file was cleaned replays an
+  // unrecoverable Wave checkpoint instead of starting a fresh model Wave.
+  const h = await productionWaveRuntimeHarness(t, {
+    failWaveOnceAfterSucceededPart: true
+  });
+  await h.runtime.startup();
+  const firstRun = h.runtime.runTask({
+    workspaceRoot: h.workspaceRoot,
+    taskId: TASK_ID
+  });
+  await h.waveStarted.promise;
+  h.releaseWave.resolve();
+  const failed = await firstRun;
+  assert.equal(failed.state, 'PAUSED');
+
+  const storedAfterFailure = JSON.parse(await readFile(
+    join(h.storageDirectory, 'class-task-checkpoints-v2.json'),
+    'utf8'
+  ));
+  const activeWave = storedAfterFailure.tasks[TASK_ID].waveState.activeWave;
+  assert.equal(activeWave.parts[0].status, 'SUCCEEDED');
+  await rm(activeWave.parts[0].isolatedFilePath, { force: true });
+  await assert.rejects(
+    access(activeWave.parts[0].isolatedFilePath),
+    (error) => error?.code === 'ENOENT'
+  );
+
+  h.releaseTmpDelete.resolve();
+  const completed = await h.runtime.resumeTask({
+    workspaceRoot: h.workspaceRoot,
+    taskId: TASK_ID
+  });
+
+  assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+  assert.equal(h.waveStreamCalls.length, 2, 'missing Part scratch must force a fresh Wave');
+  await access(h.formalFilePath);
+});
 test('retrying a model failure uses the newly selected model without restarting the Wave', async (t) => {
   const h = await productionWaveRuntimeHarness(t, {
     failWaveOnceAfterSucceededPart: true
@@ -2377,7 +2806,8 @@ test('a legacy generic missing-report failure refreshes coverage artifacts befor
   assert.equal(registry.snapshot(TASK_ID).state, 'READY');
 });
 
-test('failed refresh preserves a model-repair Wave checkpoint even when recovery files are missing', async (t) => {
+for (const retryableFailure of ['MODEL_PERMISSION_DENIED', 'RAG_INDEX_IDENTITY_MISMATCH']) {
+test(`failed refresh preserves ${retryableFailure} Wave checkpoint even when recovery files are missing`, async (t) => {
   // Mutation caught: omitting resetGenerationCheckpoint:false lets restart() use its default
   // reset behavior, deleting the MODEL_REPAIR checkpoint and submitting the same Wave as
   // first generation again.
@@ -2446,7 +2876,7 @@ test('failed refresh preserves a model-repair Wave checkpoint even when recovery
     ...registry.snapshot(TASK_ID),
     state: 'FAILED',
     lastError: {
-      code: 'MODEL_PERMISSION_DENIED',
+      code: retryableFailure,
       message: 'simulated model permission failure',
       moduleName: 'Task',
       modulePath: h.workspaceRoot,
@@ -2464,6 +2894,7 @@ test('failed refresh preserves a model-repair Wave checkpoint even when recovery
   assert.equal(wave.activeWave?.waveId, waveId);
   assert.equal(wave.candidates[candidateId]?.status, 'MODEL_REPAIR');
 });
+}
 test('restart with a refreshed coverage pair resumes the merged TMP at Maven without initial regeneration', async (t) => {
   const h = await productionWaveRuntimeHarness(t);
   await h.runtime.startup();
@@ -2624,6 +3055,38 @@ test('failed retry keeps a Maven-passed Wave TMP after its Part scratch was clea
   await access(h.formalFilePath);
 });
 
+test('unsafe formal rename retains a passed candidate and resumes without model regeneration', async (t) => {
+  const h = await productionWaveRuntimeHarness(t);
+  await h.runtime.startup();
+  const original = h.runtime.coordinator.formalizeWaveGroup.bind(h.runtime.coordinator);
+  let rejectRename = true;
+  h.runtime.coordinator.formalizeWaveGroup = async (...args) => {
+    if (rejectRename) {
+      rejectRename = false;
+      const error = new Error('generated class cannot be safely renamed');
+      error.code = 'METHOD_GENERATION_TEST_RENAME_UNSAFE';
+      throw error;
+    }
+    return original(...args);
+  };
+  const firstRun = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  await h.waveStarted.promise;
+  h.releaseWave.resolve();
+  h.releaseTmpDelete.resolve();
+  const failed = await firstRun;
+  assert.equal(failed.state, 'FAILED');
+  assert.equal(failed.lastError?.code, 'METHOD_GENERATION_TEST_RENAME_UNSAFE');
+  const wave = await h.runtime.coordinator.dependencies.checkpoints.taskWaveProgress(TASK_ID);
+  const candidate = Object.values(wave.candidates)[0];
+  assert.equal(candidate.status, 'PASSED');
+  assert.equal(candidate.managedFile?.location, 'PROJECT');
+  await access(candidate.managedFile.path);
+  const completed = await h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+  assert.equal(h.waveStreamCalls.length, 1);
+  await access(h.formalFilePath);
+});
+
 test('formalization rebuilds the packer after runtime result resources roll over', async (t) => {
   // Accepting an earlier formal result replaces the task file transaction and clears the
   // packer. A Wave that already finished Maven must still publish against the new transaction.
@@ -2700,6 +3163,76 @@ test('formalization rebuilds the packer after runtime result resources roll over
   assert.equal(nextResult?.canAccept, true);
   assert.equal(nextResult?.canRevoke, true);
   await assert.rejects(access(h.tmpFilePath), (error) => error?.code === 'ENOENT');
+});
+
+test('a new class Wave publishes its own candidate when a prior run retained the same method ordinal', async (t) => {
+  // Matching by occurrence alone silently substitutes a historical test file for
+  // the current passing candidate and commits scenarios that file never tested.
+  const h = await productionWaveRuntimeHarness(t);
+  const oldPath = join(dirname(h.formalFilePath), 'Task9Test.java');
+  const oldCode = 'package example; public class Task9Test { @org.junit.jupiter.api.Test void historical() {} }\n';
+  await mkdir(dirname(oldPath), { recursive: true });
+  await writeFile(oldPath, oldCode);
+  await h.runtime.startup();
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  const firstBoundary = await Promise.race([
+    h.waveStarted.promise.then(() => ({ kind: 'wave-started' })),
+    running.then((snapshot) => ({ kind: 'task-ended', snapshot }))
+  ]);
+  assert.equal(firstBoundary.kind, 'wave-started', firstBoundary.snapshot?.lastError?.message);
+  // Preparation can restore retained pending artifacts after the scheduler clears
+  // public run results, as in the real failed task. Seed that transaction boundary.
+  await h.runtime.coordinator.resourceFor(TASK_ID).transaction.track({
+    taskId: TASK_ID, workspaceRoot: h.workspaceRoot,
+    filePath: oldPath, testClassName: 'Task9Test', ordinaryTestMethodCount: 1,
+    methodIds: [h.methodId], methodResults: [{
+      methodId: h.methodId, methodName: 'run', displaySignature: 'run()',
+      jacocoOrder: 0, ordinaryTestMethodCount: 1
+    }],
+    sha256: createHash('sha256').update(oldCode).digest('hex'),
+    sealed: true, existedBefore: false
+  });
+  h.releaseWave.resolve();
+  h.releaseTmpDelete.resolve();
+  const completed = await running;
+  assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+  assert.equal(completed.generatedArtifacts.length, 2, 'both historical and new formal files must remain');
+  assert.equal(await readFile(oldPath, 'utf8'), oldCode);
+  assert.match(await readFile(h.formalFilePath, 'utf8'), /void m1_generated\(\)/);
+  const published = completed.generatedArtifacts.find((artifact) => artifact.filePath === h.formalFilePath);
+  assert.equal(published.methodResults[0].waveIndex, 1);
+  const checkpoint = JSON.parse(await readFile(join(h.storageDirectory, 'class-task-checkpoints-v2.json'), 'utf8'));
+  assert.deepEqual(published.methodResults[0].sourceBatchIds,
+    checkpoint.tasks[TASK_ID].waveState.methods[h.methodId].completedWaves[0].candidateIds);
+});
+
+test('retrying an unpublished passing Wave recovers its lost scratch without resetting completed progress', async (t) => {
+  const h = await productionWaveRuntimeHarness(t);
+  await h.runtime.startup();
+  const formalize = h.runtime.coordinator.formalizeWaveGroup.bind(h.runtime.coordinator);
+  let failOnce = true;
+  h.runtime.coordinator.formalizeWaveGroup = async (...args) => {
+    if (failOnce) {
+      failOnce = false;
+      throw new Error('Published class Wave result is incomplete.');
+    }
+    return formalize(...args);
+  };
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  await h.waveStarted.promise;
+  h.releaseWave.resolve();
+  h.releaseTmpDelete.resolve();
+  const failed = await running;
+  assert.equal(failed.state, 'FAILED');
+  const before = await h.runtime.coordinator.dependencies.checkpoints.taskWaveProgress(TASK_ID);
+  assert.equal(Object.values(before.candidates)[0].managedFile, null);
+  const refresh = await h.runtime.coordinator.refreshFailedRunIfStale(TASK_ID);
+  assert.deepEqual(refresh, { refreshed: false, preserveCheckpoint: true });
+  const completed = await h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+  const after = await h.runtime.coordinator.dependencies.checkpoints.taskWaveProgress(TASK_ID);
+  assert.deepEqual(after.methods[h.methodId].completedWaves[0].candidateIds, Object.keys(before.candidates));
+  assert.match(await readFile(h.formalFilePath, 'utf8'), /void m1_generated\(\)/);
 });
 
 test('restart commits an already published Wave after its TMP was cleaned without regenerating', async (t) => {
@@ -2985,6 +3518,55 @@ test('failed retry preserves a formal file when a later method candidate is miss
   await access(h.formalFilePath);
 });
 
+for (const failureCode of [
+  'METHOD_GENERATION_PROJECT_BLOCKED',
+  'RAG_INDEX_IDENTITY_MISMATCH',
+  'RAG_RUN_AUTHORIZATION_MISMATCH',
+  'RAG_REPAIR_CONTEXT_UNAVAILABLE'
+]) {
+test(`releasing ${failureCode} keeps its isolated candidate and Part recovery files`, async (t) => {
+  const h = await productionWaveRuntimeHarness(t);
+  const code = 'package example; public class TaskTmp1Test { int kept; }\n';
+  const candidateId = '66666666-6666-4666-8666-666666666666';
+  await mkdir(dirname(h.tmpFilePath), { recursive: true });
+  await writeFile(h.tmpFilePath, code);
+  const partFile = join(waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-parts'), 'part.java');
+  await mkdir(dirname(partFile), { recursive: true });
+  await writeFile(partFile, 'recoverable Part');
+  const taskStorePath = join(h.storageDirectory, 'class-tasks-v2.json');
+  const store = JSON.parse(await readFile(taskStorePath, 'utf8'));
+  store.tasks[TASK_ID].state = 'FAILED';
+  store.tasks[TASK_ID].lastError = {
+    code: failureCode, message: 'recoverable runtime failure',
+    moduleName: 'example.Task', modulePath: h.workspaceRoot, command: null,
+    occurredAt: '2026-10-01T10:34:34.000Z'
+  };
+  await writeFile(taskStorePath, JSON.stringify(store));
+  await writeFile(join(h.storageDirectory, 'class-task-checkpoints-v2.json'), JSON.stringify({
+    version: 5, tasks: { [TASK_ID]: storedTaskCheckpoint({ candidates: {
+      [candidateId]: {
+        candidateId, methodId: h.methodId, waveId: 'c'.repeat(64), status: 'BLOCKED',
+        llmRepairAttemptsUsed: 5, repairAttemptLimit: 5, unlimitedRepair: false,
+        lastMavenBatchId: null,
+        stableRepair: { phase: 'BLOCKED', iteration: 3, annotatedMemberIds: [] },
+        managedFile: { path: h.tmpFilePath, sha256: createHash('sha256').update(code).digest('hex'), location: 'PROJECT' },
+        moveTransaction: null
+      }
+    } }) }
+  }));
+  await h.runtime.startup();
+  await h.runtime.coordinator.releaseRun(TASK_ID);
+  await h.runtime.flush();
+  const cp = JSON.parse(await readFile(join(h.storageDirectory, 'class-task-checkpoints-v2.json'), 'utf8'));
+  const retained = cp.tasks[TASK_ID].waveState.candidates[candidateId];
+  assert.equal(retained.status, 'BLOCKED');
+  assert.equal(retained.managedFile?.location, 'ISOLATED');
+  assert.equal(await readFile(retained.managedFile.path, 'utf8'), code);
+  assert.equal(await readFile(partFile, 'utf8'), 'recoverable Part');
+  await assert.rejects(access(h.tmpFilePath), (error) => error?.code === 'ENOENT');
+});
+}
+
 test('production formal publication failure deletes Wave TMP, Part, and isolation scratch', async (t) => {
   // Mutation caught: terminal failure without scratch cleanup leaves project TMP files and
   // both hidden Wave trees behind even though this run cannot be resumed.
@@ -3077,6 +3659,40 @@ test('terminating a production run deletes orphan Wave Part and isolated TMP tre
   await assert.rejects(access(candidateRoot), (error) => error?.code === 'ENOENT');
 });
 
+for (const alreadyPublished of [false, true]) {
+  test(`formalizing ${alreadyPublished ? 'an already published' : 'a new'} class Wave reclaims orphan candidates before task completion`, async (t) => {
+    // Terminal-only cleanup cannot remove stale candidates while later Waves run;
+    // the already-published recovery branch must clean them too.
+    const h = await productionWaveRuntimeHarness(t);
+    await h.runtime.startup();
+    const orphanPath = join(
+      waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-candidates'),
+      '77777777-7777-4777-8777-777777777777', 'TaskTmp6Test.java'
+    );
+    const originalFormalize = h.runtime.coordinator.formalizeWaveGroup.bind(h.runtime.coordinator);
+    let checkedBeforeCompletion = false;
+    h.runtime.coordinator.formalizeWaveGroup = async (...args) => {
+      if (alreadyPublished) await originalFormalize(...args);
+      await mkdir(dirname(orphanPath), { recursive: true });
+      await writeFile(orphanPath, 'abandoned candidate');
+      await originalFormalize(...args);
+      await assert.rejects(access(orphanPath), (error) => error?.code === 'ENOENT');
+      await access(h.formalFilePath);
+      checkedBeforeCompletion = true;
+    };
+
+    const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+    await h.waveStarted.promise;
+    h.releaseWave.resolve();
+    h.releaseTmpDelete.resolve();
+    const completed = await running;
+
+    assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+    assert.equal(checkedBeforeCompletion, true);
+    assert.equal(completed.generatedArtifacts.length, 1);
+  });
+}
+
 test('completing a production run deletes orphan isolated Wave TMP trees', async (t) => {
   // Mutation caught: completed runs used to skip terminal scratch cleanup, so a candidate
   // discarded during catalog reconciliation remained forever outside the checkpoint.
@@ -3101,6 +3717,133 @@ test('completing a production run deletes orphan isolated Wave TMP trees', async
   assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
   await assert.rejects(access(candidateRoot), (error) => error?.code === 'ENOENT');
 });
+
+test('completion preserves quarantined failure evidence while cleaning ordinary Wave scratch', async (t) => {
+  const h = await productionWaveRuntimeHarness(t);
+  await h.runtime.startup();
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  await h.waveStarted.promise;
+  const candidateId = '77777777-7777-4777-8777-777777777777';
+  const candidateRoot = waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-candidates');
+  const file = join(waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-failures'), candidateId, 'TaskTmp9Test.java');
+  const source = 'package example; public class TaskTmp9Test {}\n';
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, source);
+  await writeFile(`${file}.failure.json`, '{"status":"compile_failed"}\n');
+  await h.runtime.coordinator.dependencies.checkpoints.saveWaveCandidate(TASK_ID, {
+    candidateId, methodId: 'f'.repeat(64), waveId: 'e'.repeat(64), status: 'QUARANTINED',
+    llmRepairAttemptsUsed: 6, repairAttemptLimit: 6, unlimitedRepair: false, lastMavenBatchId: null,
+    stableRepair: { phase: 'BLOCKED', iteration: 1, annotatedMemberIds: [] },
+    managedFile: { path: file, sha256: createHash('sha256').update(source).digest('hex'), location: 'ISOLATED' },
+    moveTransaction: null
+  });
+  const orphan = join(candidateRoot, 'orphan', 'TaskTmp8Test.java');
+  await mkdir(dirname(orphan), { recursive: true });
+  await writeFile(orphan, 'orphan');
+  h.releaseWave.resolve();
+  h.releaseTmpDelete.resolve();
+  const completed = await running;
+  assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+  assert.equal(await readFile(file, 'utf8'), source);
+  await access(`${file}.failure.json`);
+  await assert.rejects(access(orphan), (error) => error?.code === 'ENOENT');
+  const checkpoint = await h.runtime.coordinator.dependencies.checkpoints.taskWaveProgress(TASK_ID);
+  assert.equal(checkpoint.candidates[candidateId].managedFile.path, file);
+});
+
+for (const state of ['COMPLETED', 'INTERRUPTED']) {
+  test(`deleting a restored ${state} task removes only its Wave failure tree`, async (t) => {
+    const h = await completedResultFileFixture(t, state, {
+      includeAcceptedArtifact: true, includeSiblingTask: true
+    });
+    const before = (await h.runtime.listClassTasks({ workspaceRoot: h.workspaceRoot }))
+      .find((task) => task.id === TASK_ID);
+    const businessSource = await readFile(before.sourceFilePath, 'utf8');
+    const failureRoot = waveScratchTaskDirectory(h.workspaceRoot, 'method-wave-failures');
+    const candidateId = '77777777-7777-4777-8777-777777777777';
+    const quarantinedFile = join(failureRoot, candidateId, 'TaskTmp9Test.java');
+    const failedSource = 'package example; public class TaskTmp9Test {}\n';
+    const siblingFailure = join(
+      h.workspaceRoot, '.ai-unit-test', 'method-wave-failures',
+      createHash('sha256').update('22222222-2222-4222-8222-222222222222').digest('hex').slice(0, 24),
+      'another-candidate', 'TaskTmp9Test.java.failure.json'
+    );
+    const retainedAudit = join(h.workspaceRoot, 'saved-failure-audit.json');
+    const files = [
+      [quarantinedFile, failedSource],
+      [`${quarantinedFile}.failure.json`, '{"status":"compile_failed"}\n'],
+      [`${quarantinedFile}.removed-tests.json`, '{"removedTests":[]}\n'],
+      [`${quarantinedFile}.stable-repair.json`, '{"iteration":1}\n'],
+      [join(failureRoot, 'untracked-candidate', 'nested', 'failure.xml'), '<testsuite errors="1"/>'],
+      [siblingFailure, '{"task":"other-task"}\n'],
+      [retainedAudit, '{"retained":"audit-copy"}\n']
+    ];
+    for (const [file, content] of files) {
+      await mkdir(dirname(file), { recursive: true });
+      await writeFile(file, content);
+    }
+    await h.runtime.coordinator.dependencies.checkpoints.saveWaveCandidate(TASK_ID, {
+      candidateId, methodId: 'f'.repeat(64), waveId: 'e'.repeat(64), status: 'QUARANTINED',
+      llmRepairAttemptsUsed: 6, repairAttemptLimit: 6, unlimitedRepair: false, lastMavenBatchId: null,
+      stableRepair: { phase: 'BLOCKED', iteration: 1, annotatedMemberIds: [] },
+      managedFile: {
+        path: quarantinedFile,
+        sha256: createHash('sha256').update(failedSource).digest('hex'),
+        location: 'ISOLATED'
+      },
+      moveTransaction: null
+    });
+
+    await h.runtime.removeClassTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+
+    await assert.rejects(access(failureRoot), (error) => error?.code === 'ENOENT');
+    assert.equal(await readFile(siblingFailure, 'utf8'), '{"task":"other-task"}\n');
+    assert.equal(await readFile(retainedAudit, 'utf8'), '{"retained":"audit-copy"}\n');
+    assert.equal(await readFile(before.sourceFilePath, 'utf8'), businessSource);
+    assert.equal(await readFile(h.acceptedTestFilePath, 'utf8'), h.acceptedTestFileContent);
+    await assert.rejects(access(h.testFilePath), (error) => error?.code === 'ENOENT');
+    assert.deepEqual(
+      (await h.runtime.listClassTasks({ workspaceRoot: h.workspaceRoot })).map((task) => task.id),
+      [h.siblingTaskId]
+    );
+    await h.runtime.removeClassTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  });
+}
+
+for (const otherWorkspaceTask of [false, true]) {
+  test(`deleting the last project task removes its entire .ai-unit-test tree${otherWorkspaceTask ? ' while preserving another project' : ''}`, async (t) => {
+    const h = await completedResultFileFixture(t, 'COMPLETED', {
+      includeAcceptedArtifact: true,
+      includeSiblingTask: otherWorkspaceTask,
+      siblingInAnotherWorkspace: otherWorkspaceTask
+    });
+    const taskRoot = join(h.workspaceRoot, '.ai-unit-test');
+    for (const name of ['method-wave-failures/task/source.java', 'method-wave-parts/task/part.java', 'logs/task/log.json', 'rag/cache.bin']) {
+      const file = join(taskRoot, name);
+      await mkdir(dirname(file), { recursive: true });
+      await writeFile(file, 'task-owned workspace data');
+    }
+    const siblingData = join(h.siblingWorkspaceRoot, '.ai-unit-test', 'logs', 'other-task.log');
+    if (otherWorkspaceTask) {
+      await mkdir(dirname(siblingData), { recursive: true });
+      await writeFile(siblingData, 'other project data');
+    }
+
+    await h.runtime.removeClassTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+
+    await assert.rejects(access(taskRoot), (error) => error?.code === 'ENOENT');
+    await access(join(h.workspaceRoot, 'module-a', 'src', 'main', 'java', 'example', 'Task.java'));
+    assert.equal(await readFile(h.acceptedTestFilePath, 'utf8'), h.acceptedTestFileContent);
+    assert.deepEqual(await h.runtime.listClassTasks({ workspaceRoot: h.workspaceRoot }), []);
+    if (otherWorkspaceTask) {
+      assert.equal(await readFile(siblingData, 'utf8'), 'other project data');
+      assert.deepEqual(
+        (await h.runtime.listClassTasks({ workspaceRoot: h.siblingWorkspaceRoot })).map((task) => task.id),
+        [h.siblingTaskId]
+      );
+    }
+  });
+}
 
 test('removing an interrupted production task deletes its project TMP and Wave Part tree', async (t) => {
   // Mutation caught: releaseRun preserves recovery files for interruption, but an explicit
@@ -3306,7 +4049,7 @@ test('startup keeps a missing result actionable so it can be accepted', async (t
     shellService: new Proxy({}, { get: (_target, key) => forbidden(`shell:${String(key)}`) }),
     mavenAnalysisContextService: { collect: forbidden('analysis-context') },
     testWriterService: new TestWriterService(),
-    jacocoArtifactsService: {},
+    jacocoArtifactsService: { async readTaskResultCoverageRollback() { return null; }, async discardTaskResultCoverageRollback() {} },
     surefireReportService: {},
     buildSettingsService: { get: forbidden('build-settings') },
     modelInterfacesService: {
@@ -3333,6 +4076,29 @@ test('startup keeps a missing result actionable so it can be accepted', async (t
   assert.deepEqual(externalCalls, []);
   await runtime.beforeQuit();
 });
+
+for (const action of ['accept', 'revoke']) {
+  test(`saving a changed configuration leaves the pending result available for ${action}`, async t => {
+    const h = await completedResultFileFixture(t);
+    const [completed] = await h.runtime.listClassTasks({workspaceRoot: h.workspaceRoot});
+    const before = await h.runtime.getTaskResult({workspaceRoot: h.workspaceRoot, taskId: TASK_ID});
+    await assert.rejects(h.runtime.saveMethodSelection({
+      workspaceRoot: h.workspaceRoot, taskId: TASK_ID, selectionMode: completed.selectionMode,
+      selectedMethodIds: completed.selectedMethodIds, methodOrder: completed.methodOrder,
+      ragEnabled: !completed.ragEnabled, repairAttemptLimit: 6,
+      unlimitedRepair: false
+    }), /请先接受或撤回.*保存配置/);
+    assert.deepEqual(await h.runtime.getTaskResult({workspaceRoot: h.workspaceRoot, taskId: TASK_ID}), before);
+    assert.equal(before.canAccept, true);
+    assert.equal(before.canRevoke, true);
+    const result = await h.runtime[action === 'accept' ? 'acceptTaskResult' : 'revokeTaskResult']({
+      workspaceRoot: h.workspaceRoot, taskId: TASK_ID
+    });
+    assert.equal(result.canAccept, false);
+    assert.equal(result.canRevoke, false);
+    assert.deepEqual(h.externalCalls, []);
+  });
+}
 
 test('completed result lookup keeps a deleted test file actionable', async (t) => {
   // Result visibility comes from persisted task metadata so accept or revoke remains possible
@@ -3516,24 +4282,25 @@ test('revoke deletes only pending files and preserves previously accepted files'
   assert.deepEqual(fixture.externalCalls, []);
 });
 
-test('revoke on a paused task deletes only pending files and keeps the task paused', async (t) => {
+test('revoke on a paused task is rejected and preserves its files and checkpoint', async (t) => {
   const fixture = await completedResultFileFixture(t, 'PAUSED');
-
-  const revoked = await fixture.runtime.revokeTaskResult({
+  const before = await fixture.runtime.getTaskResult({
     workspaceRoot: fixture.workspaceRoot,
     taskId: TASK_ID
   });
-
-  assert.equal(revoked.state, 'PAUSED');
-  assert.equal(revoked.canAccept, false);
-  assert.equal(revoked.canRevoke, false);
-  await assert.rejects(access(fixture.testFilePath), { code: 'ENOENT' });
+  assert.equal(before.canAccept, false);
+  assert.equal(before.canRevoke, false);
+  await assert.rejects(fixture.runtime.revokeTaskResult({
+    workspaceRoot: fixture.workspaceRoot,
+    taskId: TASK_ID
+  }));
+  await access(fixture.testFilePath);
   const [persisted] = await fixture.runtime.listClassTasks({
     workspaceRoot: fixture.workspaceRoot
   });
   assert.equal(persisted.state, 'PAUSED');
-  assert.deepEqual(persisted.generatedArtifacts, []);
-  assert.deepEqual(persisted.coverageCurrent, persisted.coverageBaseline);
+  assert.deepEqual(persisted.generatedArtifacts, before.artifacts);
+  assert.deepEqual(persisted.coverageCurrent, before.coverageCurrent);
   assert.deepEqual(fixture.externalCalls, []);
 });
 
@@ -3587,7 +4354,7 @@ test('production composition persists and broadcasts a class-local preload failu
     shellService: new Proxy({}, { get: (_target, key) => forbidden(`shell:${String(key)}`) }),
     mavenAnalysisContextService: { collect: forbidden('analysis-context') },
     testWriterService: {},
-    jacocoArtifactsService: {},
+    jacocoArtifactsService: { async readTaskResultCoverageRollback() { return null; }, async discardTaskResultCoverageRollback() {} },
     surefireReportService: {},
     buildSettingsService: { get: async () => null },
     modelInterfacesService: {
@@ -3659,7 +4426,7 @@ test('a legacy preload cache cannot leave a class task permanently running', asy
   t.after(() => runtime.beforeQuit());
   await runtime.startup();
   await runtime.addClassTasks({ workspaceRoot, classFilePaths: [sourceFilePath] });
-  await maven.compileStarted;
+  await maven.moduleStarted;
   maven.finish({
     command: 'fake-mvn compile',
     cwd: moduleRoot,
@@ -3672,8 +4439,8 @@ test('a legacy preload cache cannot leave a class task permanently running', asy
   const [persisted] = await runtime.listClassTasks({ workspaceRoot });
   assert.equal(persisted.state, 'PRELOAD_FAILED');
   assert.equal(persisted.preloadState, 'FAILED');
-  assert.equal(maven.moduleCallCount, 0);
-  assert.equal(maven.compileCallCount, 1);
+  assert.equal(maven.moduleCallCount, 1);
+  assert.equal(maven.compileCallCount, 0);
   assert.equal(maven.directCallCount, 0);
 });
 
@@ -3833,7 +4600,7 @@ test('class preload isolates an unowned same-class TMP before Maven starts', asy
     classFilePaths: [sourceFilePath]
   });
 
-  await maven.compileStarted;
+  await maven.moduleStarted;
 
   await assert.rejects(access(orphanTmpPath), (error) => error?.code === 'ENOENT');
   await access(unrelatedTmpPath);
@@ -3874,7 +4641,7 @@ test('keeps a class PRELOADING and exponentially retries when a healthy Analyzer
   });
   const pairId = 'a'.repeat(64);
   const broadcasts = [];
-  const maven = controlledPreloadMaven();
+  const maven = controlledPreloadMaven({ writeModuleExec: true });
   const options = productionPreloadOptions({
     storageDirectory: join(root, 'state'),
     maven,
@@ -3974,7 +4741,7 @@ test('keeps a class PRELOADING and exponentially retries when a healthy Analyzer
     workspaceRoot,
     classFilePaths: [sourceFilePath]
   });
-  await maven.compileStarted;
+  await maven.moduleStarted;
   maven.finish({
     command: 'fake-mvn compile',
     cwd: moduleRoot,
@@ -3986,7 +4753,8 @@ test('keeps a class PRELOADING and exponentially retries when a healthy Analyzer
     analyzerRetryStarted.then(() => true),
     new Promise((resolve) => setTimeout(() => resolve(false), 250))
   ]);
-  assert.equal(retryStarted, true, 'healthy Analyzer timeout should schedule a retry');
+  const retryState = await runtime.listClassTasks({ workspaceRoot });
+  assert.equal(retryStarted, true, `healthy Analyzer timeout should schedule a retry: ${JSON.stringify(retryState.map(task => task.lastError))}`);
 
   const [pending] = await runtime.listClassTasks({ workspaceRoot });
   const readyBroadcasts = broadcasts.filter(
@@ -4286,7 +5054,9 @@ test('recoverable Analyzer cancellation uses a fresh session before capacity rec
         stderr: ''
       };
     },
-    runMavenModuleTestsWithJacoco: forbidden('module-tests'),
+    async runMavenModuleTestsWithJacoco() {
+      return successfulCommand('fake-mvn module-test', moduleRoot);
+    },
     runMavenDirectTestsWithJacoco: forbidden('direct-tests'),
     runMavenGeneratedTestCompile: forbidden('generated-compile'),
     runMavenGeneratedSurefireTest: forbidden('generated-test'),
@@ -5010,19 +5780,17 @@ test('removing the last active card stops its class-targeted Maven command', asy
   await maven.directStarted;
 
   const removing = runtime.removeClassTask({ workspaceRoot, taskId: only.id });
-  const earlyOutcome = await observeSettlement(removing);
-  if (earlyOutcome.status === 'pending') {
-    maven.finish({
-      command: 'fake-mvn preload-with-jacoco',
-      cwd: moduleRoot,
-      exitCode: 0,
-      stdout: '',
-      stderr: ''
-    });
+  let removalTimer;
+  try {
+    await Promise.race([
+      removing,
+      new Promise((_, reject) => {
+        removalTimer = setTimeout(() => reject(new Error('Removal is waiting for aborted Maven work.')), 5000);
+      })
+    ]);
+  } finally {
+    clearTimeout(removalTimer);
   }
-  await removing;
-
-  assert.equal(earlyOutcome.status, 'fulfilled');
   assert.equal(maven.abortCount, 1);
   assert.deepEqual(await runtime.listClassTasks({ workspaceRoot }), []);
 });
@@ -5183,7 +5951,10 @@ async function waitForMavenCalls(maven, expected) {
 async function completedResultFileFixture(
   t,
   resultState = 'COMPLETED',
-  { includeAcceptedArtifact = false } = {}
+  {
+    includeAcceptedArtifact = false, withoutCoverage = false, ordinaryTestMethodCount = 1,
+    includeSiblingTask = false, siblingInAnotherWorkspace = false
+  } = {}
 ) {
   const root = await mkdtemp(join(tmpdir(), 'class-task-runtime-result-file-'));
   const workspaceRoot = join(root, 'workspace');
@@ -5194,20 +5965,25 @@ async function completedResultFileFixture(
   const testFilePath = join(testDirectory, 'Task1Test.java');
   const acceptedTestFilePath = join(testDirectory, 'Task0Test.java');
   const storageDirectory = join(root, 'state');
-  const testFileContent = 'package example; public class Task1Test {}';
+  const siblingTaskId = '22222222-2222-4222-8222-222222222222';
+  const siblingWorkspaceRoot = siblingInAnotherWorkspace ? join(root, 'other-workspace') : workspaceRoot;
+  const siblingSourcePath = join(siblingWorkspaceRoot, 'module-a', 'src', 'main', 'java', 'example', 'Sibling.java');
+  const testFileContent = ordinaryTestMethodCount === 0
+    ? 'package example; public class Task1Test {\n // @Test\n // void failedCase() {}\n}'
+    : 'package example; public class Task1Test {}';
   const acceptedTestFileContent = 'package example; public class Task0Test {}';
   const artifact = {
     id: 'artifact-1',
     filePath: testFilePath,
     testClassName: 'Task1Test',
-    ordinaryTestMethodCount: 1,
+    ordinaryTestMethodCount,
     methodIds: ['method-id'],
     methodResults: [{
       methodId: 'method-id',
       methodName: 'method',
       displaySignature: 'method()',
       jacocoOrder: 0,
-      ordinaryTestMethodCount: 1
+      ordinaryTestMethodCount
     }],
     sha256: createHash('sha256').update(testFileContent).digest('hex'),
     sealed: true,
@@ -5218,6 +5994,7 @@ async function completedResultFileFixture(
   const acceptedArtifact = {
     ...artifact,
     id: 'accepted-artifact-1',
+    ordinaryTestMethodCount: 1,
     filePath: acceptedTestFilePath,
     testClassName: 'Task0Test',
     methodIds: ['accepted-method-id'],
@@ -5242,9 +6019,23 @@ async function completedResultFileFixture(
   if (includeAcceptedArtifact) {
     await writeFile(acceptedTestFilePath, acceptedTestFileContent, 'utf8');
   }
+  if (includeSiblingTask) {
+    await mkdir(dirname(siblingSourcePath), { recursive: true });
+    await writeFile(siblingSourcePath, 'package example; public class Sibling {}', 'utf8');
+  }
   await writeFile(join(storageDirectory, 'class-tasks-v2.json'), JSON.stringify({
     version: 3,
     tasks: {
+      ...(includeSiblingTask ? {
+        [siblingTaskId]: task(siblingTaskId, 'COMPLETED', {
+          workspaceRoot: siblingWorkspaceRoot,
+          sourceFilePath: siblingSourcePath,
+          qualifiedClassName: 'example.Sibling',
+          moduleKey: `${join(siblingWorkspaceRoot, 'module-a').replaceAll('\\', '/').toLowerCase()}/pom.xml`,
+          moduleDisplayPath: join(siblingWorkspaceRoot, 'module-a'),
+          generatedArtifacts: []
+        })
+      } : {}),
       [TASK_ID]: task(TASK_ID, resultState, {
         workspaceRoot,
         sourceFilePath,
@@ -5254,11 +6045,11 @@ async function completedResultFileFixture(
         generatedArtifacts: includeAcceptedArtifact
           ? [acceptedArtifact, artifact]
           : [artifact],
-        coverageBaseline: {
+        coverageBaseline: withoutCoverage ? null : {
           lineCovered: 0, lineMissed: 1, lineTotal: 1,
           branchCovered: 0, branchMissed: 0, branchTotal: 0
         },
-        coverageCurrent: {
+        coverageCurrent: withoutCoverage ? null : {
           lineCovered: 1, lineMissed: 0, lineTotal: 1,
           branchCovered: 0, branchMissed: 0, branchTotal: 0
         },
@@ -5287,7 +6078,7 @@ async function completedResultFileFixture(
     shellService: new Proxy({}, { get: (_target, key) => forbidden(`shell:${String(key)}`) }),
     mavenAnalysisContextService: { collect: forbidden('analysis-context') },
     testWriterService: new TestWriterService(),
-    jacocoArtifactsService: {},
+    jacocoArtifactsService: { async readTaskResultCoverageRollback() { return null; }, async discardTaskResultCoverageRollback() {} },
     surefireReportService: {},
     buildSettingsService: { get: forbidden('build-settings') },
     modelInterfacesService: {
@@ -5312,11 +6103,15 @@ async function completedResultFileFixture(
     acceptedTestFilePath,
     acceptedTestFileContent,
     acceptedArtifact,
+    siblingTaskId,
+    siblingWorkspaceRoot,
     externalCalls
   };
 }
 
 async function productionWaveRuntimeHarness(t, {
+  fullSource = false,
+  stallFullSourceAfterCandidate = false,
   failFormalPublication = false,
   failCoverageRefreshAfterFormalOnce = false,
   failHeartbeatOnceWithCancelledSession = false,
@@ -5324,14 +6119,20 @@ async function productionWaveRuntimeHarness(t, {
   failClassWaveOnceWithBusySession = false,
   failClassWaveOnceWithInvalidResponse = false,
   failClassWaveOnceWithMissingSession = false,
+  failClassWaveUntilSessionRebuilt = false,
+  failEveryAnalysisSessionCreation = false,
+  stallHeartbeatDuringWave = false,
   failWaveOnceAfterSucceededPart = false,
+  stallWaveAfterSucceededPart = false,
   candidateUsage = null,
   markMethodCoveredAfterRefresh = false,
   trackCoverageFromMaven = false,
   analysisSessionHeartbeatIntervalMilliseconds,
   analysisResponseTimeoutRetryInitialDelayMilliseconds,
   analysisResponseTimeoutRetryMaxDelayMilliseconds,
-  broadcast = () => undefined
+  methodGenerationWaveProgressTimeoutMilliseconds,
+  broadcast = () => undefined,
+  onMethodCatalogChanged = () => undefined
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'class-task-runtime-production-wave-'));
   const workspaceRoot = join(root, 'workspace');
@@ -5372,6 +6173,7 @@ async function productionWaveRuntimeHarness(t, {
   }), 'utf8');
 
   const waveStarted = runtimeDeferred();
+  const stalledHeartbeatStarted = runtimeDeferred();
   const releaseWave = runtimeDeferred();
   const tmpDeleteStarted = runtimeDeferred();
   const releaseTmpDelete = runtimeDeferred();
@@ -5379,6 +6181,7 @@ async function productionWaveRuntimeHarness(t, {
   const waveStreamCalls = [];
   const waveModelNames = [];
   let heartbeatCallCount = 0;
+  let heartbeatStalled = false;
   let analyzerHealthCheckCount = 0;
   let cancelledHeartbeatCount = 0;
   let analysisSessionCreationCount = 0;
@@ -5604,6 +6407,9 @@ async function productionWaveRuntimeHarness(t, {
     async createMethodAnalysisSession(request) {
       analysisSessionCreationCount += 1;
       analysisSessionId = request.analysisSessionId;
+      if (failEveryAnalysisSessionCreation) {
+        throw new MethodAnalysisRequestError('ANALYSIS_SESSION_CANCELLED', 'The session was cancelled.');
+      }
       return {
         analysisSessionId,
         reportPairId: currentReportPairId,
@@ -5641,8 +6447,16 @@ async function productionWaveRuntimeHarness(t, {
         catalog: methodCatalog()
       };
     },
-    async heartbeatMethodAnalysisSession() {
+    async heartbeatMethodAnalysisSession(_sessionId, signal) {
       heartbeatCallCount += 1;
+      if (stallHeartbeatDuringWave && waveHasStarted && !heartbeatStalled) {
+        heartbeatStalled = true;
+        stalledHeartbeatStarted.resolve();
+        await new Promise((resolve, reject) => {
+          if (signal?.aborted) reject(signal.reason);
+          else signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      }
       if (pendingResponseTimeoutHeartbeat && waveHasStarted) {
         pendingResponseTimeoutHeartbeat = false;
         throw Object.assign(new Error('Java Analyzer 响应等待时间过长，请稍后重试。'), {
@@ -5677,6 +6491,9 @@ async function productionWaveRuntimeHarness(t, {
     },
     async nextClassScenarioWave(sessionId, request) {
       analyzerCalls.push({ kind: 'wave', sessionId, request: structuredClone(request) });
+      if (failClassWaveUntilSessionRebuilt && analysisSessionCreationCount === 1) {
+        throw new MethodAnalysisRequestError('ANALYSIS_SESSION_BUSY', 'The old analysis session is stuck.');
+      }
       if (pendingClassWaveMissingSession) {
         pendingClassWaveMissingSession = false;
         throw new MethodAnalysisRequestError(
@@ -5780,6 +6597,9 @@ async function productionWaveRuntimeHarness(t, {
         candidateId,
         partResult
       }));
+      if (stallWaveAfterSucceededPart) {
+        await waitForReleaseOrAbort(new Promise(() => {}), signal);
+      }
       if (pendingWaveFailure) {
         pendingWaveFailure = false;
         throw new MethodGenerationRequestError(
@@ -5986,6 +6806,7 @@ async function productionWaveRuntimeHarness(t, {
     },
     modelCallLogSettingsService: { async get() { return { enabled: false }; } },
     broadcast,
+    onMethodCatalogChanged,
     idFactory: sequentialUuidFactory(),
     ...(analysisSessionHeartbeatIntervalMilliseconds === undefined
       ? {}
@@ -5995,8 +6816,48 @@ async function productionWaveRuntimeHarness(t, {
       : { analysisResponseTimeoutRetryInitialDelayMilliseconds }),
     ...(analysisResponseTimeoutRetryMaxDelayMilliseconds === undefined
       ? {}
-      : { analysisResponseTimeoutRetryMaxDelayMilliseconds })
+      : { analysisResponseTimeoutRetryMaxDelayMilliseconds }),
+    ...(methodGenerationWaveProgressTimeoutMilliseconds === undefined
+      ? {}
+      : { methodGenerationWaveProgressTimeoutMilliseconds })
   };
+  let fullSourceInitialCalls = 0, fullSourceCancelCalls = 0;
+  const fullSourceWaiting = runtimeDeferred();
+  if (fullSource) {
+    aiClient.fullSourceGenerationFacts = async (_session, request) => {
+      assert.deepEqual(request.selectedMethodIds, [methodId]);
+      analyzerCalls.push({ kind: 'full-source' });
+      const facts = fullSourceFacts(1);
+      facts.reportPairId = currentReportPairId; facts.sourceSha256 = 'e'.repeat(64);
+      facts.declaringType = 'example.Task';
+      facts.targetFixturePlan.targetClass = facts.declaringType;
+      facts.methods[0] = { ...facts.methods[0], methodId, declaringType: facts.declaringType,
+        methodName: 'run', completeMethodSource: 'public void run() {}' };
+      return facts;
+    };
+    aiClient.startFullSourceGenerationStream = async request => {
+      fullSourceInitialCalls++;
+      const testCode = `package example; import org.junit.jupiter.api.Test; public class ${request.outputTestClassName} {
+        Task target = new Task(); @Test void m1_generated() { target.run(); org.junit.jupiter.api.Assertions.assertNotNull(target); } }`;
+      return { kind: 'candidate_ready', sessionId: childSessionId, eventSequence: 1, candidate: {
+        generationMode: 'FULL_SOURCE', candidateId, candidateVersion: 1, repairAttempt: 0, methodId,
+        batchId: request.batchId, batchIndex: 1, testCode,
+        generatedCodeSha256: createHash('sha256').update(testCode).digest('hex'),
+        outputTestClassName: request.outputTestClassName, ordinaryTestMethodCount: 1, usage: null } };
+    };
+    aiClient.resumeFullSourceGenerationStream = async (_session, feedback, request, _model, _progress, signal) => {
+      assert.equal(feedback.execution.status, 'passed');
+      fullSourceWaiting.resolve();
+      if (stallFullSourceAfterCandidate) await waitForReleaseOrAbort(new Promise(() => {}), signal);
+      return { kind: 'completed', sessionId: childSessionId, eventSequence: 2, completion: {
+        methodId, batchId: request.batchId, stopReason: 'verified', bestCandidateId: candidateId,
+        aggregateUsage: null, modelCallCount: 1, usageReportedCallCount: 0 } };
+    };
+    aiClient.cancelFullSourceGeneration = async () => { fullSourceCancelCalls++; };
+    surefireReportService.readAttemptArtifacts = async () => [{ fileName: 'TEST-fixture.xml',
+      content: `<testsuite name="${currentTestClasses[0]}" tests="1" failures="0" errors="0" skipped="0">`
+        + `<testcase classname="${currentTestClasses[0]}" name="m1_generated"/></testsuite>` }];
+  }
   const runtime = createProductionClassTaskRuntime(runtimeOptions);
   t.after(async () => {
     const [shutdown] = await Promise.allSettled([runtime.beforeQuit()]);
@@ -6007,6 +6868,7 @@ async function productionWaveRuntimeHarness(t, {
     runtime,
     workspaceRoot,
     storageDirectory,
+    moduleRoot,
     methodId,
     reportPairId,
     tmpFilePath,
@@ -6019,6 +6881,7 @@ async function productionWaveRuntimeHarness(t, {
     setModelName(value) { activeModelName = value; },
     setReportPairId(value) { currentReportPairId = value; },
     heartbeatCallCount: () => heartbeatCallCount,
+    stalledHeartbeatStarted,
     analyzerHealthCheckCount: () => analyzerHealthCheckCount,
     cancelledHeartbeatCount: () => cancelledHeartbeatCount,
     analysisSessionCreationCount: () => analysisSessionCreationCount,
@@ -6026,9 +6889,583 @@ async function productionWaveRuntimeHarness(t, {
     releaseWave,
     tmpDeleteStarted,
     releaseTmpDelete,
-    runtimeOptions
+    runtimeOptions,
+    fullSourceInitialCalls: () => fullSourceInitialCalls,
+    fullSourceCancelCalls: () => fullSourceCancelCalls,
+    fullSourceWaiting
   };
 }
+
+test('production full-source publishes VERIFIED and restores formal evidence without another initial call', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true, failCoverageRefreshAfterFormalOnce: true });
+  await h.runtime.startup();
+  const first = await h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.equal(first.state, 'FAILED', first.lastError?.message);
+  await h.runtime.flush();
+  const cpFile = join(h.storageDirectory, 'class-task-checkpoints-v2.json');
+  let cp = JSON.parse(await readFile(cpFile, 'utf8')).tasks[TASK_ID];
+  assert.equal(cp.fullSource.publication.phase, 'VERIFIED');
+  assert.equal(cp.fullSource.managedFile.location, 'ISOLATED');
+  const completed = await h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  assert.equal(completed.state, 'COMPLETED', completed.lastError?.message);
+  assert.equal(completed.executionMode, 'FULL_SOURCE');
+  assert.equal(h.fullSourceInitialCalls(), 1);
+  assert.deepEqual(h.analyzerCalls.map(c => c.kind), ['full-source']);
+  assert.equal(h.waveStreamCalls.length, 0);
+  assert.equal(completed.generatedArtifacts.length, 1);
+  await h.runtime.flush();
+  cp = JSON.parse(await readFile(cpFile, 'utf8')).tasks[TASK_ID];
+  assert.deepEqual(cp.completedMethodIds, [h.methodId]);
+  assert.equal(cp.fullSource.methodOutcomes[0].passedTestNames[0], 'm1_generated');
+});
+
+test('a locked old XML cleanup does not report a committed acceptance as failed', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  h.runtimeOptions.jacocoArtifactsService.discardTaskResultCoverageRollback = async () => {
+    throw Object.assign(new Error('fixture old XML locked'), { code: 'EBUSY' });
+  };
+  const accepted = await h.runtime.acceptTaskResult(request);
+  assert.equal(accepted.artifacts[0].accepted, true);
+  assert.equal(accepted.canRevoke, false);
+  await access(h.formalFilePath);
+});
+
+for (const fullSource of [false, true]) {
+  test(`revoke restores retained coverage and its method catalog without new analysis (${fullSource ? 'full source' : 'Wave'})`, async t => {
+    const h = await productionWaveRuntimeHarness(t, { fullSource });
+    h.releaseWave.resolve();
+    h.releaseTmpDelete.resolve();
+    await h.runtime.startup();
+    const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+    const baselineCatalog = await h.runtime.getClassTaskMethods(request);
+    const artifacts = h.runtimeOptions.jacocoArtifactsService;
+    let retained = null;
+    let restored = 0;
+    let discarded = 0;
+    artifacts.retainTaskResultCoverage = async (_root, _taskId, input) => {
+      retained ??= { coverage: structuredClone(input.coverage), catalog: structuredClone(input.catalog),
+        pair: { reportPath: 'baseline.xml', branchSnapshotPath: 'baseline.branches.json', pairId: input.catalog.reportPairId } };
+    };
+    artifacts.readTaskResultCoverageRollback = async () => retained;
+    artifacts.restoreTaskResultCoverage = async () => { restored += 1; return retained; };
+    artifacts.discardTaskResultCoverageRollback = async () => { discarded += 1; retained = null; };
+    assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+    assert.ok(retained, 'retain the old report before replacing formal coverage');
+    const analysisCount = h.analysisSessionCreationCount();
+    const revoked = await h.runtime.revokeTaskResult(request);
+    assert.equal(restored, 1);
+    assert.equal(discarded, 1);
+    assert.deepEqual(revoked.restoredMethodCatalog.methods, baselineCatalog.methods);
+    assert.deepEqual(revoked.coverageCurrent, revoked.coverageBaseline);
+    assert.equal(revoked.artifacts.length, 0);
+    assert.deepEqual((await h.runtime.getClassTaskMethods(request)).methods, baselineCatalog.methods);
+    assert.equal(h.analysisSessionCreationCount(), analysisCount);
+    await assert.rejects(access(h.formalFilePath), { code: 'ENOENT' });
+    const compiledDirectory = join(h.moduleRoot, 'target', 'classes', 'example');
+    await mkdir(compiledDirectory, { recursive: true });
+    await writeFile(join(compiledDirectory, 'Task.class'), 'fixture compiled-file presence');
+    let mavenCalls = 0;
+    for (const name of ['runMavenCompile', 'runMavenModuleTestsWithJacoco', 'runMavenDirectTestsWithJacoco']) {
+      const run = h.runtimeOptions.shellService[name];
+      h.runtimeOptions.shellService[name] = async (...args) => { mavenCalls += 1; return run(...args); };
+    }
+    for (let count = 1; count <= 2; count += 1) {
+      await h.runtime.getClassTaskMethods({ ...request, forceReload: true });
+      assert.equal(mavenCalls, count, 'each manual refresh must execute Maven even after restoring retained coverage');
+    }
+  });
+}
+
+test('each forced refresh of a pending result reruns Maven and keeps its rollback baseline', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true, trackCoverageFromMaven: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  const before = await h.runtime.getTaskResult(request);
+  const compiledDirectory = join(h.moduleRoot, 'target', 'classes', 'example');
+  await mkdir(compiledDirectory, { recursive: true });
+  await writeFile(join(compiledDirectory, 'Task.class'), 'fixture compiled-file presence');
+  let baselineRuns = 0, pendingRuns = 0;
+  for (const name of ['runMavenCompile', 'runMavenModuleTestsWithJacoco', 'runMavenDirectTestsWithJacoco']) {
+    const run = h.runtimeOptions.shellService[name];
+    h.runtimeOptions.shellService[name] = async (...args) => { baselineRuns += 1; return run(...args); };
+  }
+  const append = h.runtimeOptions.shellService.runMavenDirectTestsWithJacocoAppend;
+  h.runtimeOptions.shellService.runMavenDirectTestsWithJacocoAppend = async (...args) => {
+    pendingRuns += 1; return append(...args);
+  };
+  for (let count = 1; count <= 2; count += 1) {
+    await h.runtime.getClassTaskMethods({ ...request, forceReload: true });
+    assert.equal(baselineRuns, count, 'do not reuse the persisted preload XML during a manual refresh');
+    assert.equal(pendingRuns, count, 'rerun pending formal tests instead of restoring an earlier current XML');
+    const after = await h.runtime.getTaskResult(request);
+    assert.deepEqual(after.coverageBaseline, before.coverageBaseline);
+    assert.deepEqual(after.coverageCurrent, before.coverageCurrent);
+    assert.equal(after.canRevoke, true);
+  }
+});
+
+test('a revoked full-source publication is reset through the normal checkpoint API before a fresh run', async t => {
+  const fixture=await completedResultFileFixture(t);
+  const coordinator=fixture.runtime.coordinator;
+  const registry=coordinator.dependencies.registry;
+  const state=registry.snapshot(TASK_ID);
+  await registry.save({...state,state:'READY',generatedArtifacts:[],coverageContributions:[],coveredMethodIds:[]});
+  const checkpoints=coordinator.dependencies.checkpoints;
+  const full=checkpoints.fullSourceProgress,prepare=checkpoints.prepareRun;
+  let resets=0;
+  checkpoints.fullSourceProgress=async()=>({publication:{phase:'VERIFIED',formalPath:fixture.testFilePath,formalSha256:'a'.repeat(64)}});
+  checkpoints.prepareRun=async(id,options)=>{assert.equal(id,TASK_ID);assert.equal(options.reset,true);
+    assert.equal(options.preserveModelUsage,true);resets++;};
+  t.after(()=>{checkpoints.fullSourceProgress=full;checkpoints.prepareRun=prepare;});
+  await coordinator.reconcileRevokedFullSourceRun(TASK_ID);
+  assert.equal(resets,0,'an existing formal file must not trigger a fresh generation');
+  await rm(fixture.testFilePath);
+  await coordinator.reconcileRevokedFullSourceRun(TASK_ID);
+  assert.equal(resets,1);
+  await registry.save({...registry.snapshot(TASK_ID),state:'RUNNING'});
+  await coordinator.reconcileRevokedFullSourceRun(TASK_ID);
+  assert.equal(resets,1,'an active task must retain its checkpoint');
+});
+
+test('a failed exhausted full-source task resumes retained finalization instead of resetting its model budget', async t => {
+  const fixture = await completedResultFileFixture(t, 'FAILED');
+  const coordinator = fixture.runtime.coordinator, registry = coordinator.dependencies.registry;
+  const current = registry.snapshot(TASK_ID);
+  await registry.save({...current, generatedArtifacts: [], coverageContributions: []});
+  await registry.saveSelection(TASK_ID, 'EXPLICIT', ['method-id'], ['method-id'], false, 6, false);
+  await registry.save({ ...current, generatedArtifacts: [], coverageContributions: [], repairAttemptLimit: 6, unlimitedRepair: false,
+    lastError: { code: 'NO_FORMAL_TEST_FILE_GENERATED', message: 'no file', moduleName: current.qualifiedClassName,
+      modulePath: current.moduleDisplayPath, command: null, occurredAt: '2026-10-07T00:00:00.000Z' } });
+  const hash = data => createHash('sha256').update(data).digest('hex');
+  const full = { completion: { stopReason: 'repair_exhausted', bestCandidateId: 'candidate' },
+    lastValidCandidate: { candidateId: 'candidate', generatedCodeSha256: hash(await readFile(fixture.testFilePath)) },
+    managedFile: { path: fixture.testFilePath, sha256: hash(await readFile(fixture.testFilePath)) },
+    batch: { facts: { sourceSha256: hash(await readFile(current.sourceFilePath)) } }, publication: null };
+  coordinator.dependencies.checkpoints.fullSourceProgress = async () => full;
+  assert.equal(await coordinator.canContinueFullSourceFinalization(TASK_ID), true);
+  coordinator.refreshFailedRunIfStale = async () => ({ refreshed: false, preserveCheckpoint: false });
+  coordinator.restart = async () => { throw Error('must not reset a usable exhausted candidate'); };
+  let options;
+  fixture.runtime.scheduler.runTask = async (_id, value) => { options = value; return registry.snapshot(TASK_ID); };
+  await fixture.runtime.runTask({ workspaceRoot: current.workspaceRoot, taskId: TASK_ID });
+  assert.deepEqual(options, { preserveCheckpoint: true });
+  await registry.save({ ...registry.snapshot(TASK_ID), state: 'RUNNING' });
+  assert.equal(await coordinator.canContinueFullSourceFinalization(TASK_ID), false);
+});
+
+test('production full-source termination cancels the known session and preserves isolated source', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true, stallFullSourceAfterCandidate: true });
+  await h.runtime.startup();
+  const running = h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  await h.fullSourceWaiting.promise;
+  await h.runtime.terminateTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  await running; await h.runtime.flush();
+  const cp = JSON.parse(await readFile(join(h.storageDirectory, 'class-task-checkpoints-v2.json'), 'utf8')).tasks[TASK_ID];
+  assert.equal(h.fullSourceCancelCalls(), 1);
+  assert.equal(cp.fullSource.managedFile.location, 'ISOLATED');
+  assert.match(await readFile(cp.fullSource.managedFile.path, 'utf8'), /target.run\(\)/);
+  const checkpoints = h.runtime.coordinator.dependencies.checkpoints;
+  const file = cp.fullSource.managedFile;
+  const code = await readFile(file.path, 'utf8') + '\n// journaled replacement\n';
+  const sha256 = createHash('sha256').update(code).digest('hex');
+  await checkpoints.saveFullSourceProgress(TASK_ID, { ...cp.fullSource, execution: null, moveTransaction: null,
+    pendingReplacement: { originalSha256: file.sha256, replacementSha256: sha256, code } });
+  await writeFile(file.path, code);
+  const restored = createProductionClassTaskRuntime(h.runtimeOptions);
+  t.after(() => restored.beforeQuit());
+  await restored.startup();
+  const recovered = await restored.coordinator.dependencies.checkpoints.fullSourceProgress(TASK_ID);
+  assert.equal(recovered.pendingReplacement, null);
+  assert.equal(recovered.managedFile.sha256, sha256);
+  assert.equal(h.fullSourceInitialCalls(), 1);
+});
+
+test('production full-source release surfaces isolation errors while preserving stored evidence', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  await h.runtime.runTask({ workspaceRoot: h.workspaceRoot, taskId: TASK_ID });
+  const coordinator = h.runtime.coordinator, original = coordinator.isolateFullSourceCandidate;
+  coordinator.isolateFullSourceCandidate = async () => { throw new Error('fixture isolation failed'); };
+  try {
+    await assert.rejects(coordinator.releaseRun(TASK_ID), error => error instanceof AggregateError
+      && error.errors.some(cause => /fixture isolation failed/.test(cause.message)));
+  } finally { coordinator.isolateFullSourceCandidate = original; }
+  const checkpoint = await coordinator.dependencies.checkpoints.fullSourceProgress(TASK_ID);
+  assert.equal(checkpoint.publication.phase, 'VERIFIED');
+});
+
+test('revoke then execute keeps the catalog waiter when Node wraps the old analysis cancellation in AbortError', async t => {
+  const h = await productionWaveRuntimeHarness(t);
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  const firstRun = h.runtime.runTask(request);
+  await h.waveStarted.promise;
+  h.releaseWave.resolve();
+  await h.tmpDeleteStarted.promise;
+  h.releaseTmpDelete.resolve();
+  assert.equal((await firstRun).state, 'COMPLETED');
+  await h.runtime.revokeTaskResult(request);
+
+  const context = h.runtime.coordinator.dependencies.options.mavenAnalysisContextService;
+  const originalCollect = context.collect.bind(context);
+  const analysisStarted = runtimeDeferred();
+  let collectCalls = 0;
+  let wrappedCancellation;
+  context.collect = async input => {
+    if (++collectCalls === 1) {
+      await new Promise((resolve, reject) => {
+        const child = execFile(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+          { signal: input.signal }, error => {
+            wrappedCancellation = error;
+            error ? reject(error) : resolve();
+          });
+        child.once('spawn', () => analysisStarted.resolve());
+      });
+    }
+    return originalCollect(input);
+  };
+  const waiting = h.runtime.getClassTaskMethods({ ...request, forceReload: true }).then(
+    value => ({ status: 'fulfilled', value }), reason => ({ status: 'rejected', reason })
+  );
+  await analysisStarted.promise;
+  const nextRun = h.runtime.runTask(request);
+  const [catalog, finished] = await Promise.all([waiting, nextRun]);
+  assert.equal(wrappedCancellation.name, 'AbortError');
+  assert.equal(wrappedCancellation.code, 'ABORT_ERR');
+  assert.equal(wrappedCancellation.cause.name, 'ModulePreloadRetriedError');
+  assert.equal(catalog.status, 'fulfilled', catalog.reason?.stack);
+  assert.equal(catalog.value.taskId, TASK_ID);
+  assert.equal(catalog.value.methods[0].methodId, h.methodId);
+  assert.equal(collectCalls, 2, 'follow the replacement preparation without repeated resets');
+  assert.equal(finished.state, 'COMPLETED', finished.lastError?.message);
+});
+
+test('an internal preparation replacement follows the new catalog when ShellService loses the abort cause', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  await h.runtime.revokeTaskResult(request);
+  const context = h.runtimeOptions.mavenAnalysisContextService;
+  const originalCollect = context.collect.bind(context);
+  const analysisStarted = runtimeDeferred();
+  const shell = new ShellService();
+  let collectCalls = 0;
+  let cancellation;
+  context.collect = async input => {
+    if (++collectCalls === 1) {
+      const command = shell.runCommand(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+        h.workspaceRoot, await h.runtimeOptions.buildSettingsService.get(), { signal: input.signal });
+      analysisStarted.resolve();
+      try { await command; } catch (error) { cancellation = error; throw error; }
+    }
+    return originalCollect(input);
+  };
+  const waiting = h.runtime.getClassTaskMethods({ ...request, forceReload: true }).then(
+    value => ({ value }), error => ({ error })
+  );
+  await analysisStarted.promise;
+  const [catalog, finished] = await Promise.all([waiting, h.runtime.runTask(request)]);
+  assert.ok(cancellation instanceof CommandCancelledError);
+  assert.equal(cancellation.cause, undefined);
+  assert.equal(catalog.error, undefined, catalog.error?.stack);
+  assert.equal(catalog.value.methods[0].methodId, h.methodId);
+  assert.equal(collectCalls, 2);
+  assert.equal(finished.state, 'COMPLETED', finished.lastError?.message);
+});
+
+test('a user stopping analysis propagates Node AbortError without starting a replacement preparation', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  const context = h.runtimeOptions.mavenAnalysisContextService;
+  const analysisStarted = runtimeDeferred();
+  let collectCalls = 0;
+  context.collect = async input => {
+    collectCalls++;
+    await new Promise((resolve, reject) => {
+      const child = execFile(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+        { signal: input.signal }, error => error ? reject(error) : resolve());
+      child.once('spawn', () => analysisStarted.resolve());
+    });
+    throw new Error('stopped analysis must not continue');
+  };
+  const waiting = h.runtime.getClassTaskMethods({ ...request, forceReload: true }).then(
+    value => ({ value }), error => ({ error })
+  );
+  await analysisStarted.promise;
+  await h.runtime.coordinator.stopClassPreload(TASK_ID);
+  const catalog = await waiting;
+  assert.equal(catalog.error?.name, 'AbortError');
+  assert.equal(catalog.error?.cause?.name, 'ModulePreloadStoppedError');
+  assert.equal(collectCalls, 1);
+  assert.equal(h.fullSourceInitialCalls(), 1, 'stopping analysis must not run the task');
+});
+
+test('a cancelled catalog waiter stays cancelled when its old preparation is internally replaced', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  await h.runtime.revokeTaskResult(request);
+  const context = h.runtimeOptions.mavenAnalysisContextService;
+  const originalCollect = context.collect.bind(context);
+  const analysisStarted = runtimeDeferred();
+  const waiter = new AbortController();
+  const userCancellation = new Error('method pane was closed');
+  let collectCalls = 0;
+  context.collect = async input => {
+    if (++collectCalls === 1) {
+      await new Promise((resolve, reject) => {
+        const child = execFile(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+          { signal: input.signal }, error => error ? reject(error) : resolve());
+        input.signal.addEventListener('abort', () => waiter.abort(userCancellation), { once: true });
+        child.once('spawn', () => analysisStarted.resolve());
+      });
+    }
+    return originalCollect(input);
+  };
+  const waiting = h.runtime.coordinator.prepare(TASK_ID, waiter.signal, { forceReload: true }).then(
+    value => ({ value }), error => ({ error })
+  );
+  await analysisStarted.promise;
+  const [catalog, finished] = await Promise.all([waiting, h.runtime.runTask(request)]);
+  assert.equal(catalog.error, userCancellation);
+  assert.equal(collectCalls, 2, 'only the new run should prepare the catalog');
+  assert.equal(finished.state, 'COMPLETED', finished.lastError?.message);
+});
+
+test('a running task rejects a forced catalog reset but shares its prepared catalog safely', async t => {
+  const h = await productionWaveRuntimeHarness(t);
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  const running = h.runtime.runTask(request);
+  await h.waveStarted.promise;
+  try {
+    const analyzerCallCount = h.analyzerCalls.length;
+    const compileCallCount = h.candidateMavenCompileCalls();
+    await assert.rejects(h.runtime.getClassTaskMethods({ ...request, forceReload: true }),
+      /当前类任务正在运行，暂时无法刷新方法与覆盖率信息/);
+    const sharedCatalog = await h.runtime.getClassTaskMethods(request);
+    assert.equal(sharedCatalog.taskId, TASK_ID);
+    assert.equal(sharedCatalog.methods[0].methodId, h.methodId);
+    assert.equal(h.analyzerCalls.length, analyzerCallCount, 'reading must reuse the task preparation');
+    assert.equal(h.candidateMavenCompileCalls(), compileCallCount);
+    const [task] = await h.runtime.listClassTasks({ workspaceRoot: h.workspaceRoot });
+    assert.equal(task.state, 'RUNNING');
+  } finally {
+    h.releaseWave.resolve();
+    await h.tmpDeleteStarted.promise;
+    h.releaseTmpDelete.resolve();
+    await running;
+  }
+});
+
+test('revoking a completed result cancels its pending catalog analysis before a new run takes ownership', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  const context = h.runtimeOptions.mavenAnalysisContextService;
+  const originalCollect = context.collect.bind(context);
+  const analysisStarted = runtimeDeferred();
+  let collectCalls = 0;
+  let oldSignal;
+  context.collect = async input => {
+    if (++collectCalls === 1) {
+      oldSignal = input.signal;
+      await new Promise((resolve, reject) => {
+        const child = execFile(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+          { signal: input.signal }, error => error ? reject(error) : resolve());
+        child.once('spawn', () => analysisStarted.resolve());
+      });
+    }
+    return originalCollect(input);
+  };
+  const waiting = h.runtime.getClassTaskMethods({ ...request, forceReload: true }).then(
+    value => ({ value }), error => ({ error })
+  );
+  await analysisStarted.promise;
+  const oldPreparation = h.runtime.coordinator.resources.get(TASK_ID).preparation;
+  try {
+    await h.runtime.revokeTaskResult(request);
+    assert.equal(oldSignal.aborted, true, 'revoke must not abandon a running analysis controller');
+    assert.equal(oldSignal.reason.name, 'ModulePreloadRetriedError');
+    const [catalog, finished] = await Promise.all([waiting, h.runtime.runTask(request)]);
+    assert.equal(catalog.error, undefined, catalog.error?.stack);
+    assert.equal(catalog.value.methods[0].methodId, h.methodId);
+    assert.equal(finished.state, 'COMPLETED', finished.lastError?.message);
+    assert.equal(h.fullSourceInitialCalls(), 2);
+  } finally {
+    oldPreparation.controller.abort(new Error('test cleanup of old analysis'));
+    await waiting;
+  }
+});
+
+test('cancelling a preparation that restored JaCoCo removes its effective restored context before the replacement runs', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  const coordinator = h.runtime.coordinator;
+  const task = coordinator.dependencies.registry.snapshot(TASK_ID);
+  const artifacts = h.runtimeOptions.jacocoArtifactsService;
+  const readPair = artifacts.readValidatedPair.bind(artifacts);
+  artifacts.readValidatedPair = async (target, paths, pairId) => {
+    const pair = await readPair(target, paths, pairId);
+    return paths.reportPath.endsWith('baseline-jacoco.xml') ? { ...pair, pairId: '9'.repeat(64) } : pair;
+  };
+  artifacts.taskVersionPairs = async () => [{ reportPath: 'retained-version.xml',
+    branchSnapshotPath: 'retained-version.branches.json', pairId: h.reportPairId }];
+  artifacts.readCoverageSnapshot = async (moduleRoot, pair) => artifacts.readExactCoverageSnapshot(moduleRoot, pair, task.coverageCurrent);
+  const jacoco = coordinator.dependencies.jacoco;
+  const tryRestore = jacoco.tryRestoreCurrent.bind(jacoco);
+  let restoredContext;
+  jacoco.tryRestoreCurrent = async (...args) => {
+    const result = await tryRestore(...args);
+    if (result) restoredContext = result.context;
+    return result;
+  };
+  const persisted = runtimeDeferred();
+  const persistCoverage = coordinator.persistCoverage.bind(coordinator);
+  let blocked = false;
+  coordinator.persistCoverage = async (...args) => {
+    await persistCoverage(...args);
+    if (restoredContext && !blocked) {
+      blocked = true;
+      persisted.resolve();
+      const signal = coordinator.resources.get(TASK_ID).preparation.controller.signal;
+      await waitForReleaseOrAbort(new Promise(() => {}), signal);
+    }
+  };
+  // Reopening can restore durable JaCoCo; a manual force refresh now intentionally
+  // reruns Maven, so exercise the ordinary reopen path for this cancellation race.
+  await coordinator.resetPrepared(coordinator.resources.get(TASK_ID));
+  const waiting = h.runtime.getClassTaskMethods(request).then(
+    value => ({ value }), error => ({ error })
+  );
+  await persisted.promise;
+  assert.equal(restoredContext.baselinePair.pairId, '9'.repeat(64));
+  await h.runtime.revokeTaskResult(request);
+  const [catalog, finished] = await Promise.all([waiting, h.runtime.runTask(request)]);
+  assert.equal(catalog.error, undefined, catalog.error?.stack);
+  assert.equal(catalog.value.methods[0].methodId, h.methodId);
+  assert.equal(finished.state, 'COMPLETED', finished.lastError?.message);
+});
+
+test('reset ownership prevents a new preparation escaping a draining reset', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  await h.runtime.revokeTaskResult(request);
+  const coordinator = h.runtime.coordinator;
+  const resources = coordinator.resources.get(TASK_ID);
+  const resetEntered = runtimeDeferred(), releaseReset = runtimeDeferred();
+  const oldEntered = runtimeDeferred(), releaseOld = runtimeDeferred();
+  const newEntered = runtimeDeferred(), releaseNew = runtimeDeferred();
+  const finish = resources.logs.finish.bind(resources.logs);
+  resources.logs.finish = async () => { resetEntered.resolve(); await releaseReset.promise; return finish(); };
+  const collect = h.runtimeOptions.mavenAnalysisContextService.collect.bind(h.runtimeOptions.mavenAnalysisContextService);
+  let calls = 0;
+  h.runtimeOptions.mavenAnalysisContextService.collect = async input => {
+    if (++calls === 1) { oldEntered.resolve(); await releaseOld.promise; }
+    return collect(input);
+  };
+  const prepareTask = coordinator.prepareTask.bind(coordinator);
+  let prepareCalls = 0;
+  coordinator.prepareTask = async (...args) => {
+    if (++prepareCalls === 2) { newEntered.resolve(); await releaseNew.promise; }
+    return prepareTask(...args);
+  };
+  const resetting = coordinator.resetPrepared(resources);
+  await resetEntered.promise;
+  const waiting = coordinator.prepare(TASK_ID).then(value => ({ value }), error => ({ error }));
+  const escaped = await Promise.race([oldEntered.promise.then(() => true), new Promise(resolve => setTimeout(() => resolve(false), 200))]);
+  releaseReset.resolve();
+  await resetting;
+  if (escaped) {
+    const replacement = coordinator.prepare(TASK_ID).then(value => ({ value }), error => ({ error }));
+    await newEntered.promise;
+    releaseOld.resolve(); await waiting;
+    releaseNew.resolve();
+    const replaced = await replacement;
+    assert.equal(replaced.error, undefined, replaced.error?.stack);
+  } else {
+    releaseOld.resolve(); releaseNew.resolve();
+    const catalog = await waiting;
+    assert.equal(catalog.error, undefined, catalog.error?.stack);
+    assert.equal(catalog.value.methods[0].methodId, h.methodId);
+    const finished = await h.runtime.runTask(request);
+    assert.equal(finished.state, 'COMPLETED', finished.lastError?.message);
+  }
+  assert.equal(escaped, false, 'a new analysis must wait until the existing reset drains');
+});
+
+for (const operation of ['resets', 'restarts']) {
+  test(`queued lifecycle ${operation} remain serial with three simultaneous requests`, async t => {
+    const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+    await h.runtime.startup();
+    const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+    assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+    await h.runtime.revokeTaskResult(request);
+    const coordinator = h.runtime.coordinator, resources = coordinator.resources.get(TASK_ID);
+    const firstEntered = runtimeDeferred(), secondEntered = runtimeDeferred();
+    const releaseFirst = runtimeDeferred(), releaseTail = runtimeDeferred();
+    const method = operation === 'resets' ? 'doResetPrepared' : 'restartNow';
+    const original = coordinator[method].bind(coordinator);
+    let count = 0, active = 0, maximumActive = 0;
+    const order = [];
+    coordinator[method] = async (...args) => {
+      const ordinal = ++count;
+      maximumActive = Math.max(maximumActive, ++active);
+      order.push(`start:${ordinal}`);
+      try {
+        if (ordinal === 1) { firstEntered.resolve(); await releaseFirst.promise; }
+        else { secondEntered.resolve(); await releaseTail.promise; }
+        return await original(...args);
+      } finally { active--; order.push(`finish:${ordinal}`); }
+    };
+    const start = () => operation === 'resets' ? coordinator.resetPrepared(resources) : coordinator.restart(TASK_ID);
+    const first = start(); await firstEntered.promise;
+    const second = start(), third = start();
+    releaseFirst.resolve(); await secondEntered.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    releaseTail.resolve();
+    await Promise.all([first, second, third]);
+    assert.equal(maximumActive, 1, 'cleanup owners must never overlap');
+    assert.deepEqual(order, ['start:1', 'finish:1', 'start:2', 'finish:2', 'start:3', 'finish:3']);
+    assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  });
+}
+
+test('closing a catalog waiter during a lifecycle reset does not start a new analysis', async t => {
+  const h = await productionWaveRuntimeHarness(t, { fullSource: true });
+  await h.runtime.startup();
+  const request = { workspaceRoot: h.workspaceRoot, taskId: TASK_ID };
+  assert.equal((await h.runtime.runTask(request)).state, 'COMPLETED');
+  await h.runtime.revokeTaskResult(request);
+  const coordinator = h.runtime.coordinator, resources = coordinator.resources.get(TASK_ID);
+  const entered = runtimeDeferred(), release = runtimeDeferred();
+  const finish = resources.logs.finish.bind(resources.logs);
+  resources.logs.finish = async () => { entered.resolve(); await release.promise; return finish(); };
+  const collect = h.runtimeOptions.mavenAnalysisContextService.collect.bind(h.runtimeOptions.mavenAnalysisContextService);
+  let newAnalysisCount = 0;
+  h.runtimeOptions.mavenAnalysisContextService.collect = async input => { newAnalysisCount++; return collect(input); };
+  const resetting = coordinator.resetPrepared(resources); await entered.promise;
+  const controller = new AbortController(), reason = new Error('method pane was closed');
+  const waiting = coordinator.prepare(TASK_ID, controller.signal).then(value => ({ value }), error => ({ error }));
+  controller.abort(reason);
+  assert.equal((await waiting).error, reason);
+  await new Promise(resolve => setImmediate(resolve));
+  release.resolve(); await resetting;
+  assert.equal(newAnalysisCount, 0, 'a cancelled waiter cannot create a preparation while cleanup is pending');
+});
 
 function runtimeDeferred() {
   let resolve;
@@ -6078,6 +7515,11 @@ function restoredPackerJacocoArtifacts(defaultPairId) {
     pairId
   });
   return {
+    async retainTaskResultCoverage() {},
+    async readTaskResultCoverageRollback() { return null; },
+    async restoreTaskResultCoverage() { return null; },
+    async discardTaskResultCoverageRollback() {},
+    async checkpointTaskBaseline() { return structuredClone(currentPair); },
     paths(moduleRoot) {
       return { targetDirectory: join(moduleRoot, 'target') };
     },

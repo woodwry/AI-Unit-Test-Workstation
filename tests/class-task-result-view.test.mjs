@@ -11,6 +11,17 @@ const {
 
 const HASH_METHOD_ID = '8a488352b060712f5a4f6a5cfc535e1c68fdd8a3bb78d2abb15a186d44cdb7a1';
 
+test('a pending READY result uses retained result counts instead of the next selection', () => {
+  const result = resultSnapshot({state: 'READY', artifacts: [artifact({ordinaryTestMethodCount: 13})],
+    generatedMethods: Array.from({length: 3}, (_, index) => generatedMethod({methodId: `old-${index}`}))});
+  const progress = buildClassTaskResultProgress({state: 'READY', methodOrder: ['next'],
+    coveredMethodIds: [], currentMethodIndex: -1}, result, buildClassTaskResultSummary(result));
+  assert.equal(progress.heading, '已有结果待处理');
+  assert.equal(progress.methodCountLabel, '3 个已有结果');
+  assert.equal(progress.totalMethodCount, 3);
+  assert.equal(progress.description, '已保留 3 个方法的结果、13 条测试记录，请先接受或撤回。');
+});
+
 test('running result overview shows completed progress before staged method results', () => {
   const result = resultSnapshot({
     state: 'RUNNING',

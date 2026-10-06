@@ -1,6 +1,5 @@
 import {
   Crosshair,
-  FileText,
   LoaderCircle,
   Pause,
   Play,
@@ -39,7 +38,6 @@ type ClassTaskCardProps = {
 
 const ACTION_TITLES: Record<ClassTaskCardAction, string> = {
   run: '执行当前类',
-  result: '查看并处理结果',
   spinner: '任务处理中',
   pause: '暂停当前类',
   resume: '继续当前类',
@@ -384,8 +382,6 @@ function ActionIcon({ action }: { action: Exclude<ClassTaskCardAction, 'spinner'
     case 'run':
     case 'resume':
       return <Play size={16} fill="currentColor" aria-hidden="true" />;
-    case 'result':
-      return <FileText size={16} aria-hidden="true" />;
     case 'pause':
       return <Pause size={16} fill="currentColor" aria-hidden="true" />;
     case 'terminate':

@@ -1,4 +1,5 @@
 import type { BuildToolchainSettings } from '../../shared/types.ts';
+import type { CandidateExecutionFeedback } from './method-generation-contract.ts';
 import type {
   MavenBatchCandidateExecutionFeedback,
   MavenCandidateExecutorService
@@ -31,6 +32,7 @@ export type FormalTestVerificationCandidate = {
   ordinaryTestMethodCount: number;
   excludedEnvironmentVariables?: readonly string[];
   signal?: AbortSignal;
+  onVerified?: (execution: CandidateExecutionFeedback) => Promise<void>;
 };
 
 export type FormalTestVerificationQueue = Pick<
@@ -149,6 +151,8 @@ export class ModuleFormalTestVerificationQueueService {
             }
             try {
               assertFormalVerificationPassed(item.candidate, result);
+              if (result.status === 'passed') await item.candidate.onVerified?.({ status: result.status,
+                mavenExecutions: result.mavenExecutions, ...(result.testReport ? { testReport: result.testReport } : {}) });
               item.resolve();
             } catch (error) {
               item.reject(error);

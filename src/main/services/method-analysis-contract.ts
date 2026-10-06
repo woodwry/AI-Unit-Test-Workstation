@@ -745,7 +745,7 @@ function validateScenario(value: unknown, methodId: string): ScenarioPlan {
   return item as ScenarioPlan;
 }
 
-function validateInvocationPlan(value: unknown): InvocationPlan {
+export function validateInvocationPlan(value: unknown): InvocationPlan {
   const item = record(value, [
     'strategy', 'receiverExpression', 'reflectionMethodName',
     'parameterClassLiterals', 'staticMethod', 'returnType', 'declaredExceptions',
@@ -978,7 +978,7 @@ function validateDependencyFixture(value: unknown): DependencyFixture {
   return item as DependencyFixture;
 }
 
-function validateFixturePlan(value: unknown): TargetFixturePlan {
+export function validateFixturePlan(value: unknown): TargetFixturePlan {
   const item = record(value, [
     'targetClass', 'targetVariableName', 'targetClassDeclaration',
     'dependencySourceDeclarations', 'constructionMode', 'constructorParameterTypes',
@@ -1000,7 +1000,7 @@ function validateFixturePlan(value: unknown): TargetFixturePlan {
   return item as TargetFixturePlan;
 }
 
-function validateReferencedType(value: unknown): ReferencedTypeApi {
+export function validateReferencedType(value: unknown): ReferencedTypeApi {
   const hasMethodContracts = value !== null && typeof value === 'object'
     && Object.prototype.hasOwnProperty.call(value, 'methodContracts');
   const item = record(value, [

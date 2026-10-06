@@ -9,11 +9,23 @@ import {
   runTrustedBackendSettingsAction,
   validateBackendSettingsSaveRequest,
   validateCreateModelInterfaceRequest,
+  validateModelInterfaceConnectionTestRequest,
   validateRagEmbeddingInterfaceConnectionTestRequest,
   validateSaveWorkstationBuildSettingsRequest,
   validateWorkstationBuildSettingsPathKind,
   validateWorkstationMavenHome
 } from '../src/main/services/workspace-model-ipc-validation.ts';
+
+test('模型连接测试 IPC 保留高级参数，同时禁止覆盖系统字段', () => {
+  const request = { interfaceId: 'existing', baseUrl: 'https://models.example.test/v1',
+    model: 'configured-model', credentialMode: 'direct',
+    requestParameters: { thinking: { type: 'enabled' }, max_tokens: 256000 } };
+  assert.deepEqual(validateModelInterfaceConnectionTestRequest(request), request);
+  for (const field of ['model', 'stream', 'messages', 'authorization']) {
+    assert.throws(() => validateModelInterfaceConnectionTestRequest({ ...request,
+      requestParameters: { [field]: 'override' } }));
+  }
+});
 
 const rendererFile = 'D:\\AI UnitTest\\out\\renderer\\index.html';
 

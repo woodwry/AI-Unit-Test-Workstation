@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import test from 'node:test';
@@ -105,6 +105,30 @@ test('writes through a same-directory unique temp file and keeps a valid backup'
   assert.deepEqual(JSON.parse(await readFile(`${path}.bak`, 'utf8')), first);
   const files = await readdir(dirname(path));
   assert.deepEqual(files.sort(), [basename(path), `${basename(path)}.bak`].sort());
+});
+
+test('retries a transient Windows EPERM when publishing the main file', async (context) => {
+  const path = await makeStorePath(context);
+  let attempts = 0;
+  const store = new AtomicJsonStore(
+    path,
+    validateStore,
+    emptyStore,
+    undefined,
+    async (source, destination) => {
+      attempts += 1;
+      if (destination === path && attempts === 1) {
+        throw Object.assign(new Error('file is temporarily locked'), { code: 'EPERM' });
+      }
+      await rename(source, destination);
+    }
+  );
+  const value = { version: 1, workspaces: { recovered: { model: 'qwen' } } };
+
+  await store.write(value);
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), value);
 });
 
 test('serializes concurrent updates so fields are not lost', async (context) => {

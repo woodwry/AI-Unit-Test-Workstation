@@ -62,7 +62,8 @@ export const CLASS_TASK_CHANNELS = {
   revoke: 'class-task:revoke',
   retryModulePreload: 'module-preload:retry',
   stopModulePreload: 'module-preload:stop',
-  snapshotChanged: 'class-task:snapshot-changed'
+  snapshotChanged: 'class-task:snapshot-changed',
+  methodCatalogChanged: 'class-task:methods:changed'
 } as const;
 
 export type ExactCoverageCounts = {
@@ -119,6 +120,11 @@ export type ClassMethodCatalog = {
   refreshedAt: string;
 };
 
+export type ClassTaskMethodCatalogChangedEvent = {
+  workspaceRoot: string;
+  catalog: ClassMethodCatalog;
+};
+
 export type GeneratedClassTaskArtifact = {
   id: string;
   filePath: string;
@@ -139,6 +145,10 @@ export type GeneratedSourceMethodResult = {
   displaySignature: string;
   jacocoOrder: number;
   ordinaryTestMethodCount: number;
+  /** Present together for verified Wave publications; legacy artifacts omit both. */
+  waveIndex?: number;
+  sourceBatchIds?: string[];
+  fullSource?: { factsId: string; candidateId: string };
 };
 
 export type ClassTaskResultMethod = GeneratedSourceMethodResult & {
@@ -184,6 +194,7 @@ export type ClassTaskSnapshot = {
   state: ClassTaskState;
   preloadState: ModulePreloadState;
   ragEnabled: boolean;
+  executionMode?: 'LEGACY_WAVE' | 'FULL_SOURCE';
   repairAttemptLimit: number | null;
   unlimitedRepair: boolean;
   selectionMode: MethodSelectionMode;
@@ -209,11 +220,21 @@ export type ClassTaskSnapshot = {
   updatedAt: string;
 };
 
+export function canHandleClassTaskResult(state: ClassTaskState): boolean {
+  return state !== 'PRELOADING'
+    && state !== 'RUNNING'
+    && state !== 'PAUSE_REQUESTED'
+    && state !== 'PAUSED'
+    && state !== 'STOPPING';
+}
+
 export function hasPendingClassTaskResult(
   task: Pick<ClassTaskSnapshot, 'state' | 'generatedArtifacts'>
 ): boolean {
-  return (task.state === 'COMPLETED' || task.state === 'TERMINATED')
-    && task.generatedArtifacts.some((artifact) => !artifact.accepted);
+  return (task.state === 'READY' || task.state === 'COMPLETED' || task.state === 'TERMINATED')
+    && task.generatedArtifacts.some((artifact) => (
+      !artifact.accepted && artifact.ordinaryTestMethodCount !== 0
+    ));
 }
 
 export type ClassTaskResultSnapshot = {
@@ -222,11 +243,13 @@ export type ClassTaskResultSnapshot = {
   artifacts: GeneratedClassTaskArtifact[];
   generatedMethods: ClassTaskResultMethod[];
   allScenariosSkipped?: boolean;
+  /** Locally restored report/catalog; no fresh preload is needed after revoke. */
+  restoredMethodCatalog?: ClassMethodCatalog;
   tokenUsage: ModelTokenUsage | null;
   modelCallCount: number | null;
   usageReportedCallCount: number | null;
-  coverageBaseline: ExactCoverageCounts;
-  coverageCurrent: ExactCoverageCounts;
+  coverageBaseline: ExactCoverageCounts | null;
+  coverageCurrent: ExactCoverageCounts | null;
   coverageContributions: CoverageContribution[];
   canAccept: boolean;
   canRevoke: boolean;
@@ -298,5 +321,6 @@ export type ClassTaskAppApi = {
   retryModulePreload: (request: RetryModulePreloadRequest) => Promise<void>;
   stopModulePreload: (request: StopModulePreloadRequest) => Promise<void>;
   onClassTaskSnapshotChanged: (callback: (snapshot: ClassTaskSnapshot) => void) => () => void;
+  onClassTaskMethodCatalogChanged: (callback: (event: ClassTaskMethodCatalogChangedEvent) => void) => () => void;
   getPathForFile: (file: File) => string;
 };

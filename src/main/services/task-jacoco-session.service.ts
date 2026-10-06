@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { promises as fs } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { extractPublicMavenDiagnostic, sanitizePublicText } from './maven-command.ts';
+import { SurefireReportService } from './surefire-report.service.ts';
 import type {
   BuildToolchainSettings,
   CommandResult,
@@ -69,6 +72,7 @@ export type TaskJacocoSessionOptions = {
 };
 
 export type TaskJacocoRefreshResult = {
+  context: TaskJacocoSessionContext;
   pair: JacocoArtifactPair;
   coverage: CoverageIdentitySnapshot;
   catalog: RefreshMethodAnalysisCoverageResponse['catalog'];
@@ -91,6 +95,20 @@ type BuiltCoverageVersion = {
   coverage: CoverageIdentitySnapshot;
   catalog: RefreshMethodAnalysisCoverageResponse['catalog'];
 };
+
+export class TaskJacocoMavenError extends Error {
+  readonly code = 'TASK_JACOCO_MAVEN_FAILED';
+  readonly command: string;
+  readonly evidenceDirectory: string;
+
+  constructor(result: CommandResult, evidenceDirectory: string) {
+    const diagnostic = extractPublicMavenDiagnostic(result);
+    super(`Task JaCoCo Maven failed with exit code ${result.exitCode ?? 'unknown'}.\n${diagnostic.summary}\n执行证据：${evidenceDirectory}`);
+    this.name = 'TaskJacocoMavenError';
+    this.command = diagnostic.command;
+    this.evidenceDirectory = evidenceDirectory;
+  }
+}
 
 export class TaskJacocoSessionService {
   private readonly artifacts: JacocoArtifactsService;
@@ -164,6 +182,120 @@ export class TaskJacocoSessionService {
     );
   }
 
+  async tryRestoreCurrent(
+    contextValue: TaskJacocoSessionContext,
+    artifactValues: readonly GeneratedClassTaskArtifact[],
+    expectedCurrentCoverageValue: ExactCoverageCounts | null,
+    signal?: AbortSignal
+  ): Promise<TaskJacocoRefreshResult | null> {
+    if (!expectedCurrentCoverageValue) return null;
+    const context = validateContext(contextValue);
+    const artifacts = artifactValues.map(validateArtifact);
+    if (artifacts.length === 0) return null;
+    return this.moduleLock.runExclusive(
+      context.moduleKey,
+      async () => {
+        throwIfAborted(signal);
+        if (this.sessions.has(context.taskId)) return null;
+        const taskPaths = this.artifacts.taskSessionPaths(
+          context.moduleRoot,
+          context.taskId
+        );
+        let baselinePair: JacocoArtifactPair;
+        let currentPair: JacocoArtifactPair;
+        let versionPairs: JacocoArtifactPair[];
+        try {
+          baselinePair = await this.artifacts.readValidatedPair(
+            taskPaths.targetDirectory,
+            taskPaths.baseline
+          );
+          currentPair = await this.artifacts.readValidatedPair(
+            taskPaths.targetDirectory,
+            taskPaths.current
+          );
+          versionPairs = await this.artifacts.taskVersionPairs(
+            context.moduleRoot,
+            context.taskId
+          );
+        } catch {
+          return null;
+        }
+        if (versionPairs.length < artifacts.length) return null;
+        try {
+          const baseline = await this.artifacts.readExactCoverageSnapshot(
+            context.moduleRoot,
+            baselinePair,
+            context.baselineCoverage,
+            context.qualifiedClassName
+          );
+          const current = await this.artifacts.readExactCoverageSnapshot(
+            context.moduleRoot,
+            currentPair,
+            expectedCurrentCoverageValue,
+            context.qualifiedClassName
+          );
+          const artifactSnapshots = [] as CoverageIdentitySnapshot[];
+          for (const pair of versionPairs.slice(0, artifacts.length)) {
+            artifactSnapshots.push(await this.artifacts.readCoverageSnapshot(
+              context.moduleRoot,
+              pair,
+              context.qualifiedClassName
+            ));
+          }
+          const lastSnapshot = artifactSnapshots.at(-1);
+          if (!lastSnapshot || !sameCoverageCounts(lastSnapshot.counts, current.counts)) {
+            return null;
+          }
+          this.ledger.initialize(context.taskId, baseline);
+          const restored = this.ledger.replace(
+            context.taskId,
+            artifacts,
+            artifactSnapshots
+          );
+          if (!sameCoverageCounts(restored.current.counts, current.counts)) return null;
+          const refreshed = await this.analyzer.refreshMethodAnalysisCoverage(
+            context.analysisSessionId,
+            {
+              reportPath: currentPair.reportPath,
+              branchSnapshotPath: currentPair.branchSnapshotPath,
+              reportPairId: currentPair.pairId
+            },
+            signal
+          );
+          throwIfAborted(signal);
+          if (
+            refreshed.reportPairId !== currentPair.pairId
+            || refreshed.catalog.reportPairId !== currentPair.pairId
+            || refreshed.catalog.analysisSessionId !== context.analysisSessionId
+          ) {
+            return null;
+          }
+          const restoredContext = validateContext({
+            ...context,
+            baselinePair,
+            baselineCoverage: baseline.counts
+          });
+          this.sessions.set(context.taskId, {
+            context: restoredContext,
+            currentPair
+          });
+          return {
+            context: structuredClone(restoredContext),
+            pair: { ...currentPair },
+            coverage: this.ledger.current(context.taskId),
+            catalog: structuredClone(refreshed.catalog),
+            contributions: this.ledger.contributions(context.taskId)
+          };
+        } catch {
+          this.ledger.remove(context.taskId);
+          this.sessions.delete(context.taskId);
+          return null;
+        }
+      },
+      signal
+    );
+  }
+
   async refreshArtifact(
     contextValue: TaskJacocoSessionContext,
     artifactValue: GeneratedClassTaskArtifact,
@@ -195,6 +327,7 @@ export class TaskJacocoSessionService {
           );
           session.currentPair = currentPair;
           return {
+            context: structuredClone(session.context),
             pair: { ...currentPair },
             coverage: this.ledger.current(context.taskId),
             catalog: structuredClone(built.catalog),
@@ -314,6 +447,7 @@ export class TaskJacocoSessionService {
           session.currentPair = currentPair;
           const catalog = staged.at(-1)?.catalog ?? baselineCatalog!;
           return {
+            context: structuredClone(session.context),
             pair: { ...currentPair },
             coverage: this.ledger.current(context.taskId),
             catalog: structuredClone(catalog),
@@ -431,12 +565,14 @@ export class TaskJacocoSessionService {
     );
     let analyzerRefreshAttempted = false;
     try {
+      const reports = new SurefireReportService();
+      const reportDirectory = await reports.prepareAttempt(context.moduleRoot, version.versionId);
       const maven = await this.maven.runMavenDirectTestsWithJacocoAppend(
         context.moduleRoot,
         context.buildSettings,
         [qualifiedTestClassName(context.qualifiedClassName, artifact.testClassName)],
         version.executionDataPath,
-        version.surefireReportsDirectory,
+        reportDirectory,
         {
           signal,
           ...(context.excludedEnvironmentVariables
@@ -448,7 +584,34 @@ export class TaskJacocoSessionService {
         }
       );
       throwIfAborted(signal);
-      requireMavenSuccess(maven);
+      if (maven.exitCode !== 0) {
+        // Retain the failed staging run, separate from the promoted coverage.
+        // This includes Surefire diagnostics instead of deleting the cause.
+        const error = new TaskJacocoMavenError(maven, version.versionDirectory);
+        try {
+          const surefireReports = await reports.readAttemptArtifacts(reportDirectory);
+          await fs.writeFile(join(version.versionDirectory, 'maven-failure.json'), JSON.stringify({
+            taskId: context.taskId,
+            artifact,
+            occurredAt: new Date().toISOString(),
+            surefireReports: surefireReports.map(report => ({
+              ...report,
+              content: sanitizePublicText(report.content)
+            })),
+            maven: {
+              ...maven,
+              command: sanitizePublicText(maven.command),
+              stdout: sanitizePublicText(maven.stdout),
+              stderr: sanitizePublicText(maven.stderr)
+            }
+          }, null, 2), 'utf8');
+        } catch (evidenceError) {
+          // A diagnostic collection/write failure must not erase the original
+          // Maven cause or delete this still-unpromoted version on unwind.
+          error.message += `\n诊断保存失败：${sanitizePublicText(evidenceError instanceof Error ? evidenceError.message : String(evidenceError))}`;
+        }
+        throw error;
+      }
       const generated = await this.targetReport.generateTargetJacocoReport({
         projectPath: context.moduleRoot,
         targetFilePath: context.targetFilePath,
@@ -502,7 +665,9 @@ export class TaskJacocoSessionService {
         catalog: refreshed.catalog
       };
     } catch (error) {
-      await this.removeVersionQuietly(context, version.versionId);
+      if (!(error instanceof TaskJacocoMavenError)) {
+        await this.removeVersionQuietly(context, version.versionId);
+      }
       if (analyzerRefreshAttempted) {
         await this.restoreAnalyzerQuietly(
           context,
@@ -562,6 +727,18 @@ export class TaskJacocoSessionService {
   }
 }
 
+function sameCoverageCounts(
+  left: ExactCoverageCounts,
+  right: ExactCoverageCounts
+): boolean {
+  return left.lineCovered === right.lineCovered
+    && left.lineMissed === right.lineMissed
+    && left.lineTotal === right.lineTotal
+    && left.branchCovered === right.branchCovered
+    && left.branchMissed === right.branchMissed
+    && left.branchTotal === right.branchTotal;
+}
+
 function validateContext(
   value: TaskJacocoSessionContext
 ): TaskJacocoSessionContext {
@@ -607,14 +784,6 @@ function validateArtifact(
   requireIdentity(value.filePath, 'artifact file path');
   requireIdentity(value.testClassName, 'test class name');
   return structuredClone(value);
-}
-
-function requireMavenSuccess(result: CommandResult): void {
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `Task JaCoCo Maven failed with exit code ${result.exitCode ?? 'unknown'}.`
-    );
-  }
 }
 
 function qualifiedTestClassName(

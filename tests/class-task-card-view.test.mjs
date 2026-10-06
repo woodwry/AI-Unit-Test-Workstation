@@ -12,6 +12,21 @@ import {
   resolveClassTaskTotalControl
 } from '../src/renderer/src/class-tasks/class-task-card-view.ts';
 
+test('full-source hides method and batch progress while preserving stage actions and terminal results', () => {
+  for (const state of ['RUNNING','PAUSE_REQUESTED','PAUSED','STOPPING','INTERRUPTED','TERMINATED']) {
+    const task = snapshot(state, { executionMode: 'FULL_SOURCE', ragEnabled: false,
+      methodOrder: ['a','b'],
+      currentAtomicStep: state === 'RUNNING' ? 'MODEL_GENERATION' : 'IDLE' });
+    const view = buildClassTaskCardView(task);
+    assert.equal(view.methodProgress, null);
+    assert.ok(view.statusLabel);
+    assert.ok(actionsForClassTask(task).length);
+  }
+  assert.equal(buildClassTaskCardView(snapshot('RUNNING', { executionMode: 'LEGACY_WAVE', ragEnabled: false, methodOrder: ['a','b'] })).methodProgress?.showBar, true);
+  const result = buildClassTaskCardView(snapshot('COMPLETED', { executionMode: 'FULL_SOURCE', generatedArtifacts: [artifact()] }));
+  assert.ok(result.testMethodCount > 0);
+});
+
 test('inactive tasks and handled terminal tasks delete immediately without confirmation', () => {
   for (const task of [
     snapshot('PRELOADING'),
@@ -93,7 +108,7 @@ test('card actions match every approved state without shifting the action slots'
   for (const state of ['COMPLETED', 'TERMINATED']) {
     assert.deepEqual(
       actionsForClassTask(snapshot(state, { generatedArtifacts: [artifact()] })),
-      ['result', 'locate', 'configure', 'delete']
+      ['run', 'locate', 'configure', 'delete']
     );
   }
 });
@@ -150,7 +165,7 @@ test('card run rejects every empty selection and accepts an explicit non-empty s
   });
 });
 
-test('card run cannot dispatch a completed or terminated result awaiting accept or revoke', () => {
+test('card run dispatches execution for terminal tasks without replacing it with result navigation', () => {
   const accepted = snapshot('COMPLETED', {
     selectionMode: 'EXPLICIT',
     selectedMethodIds: ['method-1'],
@@ -172,11 +187,7 @@ test('card run cannot dispatch a completed or terminated result awaiting accept 
       generatedArtifacts: [artifact()]
     });
     assert.deepEqual(resolveClassTaskIconClick(pending, 'run'), {
-      kind: 'none',
-      taskId: pending.id
-    });
-    assert.deepEqual(resolveClassTaskIconClick(pending, 'result'), {
-      kind: 'open_result',
+      kind: 'run',
       taskId: pending.id
     });
   }
@@ -422,6 +433,27 @@ test('paused model failures are shown on the card only as model unavailable', ()
   assert.match(failed.error?.message ?? '', /当前选择的模型不可用/);
   assert.match(failed.error?.message ?? '', /切换可用模型后重试/);
   assert.doesNotMatch(failed.error?.message ?? '', /quota|额度/i);
+});
+
+test('paused Wave idle timeout is not presented as an unavailable model', () => {
+  const paused = buildClassTaskCardView(snapshot('PAUSED', {
+    currentAtomicStep: 'MODEL_GENERATION',
+    lastError: {
+      code: 'MODEL_WAVE_IDLE_TIMEOUT',
+      message: '模型生成长时间没有返回进度，已停止本轮生成，请稍后继续执行。',
+      moduleName: 'example.TaskService',
+      modulePath: 'D:\\work\\module-a',
+      command: null,
+      occurredAt: '2026-10-01T03:50:31.753Z'
+    }
+  }));
+
+  assert.equal(paused.statusLabel, '生成无响应');
+  assert.deepEqual(paused.execution, {
+    label: '已暂停 · 生成单元测试',
+    animated: false
+  });
+  assert.equal(paused.error, null);
 });
 
 test('non-model execution failures keep a generic card label and guidance', () => {

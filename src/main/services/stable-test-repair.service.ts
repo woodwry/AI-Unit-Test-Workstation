@@ -4,6 +4,7 @@ import type {
 import {
   GeneratedTestFailurePrunerService
 } from './generated-test-failure-pruner.service.ts';
+import { AbnormalTestPrunerService, type RemovedAbnormalTest } from './abnormal-test-pruner.service.ts';
 import {
   JavaTestStructureService,
   matchingBrace,
@@ -24,6 +25,17 @@ export type StableRepairCheckpoint = {
   annotatedMemberIds: string[];
 };
 
+export type StableRepairChangeEvidence = {
+  code: string;
+  nextCode: string;
+  execution: CandidateExecutionFeedback;
+  phase: 'TEST_METHODS' | 'SHARED_MEMBERS';
+  iteration: number;
+  newMemberIds: string[];
+  annotatedMemberIds: string[];
+  reason?: 'NON_VALIDATING_TEST';
+};
+
 export type StableTestRepairInput = {
   code: string;
   candidateFilePath: string;
@@ -31,6 +43,9 @@ export type StableTestRepairInput = {
   initialExecution: CandidateExecutionFeedback;
   annotatedMemberIds: readonly string[];
   initialIteration?: number;
+  onDiscardAbnormalTests?: (methods: RemovedAbnormalTest[], execution: CandidateExecutionFeedback) => Promise<void>;
+  onBeforeRepairChange?: (change: StableRepairChangeEvidence) => Promise<void>;
+  findNonValidatingTests?: (code: string) => string[];
   replaceCandidate: (code: string) => Promise<void>;
   executeMaven: () => Promise<CandidateExecutionFeedback>;
   saveCheckpoint: (checkpoint: StableRepairCheckpoint) => Promise<void>;
@@ -39,6 +54,7 @@ export type StableTestRepairInput = {
 
 export type StableTestRepairResult = {
   status: 'passed' | 'retained_empty' | 'external_project_blocked';
+  blockedScope?: 'candidate' | 'project';
   code: string;
   execution: CandidateExecutionFeedback;
   phase: 'PASSED' | 'BLOCKED';
@@ -84,7 +100,10 @@ export class StableTestRepairService {
     }
     const annotatedMemberIds = new Set(input.annotatedMemberIds);
 
-    while (execution.status !== 'passed') {
+    while (true) {
+      const nonValidatingTests = execution.status === 'passed'
+        ? input.findNonValidatingTests?.(code) ?? [] : [];
+      if (execution.status === 'passed' && nonValidatingTests.length === 0) break;
       throwIfAborted(input.signal);
       if (
         this.structure.findTestMethods(code).length === 0
@@ -103,13 +122,34 @@ export class StableTestRepairService {
           ...checkpoint
         };
       }
-      const tests = this.pruner.commentFailingTestMethods({
+      const pruneInput = {
         code,
         candidateFilePath: input.candidateFilePath,
         execution
+      };
+      // Delete proven abnormal tests first; ordinary failures still use the
+      // existing statement-level repair or comment flow.
+      const abnormal = new AbnormalTestPrunerService().remove({
+        code, generatedTestClassName: input.generatedTestClassName, execution
       });
+      const minimal = nonValidatingTests.length || abnormal.removedMethods.length > 0 ? null : this.pruner.prune(pruneInput);
+      const tests = nonValidatingTests.length > 0
+        ? this.pruner.commentTestMethods({ code, testMethodNames: nonValidatingTests })
+        : abnormal.removedMethods.length > 0
+        ? { code: abnormal.code, commentedMemberIds: abnormal.removedMethods.map(method =>
+            `removed-test:${method.name}:${method.startLine}`) }
+        : minimal && minimal.code !== code
+        ? {
+            ...minimal,
+            commentedMemberIds: minimal.commentedMethods.length > 0
+              ? this.structure.findTestMethods(code)
+                  .filter((method) => minimal.commentedMethods.includes(method.name))
+                  .map((method) => `test:${method.name}:${method.startLine}`)
+              : [`statement:${iteration + 1}`]
+          }
+        : this.pruner.commentFailingTestMethods(pruneInput);
       let nextCode = tests.code;
-      let phase: StableRepairPhase = 'TEST_METHODS';
+      let phase: 'TEST_METHODS' | 'SHARED_MEMBERS' = 'TEST_METHODS';
       let newMemberIds = tests.commentedMemberIds.filter((id) => (
         !annotatedMemberIds.has(id)
       ));
@@ -119,67 +159,16 @@ export class StableTestRepairService {
           code,
           input.candidateFilePath,
           execution
-        ).find((member) => !annotatedMemberIds.has(member.id))
-          ?? (
-            executionMentionsCandidate(
-              execution,
-              input.candidateFilePath,
-              input.generatedTestClassName
-            )
-              ? this.fallbackSharedMembers(code).find(
-                  (member) => !annotatedMemberIds.has(member.id)
-                ) ?? null
-              : null
-          );
+        ).find((member) => !annotatedMemberIds.has(member.id));
         if (shared) {
           const dependentTestNames = this.dependentTestNames(code, shared);
-          if (dependentTestNames.length > 0) {
-            const dependentTests = this.pruner.commentTestMethods({
-              code,
-              testMethodNames: dependentTestNames
-            });
-            nextCode = dependentTests.code;
-            phase = 'TEST_METHODS';
-            newMemberIds = dependentTests.commentedMemberIds.filter((id) => (
-              !annotatedMemberIds.has(id)
-            ));
-          } else {
+          // A shared compile error prevents tests from running; it is not
+          // evidence that every caller failed. Preserve those tests and block
+          // rather than manufacturing an empty passing class.
+          if (dependentTestNames.length === 0) {
             nextCode = commentRange(code, shared);
             phase = 'SHARED_MEMBERS';
             newMemberIds = [shared.id];
-          }
-        } else if (executionMentionsCandidate(
-          execution,
-          input.candidateFilePath,
-          input.generatedTestClassName
-        )) {
-          const remainingTests = this.structure.findTestMethods(code);
-          const commented = this.pruner.commentTestMethods({
-            code,
-            testMethodNames: remainingTests.map((method) => method.name)
-          });
-          nextCode = commented.code;
-          phase = 'TEST_METHODS';
-          newMemberIds = commented.commentedMemberIds.filter((id) => (
-            !annotatedMemberIds.has(id)
-          ));
-        }
-        if (newMemberIds.length === 0 && executionMentionsCandidate(
-          execution,
-          input.candidateFilePath,
-          input.generatedTestClassName
-        )) {
-          const emptyClassId = `empty_class:${input.generatedTestClassName}`;
-          if (!annotatedMemberIds.has(emptyClassId)) {
-            const emptyClass = retainCompilableEmptyClass(
-              code,
-              input.generatedTestClassName
-            );
-            if (emptyClass !== code) {
-              nextCode = emptyClass;
-              phase = 'SHARED_MEMBERS';
-              newMemberIds = [emptyClassId];
-            }
           }
         }
         if (newMemberIds.length === 0) {
@@ -191,6 +180,8 @@ export class StableTestRepairService {
           await input.saveCheckpoint(checkpoint);
           return {
             status: 'external_project_blocked',
+            blockedScope: candidateLocalFailure(execution, input.candidateFilePath, input.generatedTestClassName)
+              ? 'candidate' : 'project',
             code,
             execution,
             ...checkpoint
@@ -201,8 +192,17 @@ export class StableTestRepairService {
       if (nextCode === code || newMemberIds.length === 0) {
         throw new Error('Stable repair must make a monotonic candidate-local change.');
       }
+      if (abnormal.removedMethods.length > 0) {
+        await input.onDiscardAbnormalTests?.(abnormal.removedMethods, execution);
+      }
       newMemberIds.forEach((id) => annotatedMemberIds.add(id));
       iteration += 1;
+      await input.onBeforeRepairChange?.({
+        code, nextCode, execution, phase, iteration,
+        newMemberIds: [...newMemberIds],
+        annotatedMemberIds: [...annotatedMemberIds],
+        ...(nonValidatingTests.length ? { reason: 'NON_VALIDATING_TEST' as const } : {})
+      });
       await input.replaceCandidate(nextCode);
       await input.saveCheckpoint({
         phase,
@@ -297,33 +297,6 @@ export class StableTestRepairService {
     return [...candidates.values()].sort(compareSharedMembers);
   }
 
-  private fallbackSharedMembers(code: string): SharedMember[] {
-    const methods = this.structure.findMethods(code)
-      .filter((method) => !method.isTestMethod)
-      .map((method): SharedMember => ({
-        id: `method:${method.name}:${method.startLine}`,
-        kind: method.isLifecycleMethod ? 'lifecycle' : 'helper',
-        referenceNames: [method.name],
-        startOffset: method.startOffset,
-        endOffset: method.endOffset,
-        methodStartOffset: method.startOffset
-      }));
-    const fields = this.structure.findFields(code).map((field): SharedMember => ({
-      id: `field:${field.names.join(',')}:${field.startLine}`,
-      kind: 'field',
-      referenceNames: [...field.names],
-      startOffset: field.startOffset,
-      endOffset: field.endOffset
-    }));
-    return [
-      ...methods,
-      ...fields,
-      ...blockSupportMembers(code),
-      ...classAnnotationMembers(code),
-      ...importMembers(code)
-    ].sort(compareSharedMembers);
-  }
-
   private dependentTestNames(code: string, member: SharedMember): string[] {
     const methods = this.structure.findMethods(code);
     const tests = methods.filter((method) => method.isTestMethod);
@@ -347,6 +320,12 @@ export class StableTestRepairService {
       }
     }
     if (dependencies.size === 0) return [];
+
+    // Lifecycle methods run for every test even though tests never call them
+    // explicitly. Removing their fields/helpers can break the whole fixture.
+    if ([...dependencies].some((method) => method.isLifecycleMethod)) {
+      return tests.map((test) => test.name);
+    }
 
     const methodsByName = new Map<string, JavaMethodSpan[]>();
     for (const method of methods) {
@@ -381,29 +360,6 @@ const SHARED_MEMBER_PRIORITY: Readonly<Record<SharedMember['kind'], number>> = {
 function compareSharedMembers(left: SharedMember, right: SharedMember): number {
   return SHARED_MEMBER_PRIORITY[left.kind] - SHARED_MEMBER_PRIORITY[right.kind]
     || left.startOffset - right.startOffset;
-}
-
-function classAnnotationMembers(code: string): SharedMember[] {
-  const sanitized = sanitizeJava(code);
-  const type = /\b(?:class|record|interface|enum)\s+[A-Za-z_$][\w$]*/u.exec(
-    sanitized
-  );
-  if (!type) return [];
-  const typeLine = lineNumberAt(code, type.index);
-  const result: SharedMember[] = [];
-  for (let line = 1; line < typeLine; line += 1) {
-    const range = lineRange(code, line);
-    if (!range) continue;
-    const source = code.slice(range.startOffset, range.endOffset);
-    if (!/^\s*@/u.test(source)) continue;
-    result.push({
-      id: `annotation:${line}`,
-      kind: 'class_annotation',
-      referenceNames: [],
-      ...range
-    });
-  }
-  return result;
 }
 
 function blockSupportMembers(code: string): SharedMember[] {
@@ -482,43 +438,6 @@ function blockSupportMembers(code: string): SharedMember[] {
     parenthesisDepth = 0;
   }
   return result;
-}
-
-function importMembers(code: string): SharedMember[] {
-  const result: SharedMember[] = [];
-  const lineCount = code.split(/\r\n|\r|\n/u).length;
-  for (let line = 1; line <= lineCount; line += 1) {
-    const range = lineRange(code, line);
-    if (!range) continue;
-    const source = code.slice(range.startOffset, range.endOffset);
-    if (!/^\s*import\b/u.test(source)) continue;
-    const simpleName = /([A-Za-z_$][\w$]*|\*)\s*;?\s*$/u.exec(source)?.[1];
-    result.push({
-      id: `import:${line}`,
-      kind: 'import',
-      referenceNames: simpleName && simpleName !== '*' ? [simpleName] : [],
-      ...range
-    });
-  }
-  return result;
-}
-
-function executionMentionsCandidate(
-  execution: CandidateExecutionFeedback,
-  candidateFilePath: string,
-  generatedTestClassName: string
-): boolean {
-  if (execution.testReport?.generatedTestClassName === generatedTestClassName) {
-    return true;
-  }
-  const expected = normalizePath(candidateFilePath);
-  const fileName = expected.split('/').at(-1) ?? '';
-  const output = execution.mavenExecutions.flatMap((item) => [
-    item.stdout,
-    item.stderr
-  ]).join('\n').replace(/\\/gu, '/').toLowerCase();
-  return output.includes(expected)
-    || Boolean(fileName && output.includes(fileName));
 }
 
 function containsIdentifier(source: string, name: string): boolean {
@@ -616,35 +535,32 @@ function isCompilableEmptyCandidate(execution: CandidateExecutionFeedback): bool
   );
   return compile?.exitCode === 0
     && test?.exitCode === 0
-    && test.surefireReports.length === 0;
+    // Surefire also writes .dump/.dumpstream diagnostics on successful runs.
+    // Only XML test reports mean that an executable test suite was produced.
+    && !test.surefireReports.some((artifact) => /^TEST-.+\.xml$/iu.test(artifact.fileName));
 }
 
-function retainCompilableEmptyClass(
-  code: string,
+/** Only explicit, exclusively candidate-local Maven evidence may be isolated. */
+function candidateLocalFailure(
+  execution: CandidateExecutionFeedback,
+  candidateFilePath: string,
   generatedTestClassName: string
-): string {
-  const simpleName = generatedTestClassName.split('.').at(-1) ?? '';
-  if (!/^[A-Za-z_$][\w$]*$/u.test(simpleName)) return code;
-  const newline = code.includes('\r\n') ? '\r\n' : '\n';
-  const lines = code.split(/\r\n|\r|\n/u);
-  let packagePreserved = false;
-  const preserved = lines.map((line) => {
-    if (!packagePreserved && /^\s*package\s+[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*;\s*$/u.test(line)) {
-      packagePreserved = true;
-      return line;
-    }
-    if (!line.trim()) return line;
-    const indent = /^[\t ]*/u.exec(line)?.[0] ?? '';
-    return `${indent}// ${line.slice(indent.length)}`;
-  });
-  while (preserved.length > 0 && preserved.at(-1) === '') preserved.pop();
-  return [
-    ...preserved,
-    '',
-    `class ${simpleName} {`,
-    '}',
-    ''
-  ].join(newline);
+): boolean {
+  if (execution.status === 'compile_failed') {
+    const compile = [...execution.mavenExecutions].reverse().find((item) => (
+      item.phase === 'test_compile' && item.exitCode !== 0
+    ));
+    if (!compile) return false;
+    const output = [compile.stdout, compile.stderr].join('\n');
+    const files = [...output.matchAll(
+      /((?:[A-Za-z]:[\\/]|\/)[^\r\n]*?\.java):(?:\[\d+,\d+\]|\d+:)/gu
+    )].map((match) => normalizePath(match[1]));
+    return files.length > 0 && files.every((file) => file === normalizePath(candidateFilePath));
+  }
+  const failures = execution.testReport?.failureDetails ?? [];
+  return failures.length > 0 && failures.every((failure) => (
+    failure.testClassName === generatedTestClassName
+  ));
 }
 
 function lineRange(

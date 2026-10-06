@@ -1331,6 +1331,36 @@ test('Wave stream abandons a heartbeat-only connection and recovers from status'
   assert.match(calls[1], new RegExp(`${WAVE_SESSION_ID}\\?afterEventSequence=1$`));
 });
 
+test('Wave stream times out when the first event is buffered indefinitely', async () => {
+  let streamCancelled = false;
+  const client = new AiClient(async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/start/stream')) {
+      const body = new ReadableStream({
+        cancel() {
+          streamCancelled = true;
+        }
+      });
+      return new Response(body, {
+        headers: { 'Content-Type': 'text/event-stream' }
+      });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  }, { methodGenerationWaveIdleTimeoutMilliseconds: 10 });
+  client.setManagedBackendAccessProvider(() => managedAccess(23));
+
+  await Promise.race([
+    assert.rejects(
+      client.streamMethodGenerationWave(startWaveRequest(1), modelContext, () => {}),
+      /单方法 Wave 连接在返回首个事件前超时/
+    ),
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Wave stream kept waiting without the first event.')), 150);
+    })
+  ]);
+  assert.equal(streamCancelled, true);
+});
+
 test('Wave stream abandons an idle terminal-parts connection and recovers from status', async () => {
   const calls = [];
   const handled = [];

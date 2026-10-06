@@ -62,6 +62,21 @@ test('production task card shows breathing activity, live stages, pause and comp
   await expect(footer).toHaveText('正在执行 Maven 测试验证');
   expect(await animation()).not.toBe('none');
 
+  for (const patch of [
+    { state: 'RUNNING', currentAtomicStep: 'MODEL_GENERATION' },
+    { state: 'RUNNING', currentAtomicStep: 'MAVEN_COMPILE' },
+    { state: 'RUNNING', currentAtomicStep: 'MODEL_REPAIR' },
+    { state: 'PAUSED', currentAtomicStep: 'IDLE' },
+    { state: 'RUNNING', currentAtomicStep: 'MAVEN_TEST' }
+  ] as const) {
+    await update({ ...patch, executionMode: 'FULL_SOURCE' });
+    await expect(page.getByRole('progressbar')).toHaveCount(0);
+    await expect(page.locator('.class-task-card-progress-active-batch')).toHaveCount(0);
+    await expect(footer).toBeVisible();
+  }
+  await update({ executionMode: 'LEGACY_WAVE', state: 'RUNNING', currentAtomicStep: 'MAVEN_TEST' });
+  await expect(page.getByRole('progressbar')).toHaveCount(1);
+
   await page.locator('#root').evaluate((element) => { element.style.width = '230px'; });
   await update({ currentAtomicStep: 'ANALYZE_METHOD' });
   const label = page.locator('.class-task-card-execution-label');
@@ -77,5 +92,31 @@ test('production task card shows breathing activity, live stages, pause and comp
   expect(await animation()).toBe('none');
   await update({ state: 'COMPLETED' });
   await expect(footer).toHaveCount(0);
+
+  for (const state of ['TERMINATED', 'COMPLETED'] as const) {
+    await update({ state, generatedArtifacts: [{
+      id: '22222222-2222-4222-8222-222222222222',
+      filePath: 'D:/fixture/src/test/TaskService1Test.java',
+      testClassName: 'TaskService1Test',
+      ordinaryTestMethodCount: 0,
+      methodIds: ['method-a'],
+      methodResults: [],
+      sha256: 'a'.repeat(64),
+      sealed: true,
+      accepted: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }] });
+    const execute = page.getByRole('button', { name: '执行当前类', exact: true });
+    await expect(execute).toBeVisible();
+    await expect(page.getByRole('button', { name: '查看并处理结果', exact: true })).toHaveCount(0);
+    await expect(execute.locator('svg')).toHaveClass(/lucide-play/);
+    await execute.click();
+    expect(await page.evaluate(() => (window as unknown as { lastTaskCardIntent: unknown }).lastTaskCardIntent))
+      .toEqual({ kind: 'run', taskId: '11111111-1111-4111-8111-111111111111' });
+    await page.locator('.class-task-card-name').click();
+    expect(await page.evaluate(() => (window as unknown as { lastTaskCardIntent: unknown }).lastTaskCardIntent))
+      .toEqual({ kind: 'open_result', taskId: '11111111-1111-4111-8111-111111111111' });
+  }
   expect(browserErrors).toEqual([]);
 });

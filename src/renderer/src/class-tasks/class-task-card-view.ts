@@ -8,7 +8,6 @@ import {
 
 export type ClassTaskCardAction =
   | 'run'
-  | 'result'
   | 'spinner'
   | 'pause'
   | 'resume'
@@ -143,15 +142,9 @@ export function actionsForClassTask(
     case 'READY':
     case 'INTERRUPTED':
     case 'FAILED':
-      return ['run', 'locate', 'configure', 'delete'];
     case 'COMPLETED':
     case 'TERMINATED':
-      return [
-        hasPendingClassTaskResult(task) ? 'result' : 'run',
-        'locate',
-        'configure',
-        'delete'
-      ];
+      return ['run', 'locate', 'configure', 'delete'];
     case 'RUNNING':
       return ['spinner', 'pause', 'terminate', 'locate', 'configure', 'delete'];
     case 'PAUSE_REQUESTED':
@@ -183,10 +176,7 @@ export function resolveClassTaskIconClick(
       return { kind: 'locate_source', taskId: task.id };
     case 'configure':
       return { kind: 'open_configuration', taskId: task.id };
-    case 'result':
-      return { kind: 'open_result', taskId: task.id };
     case 'run':
-      if (hasPendingClassTaskResult(task)) return { kind: 'none', taskId: task.id };
       return requiresClassTaskMethodSelection(task)
         ? { kind: 'show_method_selection_hint', taskId: task.id }
         : { kind: 'run', taskId: task.id };
@@ -375,8 +365,10 @@ function methodProgressFor(
     | 'activeGenerationBatch'
     | 'generatedArtifacts'
     | 'coverageCurrent'
+    | 'executionMode'
   >
 ): ClassTaskCardView['methodProgress'] {
+  if (task.executionMode === 'FULL_SOURCE') return null;
   const total = task.methodOrder.length;
   if (!METHOD_PROGRESS_STATES.has(task.state) || total === 0) return null;
 
@@ -488,9 +480,11 @@ function statusFor(task: Pick<ClassTaskSnapshot, 'state' | 'lastError'>): {
     case 'READY': return { label: '待执行', tone: 'neutral' };
     case 'RUNNING': return { label: '执行中', tone: 'active' };
     case 'PAUSE_REQUESTED': return { label: '正在暂停', tone: 'warning' };
-    case 'PAUSED': return isModelFailure(task.lastError)
-      ? { label: '模型不可用', tone: 'warning' }
-      : { label: '已暂停', tone: 'warning' };
+    case 'PAUSED': return isWaveIdleTimeout(task.lastError)
+      ? { label: '生成无响应', tone: 'warning' }
+      : isModelAvailabilityFailure(task.lastError)
+        ? { label: '模型不可用', tone: 'warning' }
+        : { label: '已暂停', tone: 'warning' };
     case 'STOPPING': return { label: '正在终止', tone: 'warning' };
     case 'TERMINATED': return { label: '已终止', tone: 'danger' };
     case 'COMPLETED': return { label: '已完成', tone: 'success' };
@@ -603,8 +597,12 @@ function isModelQuotaUnavailable(error: PublicTaskError | null): boolean {
   return executionFailureCodes(error).has('MODEL_QUOTA_EXHAUSTED');
 }
 
-function isModelFailure(error: PublicTaskError | null): boolean {
-  return [...executionFailureCodes(error)].some((code) => code.startsWith('MODEL_'));
+function isModelAvailabilityFailure(error: PublicTaskError | null): boolean {
+  return executionFailureKind(error) !== 'other';
+}
+
+function isWaveIdleTimeout(error: PublicTaskError | null): boolean {
+  return executionFailureCodes(error).has('MODEL_WAVE_IDLE_TIMEOUT');
 }
 
 function executionFailureCodes(error: PublicTaskError | null): Set<string> {

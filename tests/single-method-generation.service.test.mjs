@@ -1991,7 +1991,7 @@ test('Agent repair exhaustion after a scope rejection enters final pruning even 
   assert.equal(h.committedBatches[0].outcome, 'RETAINED');
 });
 
-test('final compile failure on an invalid import retains unaffected tests instead of dropping the batch', async () => {
+test('final shared import failure stops instead of guessing which tests to prune', async () => {
   const candidateCode = [
     'package demo;',
     '',
@@ -2028,24 +2028,19 @@ test('final compile failure on an invalid import retains unaffected tests instea
     }
   });
 
-  const bundle = await h.service.execute(
-    task({ repairAttemptLimit: 0 }),
-    METHOD_ID,
-    { completedBatches: [], completedTestMethodPlanIds: [] },
-    new AbortController().signal
+  await assert.rejects(
+    h.service.execute(
+      task({ repairAttemptLimit: 0 }),
+      METHOD_ID,
+      { completedBatches: [], completedTestMethodPlanIds: [] },
+      new AbortController().signal
+    ),
+    /without a safely retained formal test result/
   );
 
-  assert.ok(bundle);
-  assert.equal(bundle.ordinaryTestMethodCount, 1);
-  assert.deepEqual(bundle.passedTestMethods, ['batch1Test1']);
-  assert.match(bundle.code, /^\/\/ import wrong\.package\.ReportUnit;$/m);
-  assert.match(bundle.code, /\/\/ TODO 当前测试方法需要修复/);
-  assert.match(bundle.code, /\/\/ void failsAtRuntime\(\) \{/);
-  assert.match(bundle.code, /^\s*void batch1Test1\(\) \{/m);
-  assert.equal(h.mavenInputs.length, 2);
-  assert.equal(h.mavenInputs.at(-1).scope, 'pruned_method_candidate');
-  assert.equal(h.committedBatches[0].outcome, 'PASSED');
-  assert.equal(h.committedBatches[0].ordinaryTestMethodCount, 1);
+  assert.equal(h.mavenInputs.length, 1);
+  assert.equal(h.committedBatches[0].outcome, 'DROPPED');
+  assert.equal(h.committedBatches[0].ordinaryTestMethodCount, 0);
 });
 
 test('fully commented final candidate is dropped and stops before the next batch when support does not compile', async () => {

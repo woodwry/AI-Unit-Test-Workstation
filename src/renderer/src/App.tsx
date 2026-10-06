@@ -228,6 +228,7 @@ type TabContextMenuState = {
 
 type ClassTaskMethodCatalogLoadState =
   | { status: 'loading' }
+  | { status: 'waiting_for_preload' }
   | { status: 'error'; message: string };
 
 type RagSourceLoadState =
@@ -348,6 +349,7 @@ export function App({ editorSession }: AppProps): JSX.Element {
   const [classTaskMethodCatalogLoadStates, setClassTaskMethodCatalogLoadStates] =
     useState<Record<string, ClassTaskMethodCatalogLoadState>>({});
   const [classTaskSnapshots, setClassTaskSnapshots] = useState<Record<string, ClassTaskSnapshot>>({});
+  const classTaskSnapshotsRef = useRef(classTaskSnapshots);
   const [classTaskOrder, setClassTaskOrder] = useState<string[]>([]);
   const [busyClassTaskIds, setBusyClassTaskIds] = useState<Set<string>>(new Set());
   const [classTaskFocusRequest, setClassTaskFocusRequest] = useState<ClassTaskFocusRequest | null>(null);
@@ -402,6 +404,7 @@ export function App({ editorSession }: AppProps): JSX.Element {
   const deletedClassTaskIdsRef = useRef<Set<string>>(new Set());
   const classTaskMethodCatalogRequestSequenceRef = useRef<number>(0);
   const classTaskMethodCatalogRequestIdsRef = useRef<Map<string, number>>(new Map());
+  const classTaskResultRevocationsRef = useRef<Map<string, Promise<ClassTaskResultSnapshot>>>(new Map());
   const isRestoringViewStateRef = useRef<boolean>(false);
   const workspaceLoadRequestRef = useRef<number>(0);
   const workspaceSelectionRequestRef = useRef<number>(0);
@@ -439,6 +442,9 @@ export function App({ editorSession }: AppProps): JSX.Element {
   const activeMethodConfigurationLoadState = activeWorkbenchTab?.kind === 'method_configuration'
     ? classTaskMethodCatalogLoadStates[activeWorkbenchTab.taskId] ?? null
     : null;
+  const activeMethodConfigurationWaitingForPreload =
+    activeMethodConfigurationTask?.state === 'PRELOADING'
+    || activeMethodConfigurationLoadState?.status === 'waiting_for_preload';
   const classTasks = useMemo(
     () => classTaskOrder.flatMap((taskId) => {
       const task = classTaskSnapshots[taskId];
@@ -676,6 +682,26 @@ export function App({ editorSession }: AppProps): JSX.Element {
   useEffect(() => window.workstation.onClassTaskSnapshotChanged((snapshot) => {
     applyClassTaskSnapshot(snapshot);
   }), []);
+
+  useEffect(() => window.workstation.onClassTaskMethodCatalogChanged(({ workspaceRoot: changedRoot, catalog }) => {
+    if (!isSameWorkspaceRoot(changedRoot, activeWorkspaceRootRef.current)
+      || deletedClassTaskIdsRef.current.has(catalog.taskId)
+      || !classTaskSnapshotsRef.current[catalog.taskId]) return;
+    // The main process publishes only after saving the refreshed coverage. A
+    // read started before that publication must not overwrite this catalog.
+    classTaskMethodCatalogRequestIdsRef.current.delete(catalog.taskId);
+    setClassTaskCatalogs(catalogs => ({ ...catalogs, [catalog.taskId]: catalog }));
+    setClassTaskMethodCatalogLoadStates(states => omitRecordKey(states, catalog.taskId));
+  }), []);
+
+  useEffect(() => {
+    classTaskSnapshotsRef.current = classTaskSnapshots;
+  }, [classTaskSnapshots]);
+
+  useEffect(() => {
+    synchronizeMethodConfigurationPreload();
+  }, [activeWorkbenchTab?.id, activeMethodConfigurationTask?.state,
+    activeMethodConfigurationLoadState?.status]);
 
   useEffect(() => {
     const handleQuickFileSearchShortcut = (event: KeyboardEvent): void => {
@@ -1099,6 +1125,7 @@ export function App({ editorSession }: AppProps): JSX.Element {
       }, snapshot.id);
       return new Set(released.busyTaskIds);
     });
+    classTaskSnapshotsRef.current = { ...classTaskSnapshotsRef.current, [snapshot.id]: snapshot };
     setClassTaskSnapshots((snapshots) => ({ ...snapshots, [snapshot.id]: snapshot }));
     setClassTaskOrder((taskIds) => taskIds.includes(snapshot.id)
       ? taskIds
@@ -1119,8 +1146,11 @@ export function App({ editorSession }: AppProps): JSX.Element {
       return;
     }
 
-    setClassTaskSnapshots(Object.fromEntries(snapshots.map((snapshot) => [snapshot.id, snapshot])));
-    setClassTaskOrder(snapshots.map((snapshot) => snapshot.id));
+    const liveSnapshots = snapshots.filter(snapshot => !deletedClassTaskIdsRef.current.has(snapshot.id));
+    const restoredSnapshots = Object.fromEntries(liveSnapshots.map((snapshot) => [snapshot.id, snapshot]));
+    classTaskSnapshotsRef.current = restoredSnapshots;
+    setClassTaskSnapshots(restoredSnapshots);
+    setClassTaskOrder(liveSnapshots.map((snapshot) => snapshot.id));
   }
 
   async function restoreLastWorkspace(requestId: number): Promise<void> {
@@ -1169,6 +1199,8 @@ export function App({ editorSession }: AppProps): JSX.Element {
     setClassTaskCatalogs({});
     setClassTaskMethodCatalogLoadStates({});
     classTaskMethodCatalogRequestIdsRef.current.clear();
+    classTaskResultRevocationsRef.current.clear();
+    classTaskSnapshotsRef.current = {};
     setClassTaskSnapshots({});
     setClassTaskOrder([]);
     setBusyClassTaskIds(new Set());
@@ -1178,7 +1210,7 @@ export function App({ editorSession }: AppProps): JSX.Element {
     classTaskTotalPendingTaskIdsRef.current = new Set();
     setSavingMethodSelectionTaskId(null);
     clearAllMethodSelectionSaveErrors();
-    void restoreClassTasks(selectedRoot, loadRequestId).catch((error: unknown) => {
+    const classTaskRestoration = restoreClassTasks(selectedRoot, loadRequestId).catch((error: unknown) => {
       if (loadRequestId === workspaceLoadRequestRef.current) {
         setStatus(`类任务恢复失败：${toErrorMessage(error)}`);
       }
@@ -1194,7 +1226,8 @@ export function App({ editorSession }: AppProps): JSX.Element {
       void restoreWorkspaceViewState(
         selectedRoot,
         rootChildren,
-        loadRequestId
+        loadRequestId,
+        classTaskRestoration
       )
         .catch((error: unknown) => {
           if (loadRequestId === workspaceLoadRequestRef.current) {
@@ -1231,7 +1264,8 @@ export function App({ editorSession }: AppProps): JSX.Element {
   async function restoreWorkspaceViewState(
     selectedRoot: string,
     rootChildren: WorkspaceFile[],
-    loadRequestId: number
+    loadRequestId: number,
+    classTaskRestoration: Promise<void>
   ): Promise<void> {
     const viewState = await window.workstation.getWorkspaceViewState(selectedRoot);
     if (loadRequestId !== workspaceLoadRequestRef.current) {
@@ -1274,20 +1308,29 @@ export function App({ editorSession }: AppProps): JSX.Element {
       })
     );
     const nextOpenFiles = restoredOpenFiles.filter((file): file is SelectedFile => Boolean(file));
-    if (loadRequestId !== workspaceLoadRequestRef.current) {
+    // Saved method tabs can outlive their tasks when the app closes before
+    // the debounced view-state save. Resolve the task list before restoring
+    // tabs, and never query a removed task from that old view.
+    await classTaskRestoration;
+    if (loadRequestId !== workspaceLoadRequestRef.current
+      || !isSameWorkspaceRoot(selectedRoot, activeWorkspaceRootRef.current)) {
       return;
     }
+
+    const persistedTabs = viewState.workbenchTabs?.filter(tab => tab.kind === 'source'
+      || (!deletedClassTaskIdsRef.current.has(tab.taskId)
+        && Boolean(classTaskSnapshotsRef.current[tab.taskId])));
 
     const restoredActiveFilePath = nextOpenFiles.some((file) => file.path === viewState.activeFilePath)
       ? viewState.activeFilePath ?? null
       : nextOpenFiles[0]?.path ?? null;
     const restoredTabs = restorePersistedWorkbenchTabs({
-      persistedTabs: viewState.workbenchTabs,
+      persistedTabs,
       availableSourceFilePaths: nextOpenFiles.map((file) => file.path),
       activeId: viewState.activeWorkbenchTabId
         ?? (restoredActiveFilePath ? `source:${restoredActiveFilePath}` : undefined)
     });
-    const restoredMethodTabs = (viewState.workbenchTabs ?? [])
+    const restoredMethodTabs = (persistedTabs ?? [])
       .filter((tab): tab is Extract<WorkspaceWorkbenchTabState, { kind: 'method_configuration' }> => (
         tab.kind === 'method_configuration'
       ));
@@ -1646,8 +1689,15 @@ export function App({ editorSession }: AppProps): JSX.Element {
   async function runSingleClassTask(task: ClassTaskSnapshot): Promise<void> {
     const reconciliationController = new AbortController();
     setClassTaskCommandBusy([task.id], true);
-    setStatus(`正在执行 ${task.qualifiedClassName}...`);
     try {
+      const revocation = classTaskResultRevocationsRef.current.get(task.id);
+      if (revocation) {
+        setStatus(`正在等待撤回完成，再执行 ${task.qualifiedClassName}...`);
+        await revocation;
+        if (!isSameWorkspaceRoot(task.workspaceRoot, activeWorkspaceRootRef.current)
+          || !classTaskSnapshotsRef.current[task.id]) return;
+      }
+      setStatus(`正在执行 ${task.qualifiedClassName}...`);
       const command = window.workstation.runClassTask({
         workspaceRoot: task.workspaceRoot,
         taskId: task.id
@@ -1784,6 +1834,7 @@ export function App({ editorSession }: AppProps): JSX.Element {
         taskId: task.id
       });
       deletedClassTaskIdsRef.current.add(task.id);
+      classTaskSnapshotsRef.current = omitRecordKey(classTaskSnapshotsRef.current, task.id);
       setClassTaskSnapshots((snapshots) => omitRecordKey(snapshots, task.id));
       setClassTaskOrder((taskIds) => taskIds.filter((taskId) => taskId !== task.id));
       setClassTaskCatalogs((catalogs) => omitRecordKey(catalogs, task.id));
@@ -1869,11 +1920,25 @@ export function App({ editorSession }: AppProps): JSX.Element {
     const task = classTaskSnapshots[taskId];
     if (!task) throw new Error('当前类任务不存在或已删除');
     const requestedWorkspaceLoadRequestId = workspaceLoadRequestRef.current;
+    let revocation: Promise<ClassTaskResultSnapshot> | undefined;
     try {
-      const result = await window.workstation.revokeClassTask({
+      revocation = window.workstation.revokeClassTask({
         workspaceRoot: task.workspaceRoot,
         taskId: task.id
       });
+      classTaskResultRevocationsRef.current.set(taskId, revocation);
+      const result = await revocation;
+      if (result.restoredMethodCatalog
+        && result.restoredMethodCatalog.taskId === task.id
+        && requestedWorkspaceLoadRequestId === workspaceLoadRequestRef.current
+        && isSameWorkspaceRoot(task.workspaceRoot, activeWorkspaceRootRef.current)
+        && !deletedClassTaskIdsRef.current.has(task.id)) {
+        classTaskMethodCatalogRequestIdsRef.current.delete(task.id);
+        setClassTaskCatalogs(catalogs => ({ ...catalogs, [task.id]: result.restoredMethodCatalog! }));
+        setClassTaskMethodCatalogLoadStates(states => omitRecordKey(states, task.id));
+        setStatus(`已撤回 ${task.qualifiedClassName} 的未接受测试文件，覆盖率已还原`);
+        return result;
+      }
       setClassTaskCatalogs((catalogs) => omitRecordKey(catalogs, task.id));
       if (isSameWorkspaceRoot(task.workspaceRoot, activeWorkspaceRootRef.current)) {
         setStatus(`已撤回 ${task.qualifiedClassName} 的未接受测试文件，正在后台刷新覆盖率...`);
@@ -1892,6 +1957,10 @@ export function App({ editorSession }: AppProps): JSX.Element {
     } catch (error: unknown) {
       setStatus(`撤回测试文件失败：${toErrorMessage(error)}`);
       throw error;
+    } finally {
+      if (classTaskResultRevocationsRef.current.get(taskId) === revocation) {
+        classTaskResultRevocationsRef.current.delete(taskId);
+      }
     }
   }
 
@@ -1938,12 +2007,37 @@ export function App({ editorSession }: AppProps): JSX.Element {
     }
   }
 
+  function synchronizeMethodConfigurationPreload(): void {
+    const task = activeMethodConfigurationTask;
+    if (!workspaceRoot || !task) return;
+    if (task.state === 'PRELOADING') {
+      setClassTaskMethodCatalogLoadStates((states) => states[task.id]?.status === 'waiting_for_preload'
+        ? states : { ...states, [task.id]: { status: 'waiting_for_preload' } });
+      setStatus('正在加载方法与覆盖率信息...');
+      return;
+    }
+    if (activeMethodConfigurationLoadState?.status !== 'waiting_for_preload') return;
+    if (task.state === 'PRELOAD_FAILED') {
+      const message = task.lastError?.message || '当前类预加载失败';
+      setClassTaskMethodCatalogLoadStates((states) => ({ ...states, [task.id]: { status: 'error', message } }));
+      setStatus('方法与覆盖率信息加载失败');
+      return;
+    }
+    void refreshClassTaskCatalogIfNeeded({
+      workspaceRoot, taskId: task.id, qualifiedClassName: task.qualifiedClassName,
+      cachedCatalog: classTaskCatalogs[task.id],
+      workspaceLoadRequestId: workspaceLoadRequestRef.current,
+      requireLiveCatalog: true
+    });
+  }
+
   async function openClassTaskMethodConfiguration(task: ClassTaskSnapshot): Promise<void> {
     if (!workspaceRoot) {
       setStatus('请先打开工作区');
       return;
     }
 
+    if (deletedClassTaskIdsRef.current.has(task.id) || !classTaskSnapshotsRef.current[task.id]) return;
     setWorkbenchTabs((tabs) => openMethodConfigurationTab(tabs, task));
     clearMethodSelectionSaveError(task.id);
     await refreshClassTaskCatalogIfNeeded({
@@ -1991,7 +2085,9 @@ export function App({ editorSession }: AppProps): JSX.Element {
       qualifiedClassName: activeMethodConfigurationTask.qualifiedClassName,
       cachedCatalog: classTaskCatalogs[activeMethodConfigurationTask.id],
       workspaceLoadRequestId: workspaceLoadRequestRef.current,
-      requireLiveCatalog: true
+      requireLiveCatalog: true,
+      forceReload: true,
+      manualRefresh: true
     });
   }
 
@@ -2002,12 +2098,27 @@ export function App({ editorSession }: AppProps): JSX.Element {
     cachedCatalog?: ClassMethodCatalog;
     workspaceLoadRequestId: number;
     forceReload?: boolean;
+    manualRefresh?: boolean;
     requireLiveCatalog?: boolean;
+    retriedAfterPreload?: boolean;
   }): Promise<void> {
     const requestedWorkspaceRoot = input.workspaceRoot;
     const taskId = input.taskId;
+    const getCurrentTask = (): ClassTaskSnapshot | undefined => classTaskSnapshotsRef.current[taskId];
+
+    if (input.workspaceLoadRequestId !== workspaceLoadRequestRef.current
+      || !isSameWorkspaceRoot(requestedWorkspaceRoot, activeWorkspaceRootRef.current)
+      || deletedClassTaskIdsRef.current.has(taskId) || !getCurrentTask()) return;
 
     if (classTaskMethodCatalogRequestIdsRef.current.has(taskId) && !input.forceReload) {
+      return;
+    }
+
+    if (getCurrentTask()?.state === 'PRELOADING') {
+      setClassTaskMethodCatalogLoadStates((states) => ({
+        ...states, [taskId]: { status: 'waiting_for_preload' }
+      }));
+      setStatus('正在加载方法与覆盖率信息...');
       return;
     }
 
@@ -2021,6 +2132,7 @@ export function App({ editorSession }: AppProps): JSX.Element {
       [taskId]: { status: 'loading' }
     }));
 
+    let deferredForPreload = false;
     try {
       if (!input.forceReload && input.cachedCatalog?.fingerprint) {
         try {
@@ -2061,18 +2173,42 @@ export function App({ editorSession }: AppProps): JSX.Element {
             input.workspaceLoadRequestId === workspaceLoadRequestRef.current &&
             isSameWorkspaceRoot(requestedWorkspaceRoot, activeWorkspaceRootRef.current)
           ) {
-            setClassTaskMethodCatalogLoadStates((states) => omitRecordKey(states, taskId));
-            setStatus(`方法指纹检查失败，已保留上次数据：${toErrorMessage(error)}`);
+            if (getCurrentTask()?.state === 'PRELOADING') {
+              deferredForPreload = true;
+              setClassTaskMethodCatalogLoadStates((states) => ({ ...states,
+                [taskId]: { status: 'waiting_for_preload' } }));
+              setStatus('正在加载方法与覆盖率信息...');
+            } else {
+              setClassTaskMethodCatalogLoadStates((states) => omitRecordKey(states, taskId));
+              setStatus(`方法指纹检查失败，已保留上次数据：${toErrorMessage(error)}`);
+            }
           }
           return;
         }
       }
 
-      const catalog = await window.workstation.getClassTaskMethods({
-        workspaceRoot: requestedWorkspaceRoot,
-        taskId,
-        ...(input.forceReload ? { forceReload: true } : {})
-      });
+      let catalog: ClassMethodCatalog;
+      try {
+        catalog = await window.workstation.getClassTaskMethods({
+          workspaceRoot: requestedWorkspaceRoot,
+          taskId,
+          ...(input.forceReload ? { forceReload: true } : {})
+        });
+      } catch (error: unknown) {
+        if (input.manualRefresh || !input.forceReload || !toErrorMessage(error).includes(
+          '当前类任务正在运行，暂时无法刷新方法与覆盖率信息。'
+        )) throw error;
+        if (
+          classTaskMethodCatalogRequestIdsRef.current.get(taskId) !== requestId ||
+          input.workspaceLoadRequestId !== workspaceLoadRequestRef.current ||
+          !isSameWorkspaceRoot(requestedWorkspaceRoot, activeWorkspaceRootRef.current)
+        ) return;
+        // 执行可能抢先于撤回后的后台刷新；共享新任务的准备结果，避免重置运行中的资源。
+        catalog = await window.workstation.getClassTaskMethods({
+          workspaceRoot: requestedWorkspaceRoot,
+          taskId
+        });
+      }
       if (
         classTaskMethodCatalogRequestIdsRef.current.get(taskId) !== requestId ||
         input.workspaceLoadRequestId !== workspaceLoadRequestRef.current ||
@@ -2094,15 +2230,32 @@ export function App({ editorSession }: AppProps): JSX.Element {
         isSameWorkspaceRoot(requestedWorkspaceRoot, activeWorkspaceRootRef.current)
       ) {
         const message = toErrorMessage(error);
-        setClassTaskMethodCatalogLoadStates((states) => ({
-          ...states,
-          [taskId]: { status: 'error', message }
-        }));
-        setStatus(`方法配置加载失败：${message}`);
+        if (getCurrentTask()?.state === 'PRELOADING'
+          || (message.includes('当前类正在预加载') && !input.retriedAfterPreload)) {
+          deferredForPreload = true;
+          setClassTaskMethodCatalogLoadStates((states) => ({ ...states,
+            [taskId]: { status: 'waiting_for_preload' } }));
+          setStatus('正在加载方法与覆盖率信息...');
+        } else {
+          setClassTaskMethodCatalogLoadStates((states) => ({
+            ...states,
+            [taskId]: { status: 'error', message }
+          }));
+          setStatus(`方法配置加载失败：${message}`);
+        }
       }
     } finally {
       if (classTaskMethodCatalogRequestIdsRef.current.get(taskId) === requestId) {
         classTaskMethodCatalogRequestIdsRef.current.delete(taskId);
+        const latestTask = getCurrentTask();
+        if (deferredForPreload && latestTask && latestTask.state !== 'PRELOADING'
+          && latestTask.state !== 'PRELOAD_FAILED'
+          && input.workspaceLoadRequestId === workspaceLoadRequestRef.current
+          && isSameWorkspaceRoot(requestedWorkspaceRoot, activeWorkspaceRootRef.current)) {
+          await refreshClassTaskCatalogIfNeeded({
+            ...input, requireLiveCatalog: true, retriedAfterPreload: true
+          });
+        }
       }
     }
   }
@@ -2607,6 +2760,7 @@ export function App({ editorSession }: AppProps): JSX.Element {
               ) : activeWorkbenchTab?.kind === 'method_configuration' ? (
                 activeMethodConfigurationTask
                   && activeMethodConfigurationCatalog
+                  && !activeMethodConfigurationWaitingForPreload
                   && activeMethodConfigurationLoadState?.status !== 'error' ? (
                   <MethodConfigurationTab
                     task={activeMethodConfigurationTask}
@@ -2617,14 +2771,15 @@ export function App({ editorSession }: AppProps): JSX.Element {
                     onRefresh={refreshClassTaskMethodConfiguration}
                     onSave={(draft) => saveClassTaskMethodConfiguration(activeWorkbenchTab.taskId, draft)}
                   />
-                ) : activeMethodConfigurationTask && activeMethodConfigurationLoadState?.status === 'loading' ? (
+                ) : activeMethodConfigurationTask && (activeMethodConfigurationWaitingForPreload
+                  || activeMethodConfigurationLoadState?.status === 'loading') ? (
                   <div
                     className="empty-editor class-task-method-loading"
                     role="status"
                     aria-live="polite"
                   >
                     <RefreshCw className="spin" size={38} />
-                    <strong>正在读取覆盖率信息</strong>
+                    <strong>正在加载方法与覆盖率信息</strong>
                     <span>{activeWorkbenchTab.qualifiedClassName}</span>
                   </div>
                 ) : activeMethodConfigurationTask && activeMethodConfigurationLoadState?.status === 'error' ? (
@@ -3940,7 +4095,11 @@ function ensureCssColor(color: string): string {
 }
 
 function toErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(
+    /^(?:Error:\s*)?Error invoking remote method (?:'[^']+'|"[^"]+"):\s*(?:Error:\s*)?/i,
+    ''
+  );
 }
 
 function omitRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {

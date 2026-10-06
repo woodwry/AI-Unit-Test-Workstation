@@ -438,6 +438,67 @@ test('times out a stalled generation-analysis request with a retryable Analyzer 
   assert.equal(requestWasAborted, true);
 });
 
+test('bounds Analyzer requests behind the production reverse-proxy prefix', async () => {
+  const client = new AiClient(async (_url, init) => new Promise((_resolve, reject) => {
+    init.signal?.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+  }), { javaAnalyzerResponseTimeoutMilliseconds: 10 });
+  client.setBackendSettings({
+    agentServiceUrl: 'https://example.test',
+    javaAnalyzerUrl: 'https://example.test/java-analyzer'
+  });
+  const controller = new AbortController();
+  const guard = setTimeout(() => controller.abort(new Error('test guard')), 150);
+  try {
+    await assert.rejects(client.nextClassScenarioWave(SESSION_ID, {
+      reportPairId: REPORT_PAIR_ID,
+      methods: [{ methodId: METHOD_ID, completedScenarioIds: [], skippedScenarioIds: [] }],
+      maxScenarios: 25,
+      partSize: 5
+    }, controller.signal), error => isJavaAnalyzerResponseTimeoutError(error));
+  } finally {
+    clearTimeout(guard);
+  }
+});
+
+test('bounds the Analyzer response body after successful headers', async () => {
+  const controller = new AbortController();
+  const client = new AiClient(async (_url, init) => new Response(new ReadableStream({
+    start(stream) {
+      const guard = setTimeout(() => stream.error(new Error('test guard')), 150);
+      init.signal.addEventListener('abort', () => {
+        clearTimeout(guard);
+        stream.error(init.signal.reason);
+      }, { once: true });
+    }
+  }), { status: 200 }), { javaAnalyzerResponseTimeoutMilliseconds: 10 });
+  client.setManagedBackendAccessProvider(() => managedAccess());
+  const guard = setTimeout(() => controller.abort(new Error('test guard')), 150);
+  try {
+    await assert.rejects(client.nextClassScenarioWave(SESSION_ID, {
+      reportPairId: REPORT_PAIR_ID,
+      methods: [{ methodId: METHOD_ID, completedScenarioIds: [], skippedScenarioIds: [] }],
+      maxScenarios: 25,
+      partSize: 5
+    }, controller.signal), error => isJavaAnalyzerResponseTimeoutError(error));
+  } finally {
+    clearTimeout(guard);
+  }
+});
+
+test('bounds the Analyzer health probe used before retries', async () => {
+  const controller = new AbortController();
+  const client = new AiClient(async (_url, init) => new Promise((_resolve, reject) => {
+    init.signal?.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+  }), { javaAnalyzerResponseTimeoutMilliseconds: 10 });
+  client.setManagedBackendAccessProvider(() => managedAccess());
+  const guard = setTimeout(() => controller.abort(new Error('test guard')), 150);
+  try {
+    assert.equal(await client.isJavaAnalyzerHealthy(controller.signal), false);
+  } finally {
+    clearTimeout(guard);
+  }
+});
+
 test('preserves the caller abort reason while the analysis timeout is armed', async () => {
   let markRequestStarted;
   const requestStarted = new Promise((resolve) => {

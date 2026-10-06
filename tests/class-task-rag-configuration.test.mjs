@@ -156,13 +156,13 @@ test('new tasks default to false and configuration save changes selection and RA
 });
 
 
-test('method configuration has one class-level RAG checkbox in the approved header actions', async () => {
+test('method configuration has one class-level deep coverage checkbox in the approved header actions', async () => {
   const source = await readFile(
     new URL('../src/renderer/src/class-tasks/MethodConfigurationTab.tsx', import.meta.url),
     'utf8'
   );
 
-  assert.equal((source.match(/<strong>RAG<\/strong>/g) ?? []).length, 1);
+  assert.equal((source.match(/<strong>深度覆盖<\/strong>/g) ?? []).length, 1);
   assert.match(source, /type="checkbox"[\s\S]*checked=\{ragEnabled\}/);
   assert.doesNotMatch(source, /role="columnheader"[^>]*>\s*RAG/);
   assert.doesNotMatch(source, /class-task-method-row[\s\S]{0,500}<strong>RAG<\/strong>/);
@@ -174,7 +174,7 @@ test('method configuration has one class-level RAG checkbox in the approved head
   assert.match(source, /inspectRagConfigurationReadiness/);
   assert.match(source, /请先在设置中完成 Embedding 配置/);
   assert.match(source, /class-task-rag-option.*unconfigured/s);
-  assert.match(source, /title="基于RAG提升单元测试质量"/);
+  assert.match(source, /title="按未覆盖场景分批生成，并使用知识库辅助修复；不勾选时将全部所选方法一次生成"/);
   assert.match(source, /class-task-rag-warning[\s\S]*class-task-rag-option/);
   const option = source.indexOf('class-task-rag-option');
   const headingActions = source.indexOf('className="class-task-method-heading-actions"');
@@ -200,3 +200,46 @@ test('method configuration has one class-level RAG checkbox in the approved head
   assert.match(source, /disabled=\{!methodSelectable \|\| selectionLocked\}/);
   assert.match(source, /onSave\(\{[\s\S]*ragEnabled/);
 });
+
+for (const state of ['COMPLETED', 'TERMINATED', 'FAILED']) {
+  test(`configuration changes cannot discard an unhandled ${state} result`, async t => {
+    const directory = await mkdtemp(join(tmpdir(), 'pending-result-selection-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const store = new ClassTaskStore(join(directory, 'tasks.json'));
+    const registry = new ClassTaskRegistryService({ store });
+    const artifact = {
+      id: 'pending-artifact', filePath: 'D:\\work\\module\\src\\test\\java\\example\\Task1Test.java',
+      testClassName: 'Task1Test', ordinaryTestMethodCount: 1, methodIds: ['old'],
+      sha256: 'a'.repeat(64), sealed: true, accepted: false, createdAt: NOW, updatedAt: NOW
+    };
+    await store.save({version: 3, tasks: {[TASK_ID]: {
+      ...legacySnapshot({state}), ragEnabled: true, repairAttemptLimit: 12, unlimitedRepair: false,
+      selectionMode: 'EXPLICIT', selectedMethodIds: ['old'], methodOrder: ['old'],
+      generatedArtifacts: [artifact], finishedAt: NOW,
+      coverageCurrent: {lineCovered: 1, lineMissed: 1, lineTotal: 2,
+        branchCovered: 0, branchMissed: 0, branchTotal: 0}
+    }}});
+    await registry.reload();
+    const before = registry.snapshot(TASK_ID);
+    for (const args of [
+      ['EXPLICIT', ['new'], ['new'], true, 12, false],
+      ['EXPLICIT', ['old'], ['old'], false, 12, false],
+      ['EXPLICIT', ['old'], ['old'], true, 6, false]
+    ]) {
+      await assert.rejects(registry.saveSelection(TASK_ID, ...args), /请先接受或撤回.*保存配置/);
+      assert.deepEqual(registry.snapshot(TASK_ID), before);
+      assert.deepEqual((await store.load()).tasks[TASK_ID], before);
+    }
+    // Saving the unchanged configuration is harmless, and accepted results allow a new selection.
+    const same = await registry.saveSelection(TASK_ID, 'EXPLICIT', ['old'], ['old'], true, 12, false);
+    assert.deepEqual(same.generatedArtifacts, [artifact]);
+    assert.equal(same.state, state);
+    await store.save({version: 3, tasks: {[TASK_ID]: {
+      ...same, generatedArtifacts: [{...artifact, accepted: true}]
+    }}});
+    await registry.reload();
+    const next = await registry.saveSelection(TASK_ID, 'EXPLICIT', ['new'], ['new'], false, 6, false);
+    assert.equal(next.state, 'READY');
+    assert.deepEqual(next.selectedMethodIds, ['new']);
+  });
+}

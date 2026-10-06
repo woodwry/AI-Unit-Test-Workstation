@@ -51,10 +51,6 @@ export class GeneratedTestFailurePrunerService {
       startOffset: number;
       endOffset: number;
     }>();
-    const importComments = new Map<string, {
-      startOffset: number;
-      endOffset: number;
-    }>();
     for (const failure of input.execution.testReport?.failureDetails ?? []) {
       const match = this.uniqueMethodForSurefireName(
         methods,
@@ -89,6 +85,15 @@ export class GeneratedTestFailurePrunerService {
             input.candidateFilePath
           );
           if (statement) {
+            // An assertion can also execute the act (lambda, method reference,
+            // or inline call). Preserve that failure as a complete commented
+            // test instead of turning it into an active test without its act.
+            if (assertionExecutesCode(
+              input.code.slice(statement.startOffset, statement.endOffset)
+            )) {
+              selected.add(match);
+              continue;
+            }
             statementComments.set(
               `${statement.startOffset}:${statement.endOffset}`,
               { method: match, ...statement }
@@ -120,46 +125,8 @@ export class GeneratedTestFailurePrunerService {
         const match = matches[0];
         if (match.isTestMethod) {
           selected.add(match);
-        } else {
-          const callers = this.callingTests(
-            input.code,
-            allMethods,
-            methods,
-            match
-          );
-          if (callers.length > 0) {
-            callers.forEach((caller) => selected.add(caller));
-          }
         }
-        continue;
       }
-
-      const importedType = explicitTypeImportAtLine(input.code, line);
-      if (!importedType) continue;
-      const referencingMethods = allMethods.filter((method) => (
-        containsIdentifier(
-          sanitizeJava(input.code.slice(method.startOffset, method.endOffset)),
-          importedType.simpleName
-        )
-      ));
-      const affectedTests = new Set<JavaMethodSpan>();
-      for (const method of referencingMethods) {
-        if (method.isTestMethod) {
-          affectedTests.add(method);
-          continue;
-        }
-        this.callingTests(input.code, allMethods, methods, method)
-          .forEach((caller) => affectedTests.add(caller));
-      }
-      if (affectedTests.size === 0) continue;
-      affectedTests.forEach((method) => selected.add(method));
-      importComments.set(
-        `${importedType.startOffset}:${importedType.endOffset}`,
-        {
-          startOffset: importedType.startOffset,
-          endOffset: importedType.endOffset
-        }
-      );
     }
 
     const ordered = methods.filter((method) => selected.has(method));
@@ -182,11 +149,6 @@ export class GeneratedTestFailurePrunerService {
         startOffset: comment.startOffset,
         endOffset: comment.endOffset,
         replacement: commentAssertionStatement(input.code, comment)
-      })),
-      ...[...importComments.values()].map((comment) => ({
-        startOffset: comment.startOffset,
-        endOffset: comment.endOffset,
-        replacement: commentImport(input.code, comment)
       }))
     ]);
     return {
@@ -195,7 +157,7 @@ export class GeneratedTestFailurePrunerService {
     };
   }
 
-  /** Stable repair comments whole attributable tests, including assertion failures. */
+  /** Only direct test diagnostics can justify commenting a whole test. */
   commentFailingTestMethods(
     input: PruneFailedMethodsInput
   ): CommentFailingTestMethodsResult {
@@ -221,9 +183,6 @@ export class GeneratedTestFailurePrunerService {
       const method = matches[0];
       if (method.isTestMethod) {
         selected.add(method);
-      } else {
-        this.callingTests(input.code, allMethods, tests, method)
-          .forEach((test) => selected.add(test));
       }
     }
     const ordered = tests.filter((method) => selected.has(method));
@@ -274,30 +233,6 @@ export class GeneratedTestFailurePrunerService {
     };
   }
 
-  private callingTests(
-    code: string,
-    allMethods: JavaMethodSpan[],
-    tests: JavaMethodSpan[],
-    target: JavaMethodSpan
-  ): JavaMethodSpan[] {
-    const methodsByName = new Map<string, JavaMethodSpan[]>();
-    for (const method of allMethods) {
-      const entries = methodsByName.get(method.name) ?? [];
-      entries.push(method);
-      methodsByName.set(method.name, entries);
-    }
-    const calls = new Map<JavaMethodSpan, JavaMethodSpan[]>();
-    for (const method of allMethods) {
-      const invoked = this.structureService.invokedMethods(code, method)
-        .flatMap((name) => {
-          const candidates = methodsByName.get(name) ?? [];
-          return candidates.length === 1 ? candidates : [];
-        });
-      calls.set(method, invoked);
-    }
-    return tests.filter((test) => reaches(test, target, calls));
-  }
-
   private uniqueMethodForSurefireName(
     methods: JavaMethodSpan[],
     testName: string
@@ -313,61 +248,6 @@ export class GeneratedTestFailurePrunerService {
     });
     return matches.length === 1 ? matches[0] : null;
   }
-}
-
-function explicitTypeImportAtLine(
-  code: string,
-  line: number
-): {
-  simpleName: string;
-  startOffset: number;
-  endOffset: number;
-} | null {
-  const range = lineRange(code, line);
-  if (!range) return null;
-  const source = code.slice(range.startOffset, range.endOffset);
-  const match = /^\s*import\s+(?!static\b)([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*;\s*$/.exec(
-    source
-  );
-  if (!match) return null;
-  const simpleName = match[1].split('.').at(-1) ?? '';
-  if (!simpleName || simpleName === '*') return null;
-  return {
-    simpleName,
-    startOffset: range.startOffset,
-    endOffset: range.endOffset
-  };
-}
-
-function containsIdentifier(code: string, name: string): boolean {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`\\b${escaped}\\b`).test(code);
-}
-
-function commentImport(
-  code: string,
-  range: { startOffset: number; endOffset: number }
-): string {
-  const source = code.slice(range.startOffset, range.endOffset);
-  const indent = /^[\t ]*/.exec(source)?.[0] ?? '';
-  return `${indent}// ${source.slice(indent.length)}`;
-}
-
-function reaches(
-  start: JavaMethodSpan,
-  target: JavaMethodSpan,
-  calls: ReadonlyMap<JavaMethodSpan, JavaMethodSpan[]>
-): boolean {
-  const pending = [...(calls.get(start) ?? [])];
-  const visited = new Set<JavaMethodSpan>();
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (!current || visited.has(current)) continue;
-    if (current === target) return true;
-    visited.add(current);
-    pending.push(...(calls.get(current) ?? []));
-  }
-  return false;
 }
 
 function replaceRanges(
@@ -510,7 +390,13 @@ function statementRangeAtLine(
   let parenthesisDepth = 0;
   let squareDepth = 0;
   let braceDepth = 0;
-  for (let index = anchor - 1; index >= bodyStart; index -= 1) {
+  // A diagnostic on the first token of an assertion identifies its start.
+  // Scanning backwards across a preceding try/catch would include unrelated
+  // cleanup in the assertion comment. Continuation lines still use the scan.
+  const startsAssertion = /^(?:[A-Za-z_$][\w$]*\s*\.\s*)*(?:assert[A-Z][\w$]*|fail|verify(?:NoInteractions|NoMoreInteractions|ZeroInteractions)?|assertSoftly|then)\s*\(/
+    .test(lineSource.slice(firstToken.index));
+  if (startsAssertion) startOffset = anchor;
+  for (let index = startsAssertion ? bodyStart - 1 : anchor - 1; index >= bodyStart; index -= 1) {
     const character = sanitized[index];
     if (character === ')') parenthesisDepth += 1;
     else if (character === '(' && parenthesisDepth > 0) parenthesisDepth -= 1;
@@ -577,6 +463,15 @@ function looksLikeAssertionStatement(source: string): boolean {
     || /(?:^|[^\w$])verify(?:NoInteractions|NoMoreInteractions|ZeroInteractions)?\s*\(/m.test(sanitized)
     || /(?:^|[^\w$])assertSoftly\s*\(/m.test(sanitized)
     || /(?:^|[^\w$])then\s*\([\s\S]*?\)\s*\.\s*should\b/m.test(sanitized);
+}
+
+function assertionExecutesCode(source: string): boolean {
+  const sanitized = sanitizeJava(source);
+  const assertion = /\b(?:assert[A-Z][\w$]*|fail)\s*\(/.exec(sanitized);
+  const argumentsSource = assertion
+    ? sanitized.slice(assertion.index + assertion[0].length)
+    : /^\s*assert\b/.test(sanitized) ? sanitized : '';
+  return /->|::|\b[A-Za-z_$][\w$]*\s*\(/.test(argumentsSource);
 }
 
 function commentAssertionStatement(

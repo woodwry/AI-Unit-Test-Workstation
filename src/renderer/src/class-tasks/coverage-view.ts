@@ -1,3 +1,4 @@
+import { canHandleClassTaskResult } from '../../../shared/class-task-contracts.ts';
 import type {
   ClassTaskResultSnapshot,
   ClassTaskState,
@@ -105,7 +106,10 @@ export function buildCoverageView(result: ClassTaskResultSnapshot): ClassTaskCov
   };
 }
 
-export function resolveClassTaskResultStatus(state: ClassTaskState): ClassTaskResultStatusView {
+export function resolveClassTaskResultStatus(
+  state: ClassTaskState,
+  hasUnhandledResult = false
+): ClassTaskResultStatusView {
   switch (state) {
     case 'COMPLETED': return { label: '已完成', tone: 'success' };
     case 'TERMINATED': return { label: '已终止', tone: 'terminated' };
@@ -114,7 +118,7 @@ export function resolveClassTaskResultStatus(state: ClassTaskState): ClassTaskRe
     case 'PAUSED': return { label: '已暂停', tone: 'neutral' };
     case 'STOPPING': return { label: '正在终止', tone: 'active' };
     case 'PRELOADING': return { label: '正在预加载', tone: 'active' };
-    case 'READY': return { label: '待执行', tone: 'neutral' };
+    case 'READY': return { label: hasUnhandledResult ? '待处理' : '待执行', tone: 'neutral' };
     case 'PRELOAD_FAILED': return { label: 'Maven 执行失败', tone: 'warning' };
     case 'FAILED': return { label: '执行失败', tone: 'warning' };
     case 'INTERRUPTED': return { label: '已中断', tone: 'warning' };
@@ -122,11 +126,15 @@ export function resolveClassTaskResultStatus(state: ClassTaskState): ClassTaskRe
 }
 
 export function shouldShowClassTaskResultActions(result: {
+  state: ClassTaskState;
   artifacts: readonly unknown[];
   canAccept: boolean;
   canRevoke: boolean;
-}): boolean {
-  return result.artifacts.length > 0 && (result.canAccept || result.canRevoke);
+}, taskState: ClassTaskState = result.state): boolean {
+  return canHandleClassTaskResult(taskState)
+    && canHandleClassTaskResult(result.state)
+    && result.artifacts.length > 0
+    && (result.canAccept || result.canRevoke);
 }
 
 export type PendingClassTaskResultAction = 'accept' | 'revoke' | null;
@@ -157,16 +165,19 @@ export function handleContributionOutsideClick(
 
 function buildMetricView(
   kind: CoverageMetricKind,
-  baseline: ExactCoverageCounts,
-  current: ExactCoverageCounts,
+  baseline: ExactCoverageCounts | null,
+  current: ExactCoverageCounts | null,
   contributions: readonly CoverageContribution[],
   artifactById: ReadonlyMap<string, GeneratedClassTaskArtifact>,
   accepted: boolean,
   acceptedArtifactIds: ReadonlySet<string>
 ): CoverageMetricView {
-  const baselineCovered = kind === 'lines' ? baseline.lineCovered : baseline.branchCovered;
-  const currentCovered = kind === 'lines' ? current.lineCovered : current.branchCovered;
-  const total = kind === 'lines' ? current.lineTotal : current.branchTotal;
+  const baselineCovered = baseline === null ? 0
+    : kind === 'lines' ? baseline.lineCovered : baseline.branchCovered;
+  const currentCovered = current === null ? 0
+    : kind === 'lines' ? current.lineCovered : current.branchCovered;
+  const total = baseline === null || current === null ? 0
+    : kind === 'lines' ? current.lineTotal : current.branchTotal;
   const available = total > 0;
   const previouslyAcceptedAdded = contributions.reduce((sum, contribution) => (
     acceptedArtifactIds.has(contribution.artifactId)

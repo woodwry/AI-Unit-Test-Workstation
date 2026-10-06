@@ -3,8 +3,17 @@ import test from 'node:test';
 
 import {
   JavaTestStructureService,
-  normalizeJavaForComparison
+  normalizeJavaForComparison,
+  sanitizeJava
 } from '../src/main/services/java-test-structure.service.ts';
+
+test('Java masking preserves UTF-16 positions when comments contain supplementary characters', () => {
+  const code = '// 🧪 archived\npublic class ExampleTest {}';
+  const masked = sanitizeJava(code);
+  assert.equal(masked.length, code.length);
+  assert.equal(masked.indexOf('public class'), code.indexOf('public class'));
+  assert.equal(masked.slice(code.indexOf('public class')), 'public class ExampleTest {}');
+});
 
 
 test('Java structure comparison ignores comments and formatting while preserving literals', () => {

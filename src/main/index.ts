@@ -4,6 +4,7 @@ import {
   ensureGlobalSnapshotPage,
   cancelGlobalKnowledgeImport,
   ensureGlobalTaskKnowledge,
+  lookupGlobalRepairKnowledge,
   executeGlobalKnowledge
 } from './services/global-knowledge.service';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, net } from 'electron';
@@ -109,6 +110,7 @@ import {
 } from '../shared/auth-contracts';
 import {
   CLASS_TASK_CHANNELS,
+  type ClassTaskMethodCatalogChangedEvent,
   type ClassTaskSnapshot
 } from '../shared/class-task-contracts';
 import {
@@ -770,6 +772,14 @@ function validateLoginRequest(value: unknown): LoginRequest {
   };
 }
 
+function publishClassTaskMethodCatalog(event: ClassTaskMethodCatalogChangedEvent): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+      window.webContents.send(CLASS_TASK_CHANNELS.methodCatalogChanged, event);
+    }
+  }
+}
+
 function validateEmailRegistrationCodeRequest(value: unknown): EmailRegistrationCodeRequest {
   const record = requireRecord(value);
   return {
@@ -990,6 +1000,10 @@ if (hasSingleInstanceLock) {
     console.info(`[rag] ${event}`, fields);
   };
   const ragIndexCoordinator = new RagIndexCoordinator({
+    globalKnowledgeLookup: async ({ context, embeddingContext, requestedFqns, requestedMethods, signal }) => {
+      if (!context.activeIndex) throw new TypeError('RAG active scope is required.');
+      return lookupGlobalRepairKnowledge({ context, embeddingContext, requestedFqns, requestedMethods, signal }, aiClient);
+    },
     globalKnowledge: async (context, embeddingContext, signal) => {
       const modulePom = await fs.readFile(join(context.scope.moduleRoot, 'pom.xml'), 'utf8').catch(() => undefined);
       return validateRagActiveIndexIdentity(await aiClient.globalKnowledge({
@@ -1043,6 +1057,7 @@ if (hasSingleInstanceLock) {
     },
     ragTelemetry,
     broadcast: publishClassTaskSnapshot,
+    onMethodCatalogChanged: publishClassTaskMethodCatalog,
     recordTaskExecution: () => authSessionService.recordTaskExecution(),
     assertBackendReady: app.isPackaged && !isRemoteBackendMode() && !isExternalBackendClientMode()
       ? assertManagedBackendRuntimeReady

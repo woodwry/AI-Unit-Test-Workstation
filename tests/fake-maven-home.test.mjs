@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import { ShellService } from '../src/main/services/shell.service.ts';
+import { GeneratedTestWatchdogService } from '../src/main/services/generated-test-watchdog.service.ts';
 import { createFakeMavenHome } from './e2e/support/fake-maven.mjs';
 
 test('temporary fake Maven home satisfies the real ShellService boundary', async (t) => {
@@ -48,6 +49,14 @@ test('temporary fake Maven home satisfies the real ShellService boundary', async
   assert.ok((await stat(executionDataPath)).size > 0);
 
   const generatedReports = join(moduleRoot, 'target', 'fixture', 'generated-reports');
+  // This fake toolchain has no javac. Supply its fixture bytecode through the
+  // runtime installer; real watchdog compilation is tested in its own suite.
+  await new GeneratedTestWatchdogService().install(moduleRoot, async (_sources, output) => {
+    const runtimePackage = join(output, 'aiunittest', 'runtime');
+    await mkdir(runtimePackage, { recursive: true });
+    await writeFile(join(runtimePackage, 'MethodWatchdog.class'), 'fixture-watchdog', 'utf8');
+    return { command: 'fixture-javac', cwd: moduleRoot, exitCode: 0, stdout: '', stderr: '' };
+  });
   const compile = await shell.runMavenGeneratedTestCompile(
     moduleRoot,
     settings,

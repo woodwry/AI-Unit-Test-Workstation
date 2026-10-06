@@ -2,8 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { constants, promises as fs } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DOMParser, type Element as XmlElement } from '@xmldom/xmldom';
-import type { ExactCoverageCounts } from '../../shared/class-task-contracts.ts';
+import type { ClassMethodCatalog, ExactCoverageCounts } from '../../shared/class-task-contracts.ts';
 import type { CoverageIdentitySnapshot } from './coverage-contribution.service.ts';
+import { AtomicJsonStore } from './atomic-json-store.ts';
 
 const MAX_REPORT_BYTES = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
@@ -55,6 +56,22 @@ export type TaskJacocoVersionPaths = {
   executionDataPath: string;
   surefireReportsDirectory: string;
   pair: JacocoArtifactPairPaths;
+};
+
+type TaskCoverageRollbackRecord = {
+  version: 1;
+  taskId: string;
+  qualifiedClassName: string;
+  pairId: string;
+  coverage: ExactCoverageCounts;
+  catalog?: ClassMethodCatalog;
+  handled?: boolean;
+};
+
+export type RetainedTaskCoverage = {
+  pair: JacocoArtifactPair;
+  coverage: ExactCoverageCounts;
+  catalog?: ClassMethodCatalog;
 };
 
 type JacocoFileSystem = Pick<typeof fs,
@@ -377,6 +394,126 @@ export class JacocoArtifactsService {
     await this.removePath(session.targetDirectory, session.taskDirectory, true);
   }
 
+  /** Independent of disposable analysis sessions; survives reset and app restart. */
+  taskResultRollbackPaths(moduleRoot: string, taskId: string): TaskJacocoSessionPaths {
+    const session = this.taskSessionPaths(moduleRoot, taskId);
+    const taskDirectory = this.managedPath(session.targetDirectory, 'jacoco', 'result-rollbacks', taskId.toLowerCase());
+    return {
+      ...session, taskDirectory, versionsDirectory: join(taskDirectory, 'versions'),
+      baselineExecutionDataPath: join(taskDirectory, 'baseline.exec'),
+      currentExecutionDataPath: join(taskDirectory, 'current.exec'),
+      baseline: this.pairPaths(taskDirectory, 'baseline'),
+      current: this.pairPaths(taskDirectory, 'current')
+    };
+  }
+
+  async retainTaskResultCoverage(
+    moduleRoot: string, taskId: string,
+    input: { coverage: ExactCoverageCounts; qualifiedClassName: string; catalog?: ClassMethodCatalog }
+  ): Promise<void> {
+    const session = this.taskSessionPaths(moduleRoot, taskId);
+    const retained = this.taskResultRollbackPaths(moduleRoot, taskId);
+    await this.validateTargetDirectory(moduleRoot, session.targetDirectory);
+    const store = await this.taskRollbackStore(retained, taskId);
+    let record = await store.read();
+    if (record?.handled) {
+      await this.removePath(retained.targetDirectory, retained.taskDirectory, true);
+      record = null;
+    }
+    if (!record) {
+      const baseline = await this.readValidatedPair(session.targetDirectory, session.baseline);
+      await this.readExactCoverageSnapshot(moduleRoot, baseline, input.coverage, input.qualifiedClassName);
+      await this.publishTaskState(retained, session.baselineExecutionDataPath, baseline, {
+        executionDataPath: retained.baselineExecutionDataPath, pair: retained.baseline
+      });
+      record = {
+        version: 1, taskId, pairId: baseline.pairId, qualifiedClassName: input.qualifiedClassName,
+        coverage: structuredClone(input.coverage),
+        ...(input.catalog?.reportPairId === baseline.pairId ? { catalog: structuredClone(input.catalog) } : {})
+      };
+      await store.write(record);
+    }
+    // Keep the preceding XML for every publication, not just the first baseline.
+    const current = await this.currentTaskPair(moduleRoot, taskId);
+    const historyDirectory = join(retained.versionsDirectory, sha256(Buffer.from(current.pairId)));
+    const history = {
+      ...retained, taskDirectory: historyDirectory,
+      currentExecutionDataPath: join(historyDirectory, 'coverage.exec'),
+      current: this.pairPaths(historyDirectory, 'coverage')
+    };
+    await this.publishTaskState(history, session.currentExecutionDataPath, current);
+  }
+
+  async readTaskResultCoverageRollback(moduleRoot: string, taskId: string): Promise<RetainedTaskCoverage | null> {
+    const retained = this.taskResultRollbackPaths(moduleRoot, taskId);
+    await this.validateTargetDirectory(moduleRoot, retained.targetDirectory);
+    const record = await (await this.taskRollbackStore(retained, taskId)).read();
+    if (!record || record.handled) return null;
+    const pair = await this.readValidatedPair(retained.targetDirectory, retained.baseline, record.pairId);
+    await this.requirePairExecutionData(pair, retained.baselineExecutionDataPath);
+    await this.readExactCoverageSnapshot(moduleRoot, pair, record.coverage, record.qualifiedClassName);
+    return { pair, coverage: structuredClone(record.coverage),
+      ...(record.catalog ? { catalog: structuredClone(record.catalog) } : {}) };
+  }
+
+  async restoreTaskResultCoverage(moduleRoot: string, taskId: string): Promise<RetainedTaskCoverage | null> {
+    const saved = await this.readTaskResultCoverageRollback(moduleRoot, taskId);
+    if (!saved) return null;
+    const retained = this.taskResultRollbackPaths(moduleRoot, taskId);
+    const session = this.taskSessionPaths(moduleRoot, taskId);
+    await this.publishTaskState(session, retained.baselineExecutionDataPath, saved.pair, {
+      executionDataPath: session.baselineExecutionDataPath, pair: session.baseline
+    });
+    const pair = await this.publishTaskState(session, retained.baselineExecutionDataPath, saved.pair);
+    return { ...saved, pair };
+  }
+
+  /** Call after accept/revoke has committed, never while results are pending. */
+  async discardTaskResultCoverageRollback(moduleRoot: string, taskId: string, options: { force?: boolean } = {}): Promise<void> {
+    const retained = this.taskResultRollbackPaths(moduleRoot, taskId);
+    const session = this.taskSessionPaths(moduleRoot, taskId);
+    await this.validateTargetDirectory(moduleRoot, retained.targetDirectory);
+    if (!options.force) {
+      const store = await this.taskRollbackStore(retained, taskId);
+      const record = await store.read();
+      if (record) await store.write({ ...record, handled: true });
+    }
+    await this.removePath(retained.targetDirectory, retained.taskDirectory, true);
+    await this.removePath(session.targetDirectory, session.versionsDirectory, true);
+  }
+
+  private async taskRollbackStore(paths: TaskJacocoSessionPaths, taskId: string): Promise<AtomicJsonStore<TaskCoverageRollbackRecord | null>> {
+    const metadataPath = join(paths.taskDirectory, 'rollback.json');
+    this.requireInside(paths.targetDirectory, metadataPath);
+    for (const path of [paths.taskDirectory, metadataPath, `${metadataPath}.bak`]) {
+      if (await this.exists(path)) await this.requireRealPathInside(paths.targetDirectory, path);
+    }
+    return new AtomicJsonStore(metadataPath, value => {
+      if (value === null) return null;
+      const record = value as TaskCoverageRollbackRecord;
+      if (!record || record.version !== 1 || record.taskId !== taskId
+        || typeof record.qualifiedClassName !== 'string' || !record.qualifiedClassName.trim()
+        || typeof record.pairId !== 'string' || !SHA256_PATTERN.test(record.pairId)
+        || !record.coverage || (record.handled !== undefined && typeof record.handled !== 'boolean')) {
+        throw new Error('Retained task coverage identity is invalid.');
+      }
+      for (const name of ['line', 'branch'] as const) {
+        const covered = record.coverage[`${name}Covered`];
+        const missed = record.coverage[`${name}Missed`];
+        const total = record.coverage[`${name}Total`];
+        if (![covered, missed, total].every(n => Number.isSafeInteger(n) && n >= 0) || covered + missed !== total) {
+          throw new Error('Retained task coverage counts are invalid.');
+        }
+      }
+      if (record.catalog && (record.catalog.taskId !== taskId || record.catalog.reportPairId !== record.pairId
+        || !Array.isArray(record.catalog.methods) || !Array.isArray(record.catalog.warnings)
+        || typeof record.catalog.analysisSessionId !== 'string')) {
+        throw new Error('Retained method catalog identity is invalid.');
+      }
+      return structuredClone(record);
+    }, () => null);
+  }
+
   classPreloadPairPaths(
     moduleRoot: string,
     fingerprint: string,
@@ -647,10 +784,9 @@ export class JacocoArtifactsService {
     };
   }
 
-  async readExactCoverageSnapshot(
+  async readCoverageSnapshot(
     moduleRoot: string,
     pair: JacocoArtifactPair,
-    countsValue: ExactCoverageCounts,
     expectedTargetClass?: string
   ): Promise<CoverageIdentitySnapshot> {
     const targetDirectory = resolve(moduleRoot, 'target');
@@ -671,74 +807,15 @@ export class JacocoArtifactsService {
     ) {
       throw new Error('JaCoCo branch snapshot target class does not match the class task.');
     }
-    const counts = validateExactCounts(countsValue);
-    const reportIdentities = exactCoverageIdentitiesFromReport(
+    const identities = exactCoverageIdentitiesFromReport(
       reportBytes,
       expectedTargetClass
-    );
-    if (reportIdentities) {
-      const result: CoverageIdentitySnapshot = {
-        pair: validatedPair,
-        counts,
-        ...reportIdentities
-      };
-      requireCoverageIdentityCounts(result, counts);
-      await this.readValidatedPair(
-        targetDirectory,
-        validatedPair,
-        validatedPair.pairId
-      );
-      return result;
-    }
-    const methods = requireArray(snapshot.methods, 'JaCoCo branch snapshot methods');
-    const lines = new Map<number, boolean>();
-    const branches = new Map<string, boolean>();
-    for (const methodValue of methods) {
-      const method = requireRecord(methodValue, 'JaCoCo branch snapshot method');
-      const targets = requireArray(
-        method.targets,
-        'JaCoCo branch snapshot method targets'
-      );
-      for (const targetValue of targets) {
-        const target = requireRecord(targetValue, 'JaCoCo coverage target');
-        const kind = requireText(target.kind, 'JaCoCo coverage target kind');
-        const covered = requireBoolean(
-          target.covered,
-          'JaCoCo coverage target covered flag'
-        );
-        if (kind === 'LINE_EXECUTE') {
-          const sourceLine = requirePositiveSafeInteger(
-            target.sourceLine,
-            'JaCoCo line target source line'
-          );
-          lines.set(sourceLine, (lines.get(sourceLine) ?? false) || covered);
-          continue;
-        }
-        if (kind !== 'BRANCH') continue;
-        const targetId = requireText(
-          target.targetId,
-          'JaCoCo branch target identity'
-        );
-        if (branches.has(targetId)) {
-          throw new Error('JaCoCo branch snapshot contains a duplicate branch identity.');
-        }
-        branches.set(targetId, covered);
-      }
-    }
-    const orderedLines = [...lines.entries()].sort((left, right) => left[0] - right[0]);
-    const orderedBranches = [...branches.entries()]
-      .sort((left, right) => left[0].localeCompare(right[0], 'en-US'));
+    ) ?? exactCoverageIdentitiesFromBranchSnapshot(snapshot);
+    const counts = exactCountsFromCoverageIdentities(identities);
     const result: CoverageIdentitySnapshot = {
       pair: validatedPair,
       counts,
-      lineIds: orderedLines.map(([line]) => `L${line}`),
-      coveredLineIds: orderedLines
-        .filter(([, covered]) => covered)
-        .map(([line]) => `L${line}`),
-      branchIds: orderedBranches.map(([identity]) => identity),
-      coveredBranchIds: orderedBranches
-        .filter(([, covered]) => covered)
-        .map(([identity]) => identity)
+      ...identities
     };
     requireCoverageIdentityCounts(result, counts);
     await this.readValidatedPair(
@@ -747,6 +824,59 @@ export class JacocoArtifactsService {
       validatedPair.pairId
     );
     return result;
+  }
+
+  async readExactCoverageSnapshot(
+    moduleRoot: string,
+    pair: JacocoArtifactPair,
+    countsValue: ExactCoverageCounts,
+    expectedTargetClass?: string
+  ): Promise<CoverageIdentitySnapshot> {
+    const counts = validateExactCounts(countsValue);
+    const result = await this.readCoverageSnapshot(
+      moduleRoot,
+      pair,
+      expectedTargetClass
+    );
+    requireCoverageIdentityCounts(result, counts);
+    return {
+      ...result,
+      counts
+    };
+  }
+
+  async taskVersionPairs(
+    moduleRoot: string,
+    taskId: string
+  ): Promise<JacocoArtifactPair[]> {
+    const session = this.taskSessionPaths(moduleRoot, taskId);
+    await this.validateTargetDirectory(moduleRoot, session.targetDirectory);
+    let entries;
+    try {
+      entries = await fs.readdir(session.versionsDirectory, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const versions = [] as { modifiedAt: number; pair: JacocoArtifactPair }[];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const versionId = entry.name.toLowerCase();
+      try {
+        this.requireUuid(versionId, 'JaCoCo task version');
+        const versionDirectory = join(session.versionsDirectory, versionId);
+        const pairPaths = this.pairPaths(versionDirectory, 'coverage');
+        const pair = await this.readValidatedPair(
+          session.targetDirectory,
+          pairPaths
+        );
+        const stat = await this.fileSystem.stat(pair.reportPath);
+        versions.push({ modifiedAt: stat.mtimeMs, pair });
+      } catch {
+        // Incomplete staged versions are ignored; a later recalculation can replace them.
+      }
+    }
+    versions.sort((left, right) => left.modifiedAt - right.modifiedAt);
+    return versions.map((item) => ({ ...item.pair }));
   }
 
   private async publishTaskState(
@@ -1412,6 +1542,72 @@ function requireXmlCount(
     throw new Error(`JaCoCo XML ${attribute} counter is invalid.`);
   }
   return value;
+}
+
+function exactCoverageIdentitiesFromBranchSnapshot(
+  snapshot: Record<string, unknown>
+): ExactCoverageIdentities {
+  const methods = requireArray(snapshot.methods, 'JaCoCo branch snapshot methods');
+  const lines = new Map<number, boolean>();
+  const branches = new Map<string, boolean>();
+  for (const methodValue of methods) {
+    const method = requireRecord(methodValue, 'JaCoCo branch snapshot method');
+    const targets = requireArray(
+      method.targets,
+      'JaCoCo branch snapshot method targets'
+    );
+    for (const targetValue of targets) {
+      const target = requireRecord(targetValue, 'JaCoCo coverage target');
+      const kind = requireText(target.kind, 'JaCoCo coverage target kind');
+      const covered = requireBoolean(
+        target.covered,
+        'JaCoCo coverage target covered flag'
+      );
+      if (kind === 'LINE_EXECUTE') {
+        const sourceLine = requirePositiveSafeInteger(
+          target.sourceLine,
+          'JaCoCo line target source line'
+        );
+        lines.set(sourceLine, (lines.get(sourceLine) ?? false) || covered);
+        continue;
+      }
+      if (kind !== 'BRANCH') continue;
+      const targetId = requireText(
+        target.targetId,
+        'JaCoCo branch target identity'
+      );
+      if (branches.has(targetId)) {
+        throw new Error('JaCoCo branch snapshot contains a duplicate branch identity.');
+      }
+      branches.set(targetId, covered);
+    }
+  }
+  const orderedLines = [...lines.entries()].sort((left, right) => left[0] - right[0]);
+  const orderedBranches = [...branches.entries()]
+    .sort((left, right) => left[0].localeCompare(right[0], 'en-US'));
+  return {
+    lineIds: orderedLines.map(([line]) => `L${line}`),
+    coveredLineIds: orderedLines
+      .filter(([, covered]) => covered)
+      .map(([line]) => `L${line}`),
+    branchIds: orderedBranches.map(([identity]) => identity),
+    coveredBranchIds: orderedBranches
+      .filter(([, covered]) => covered)
+      .map(([identity]) => identity)
+  };
+}
+
+function exactCountsFromCoverageIdentities(
+  identities: ExactCoverageIdentities
+): ExactCoverageCounts {
+  return {
+    lineCovered: identities.coveredLineIds.length,
+    lineMissed: identities.lineIds.length - identities.coveredLineIds.length,
+    lineTotal: identities.lineIds.length,
+    branchCovered: identities.coveredBranchIds.length,
+    branchMissed: identities.branchIds.length - identities.coveredBranchIds.length,
+    branchTotal: identities.branchIds.length
+  };
 }
 
 function requireCoverageIdentityCounts(
