@@ -108,6 +108,7 @@ import {
 } from './rag-index-contract.ts';
 import { sanitizePublicText } from './maven-command.ts';
 import { ModuleOperationLock } from './module-operation-lock.service.ts';
+import { jitteredRetryDelayMilliseconds } from '../retry-delay.ts';
 import { ANALYSIS_DEPENDENCY_JAR_PATH, collectAnalysisDependencyBytecode } from './analysis-dependency-bytecode.ts';
 
 export const DEFAULT_BACKEND_SETTINGS: BackendSettings = {
@@ -128,7 +129,8 @@ const DEFAULT_METHOD_ANALYSIS_RESPONSE_TIMEOUT_MS = 120_000;
 export function methodGenerationRecoveryPollDelayMilliseconds(
   idlePollIndex: number,
   initialDelayMilliseconds = METHOD_GENERATION_RECOVERY_POLL_INITIAL_MS,
-  maxDelayMilliseconds = METHOD_GENERATION_RECOVERY_POLL_MAX_MS
+  maxDelayMilliseconds = METHOD_GENERATION_RECOVERY_POLL_MAX_MS,
+  random: () => number = Math.random
 ): number {
   if (!Number.isSafeInteger(idlePollIndex) || idlePollIndex < 0) {
     throw new TypeError('Generation recovery idle poll index must be a non-negative integer.');
@@ -140,9 +142,9 @@ export function methodGenerationRecoveryPollDelayMilliseconds(
     || maxDelayMilliseconds < initialDelayMilliseconds) {
     throw new TypeError('Generation recovery maximum poll delay must cover the initial delay.');
   }
-  return Math.min(
-    maxDelayMilliseconds,
-    initialDelayMilliseconds * (2 ** Math.min(idlePollIndex, 30))
+  return jitteredRetryDelayMilliseconds(
+    Math.min(maxDelayMilliseconds, initialDelayMilliseconds * (2 ** Math.min(idlePollIndex, 30))),
+    random
   );
 }
 

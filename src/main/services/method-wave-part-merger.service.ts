@@ -135,7 +135,8 @@ export class MethodWavePartMergerService {
       }
     }
     if (accepted.length === 0) {
-      throw new Error('No structurally valid Wave Part can be merged.');
+      const diagnostics = skippedParts.map(part => `Part ${part.partIndex}: ${part.reason}`).join('; ');
+      throw new Error(`No structurally valid Wave Part can be merged. ${diagnostics}`);
     }
 
     const imports: string[] = [];

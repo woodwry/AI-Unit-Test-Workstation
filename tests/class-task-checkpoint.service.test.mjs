@@ -21,6 +21,27 @@ const METHOD_3 = '3'.repeat(64);
 const SCENARIO_ID = '3f0d9173d7f34faabbba4c89cdd3a415';
 const PART_BATCH_ID = 'c'.repeat(64);
 
+for (const code of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE', 'GENERATED_TEST_TOO_LARGE']) {
+  test(`records ${code} without replacing its diagnostic with a model-code validation error`, async t => {
+    const root = await mkdtemp(join(tmpdir(), 'class-task-generation-failure-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const state = taskState(snapshot({ qualifiedClassName: 'example.Task', moduleDisplayPath: root,
+      state: 'RUNNING', selectedMethodIds: [METHOD_1], lastError: null }));
+    const service = new ClassTaskCheckpointService({ storagePath: join(root, 'checkpoints.json'), taskState: state });
+    const message = '生成的测试代码无效。Part 1: Part member is truncated';
+    const recorded = await service.recordModelFailure(TASK_ID, { code, message, stage: 'generation' });
+    assert.equal(recorded.lastError.code, code);
+    assert.equal(recorded.lastError.message, message);
+    assert.equal(recorded.state, 'RUNNING');
+    assert.deepEqual(recorded.selectedMethodIds, [METHOD_1]);
+    assert.equal(recorded.currentMethodIndex, -1);
+    await assert.rejects(service.recordModelFailure(TASK_ID,
+      { code: 'GENERATED_TEST_EXTERNALLY_MODIFIED', message: 'not a generation output failure', stage: 'generation' }),
+    /failure code is invalid/);
+    assert.equal(state.snapshot().lastError.code, code);
+  });
+}
+
 function snapshot(overrides = {}) {
   return {
     id: TASK_ID,

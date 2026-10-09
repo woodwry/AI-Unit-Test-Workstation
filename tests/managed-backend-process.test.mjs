@@ -123,7 +123,8 @@ function createManaged({
   return { managed, child, spawnCalls, logSink };
 }
 
-test('spawns without a shell, decodes stdout lines and validates handshake plus readiness', async () => {
+test('spawns without a shell, decodes stdout lines and validates handshake plus readiness', async (t) => {
+  t.mock.method(Math, 'random', () => 0.5);
   const fetchCalls = [];
   const delays = [];
   const responses = [
@@ -161,7 +162,7 @@ test('spawns without a shell, decodes stdout lines and validates handshake plus 
   assert.deepEqual(fixture.spawnCalls[0].options.stdio, ['pipe', 'pipe', 'pipe']);
   assert.equal(fixture.spawnCalls[0].options.shell, false);
   assert.equal(fixture.spawnCalls[0].options.windowsHide, true);
-  assert.deepEqual(delays, [250, 500]);
+  assert.deepEqual(delays, [188, 375]);
   assert.deepEqual(fetchCalls.map((call) => call.url), [
     'http://127.0.0.1:49152/api/internal/ready',
     'http://127.0.0.1:49152/api/internal/ready',
@@ -181,6 +182,26 @@ test('spawns without a shell, decodes stdout lines and validates handshake plus 
   fixture.child.exit(0);
   await stopping;
   assert.equal(controlInput, 'shutdown\n');
+});
+
+test('readiness retries retain fresh jitter when the backoff ceiling stops growing', async t => {
+  const samples = [0, 0.25, 0.5, 0.75];
+  const random = t.mock.method(Math, 'random', () => samples.shift());
+  const delays = [];
+  let requests = 0;
+  const fixture = createManaged({
+    fetch: async () => jsonResponse(++requests < 5 ? 503 : 200,
+      statusBody(requests < 5 ? 'not_ready' : 'ready')),
+    sleep: async milliseconds => { delays.push(milliseconds); }
+  });
+  const starting = fixture.managed.start();
+  fixture.child.stdout.write(`${JSON.stringify(handshake())}\n`);
+  await starting;
+  assert.deepEqual(delays, [125, 312, 750, 875]);
+  assert.equal(random.mock.callCount(), 4);
+  const stopping = fixture.managed.stop();
+  fixture.child.exit(0);
+  await stopping;
 });
 
 test('rejects an exact-looking but invalid JSON handshake without echoing its content', async () => {

@@ -734,6 +734,7 @@ function harness({
   };
   const loggedEvents = [];
   const repairTelemetry = [];
+  const ragPreparationTelemetry = [];
   const service = new SingleMethodGenerationService({
     analyzer,
     agent,
@@ -777,7 +778,8 @@ function harness({
     merger,
     logs: {
       async record(value) { loggedEvents.push(value); },
-      async recordRepairTelemetry(value) { repairTelemetry.push(value); }
+      async recordRepairTelemetry(value) { repairTelemetry.push(value); },
+      async recordRagRepairPreparation(value) { ragPreparationTelemetry.push(value); }
     },
     ragIndexCoordinator: {
       async refresh(subscription, diagnosticFqns, signal, requestedMethods, methodIds) {
@@ -861,6 +863,7 @@ function harness({
     modelUsageUpdates,
     loggedEvents,
     repairTelemetry,
+    ragPreparationTelemetry,
     mergeCalls,
     operations
   };
@@ -2406,6 +2409,13 @@ test('RAG index refresh timeout degrades to no-RAG without stalling Maven verifi
   assert.ok(h.feedbackRequests[0].request.repairContext);
   assert.equal('ragRepairAttempt' in h.feedbackRequests[0].request, false);
   assert.equal('ragEmbeddingConfig' in h.feedbackRequests[0].request, false);
+  assert.ok(h.feedbackRequests[0].request.repairContext.analyzerWarnings.some(
+    (warning) => warning.includes('RAG_INDEX_REFRESH_TIMEOUT')
+  ));
+  assert.equal(h.ragPreparationTelemetry.at(-1).status, 'degraded');
+  assert.equal(h.ragPreparationTelemetry.at(-1).phase, 'refresh-index');
+  assert.equal(h.ragPreparationTelemetry.at(-1).degradationCode, 'RAG_INDEX_REFRESH_TIMEOUT');
+  assert.ok(h.ragPreparationTelemetry.at(-1).elapsedMilliseconds >= 0);
 });
 
 test('accepts multiple Surefire invocations produced by one parameterized test method', async () => {

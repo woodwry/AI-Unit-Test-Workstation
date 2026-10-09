@@ -407,7 +407,10 @@ test('runner schedules one 25-by-5 class Wave across source-method boundaries', 
   assert.deepEqual((await checkpoints.taskProgress('Task')).completedMethodIds, ['A', 'B']);
 });
 
-test('class Wave model failure keeps selected methods incomplete and resumes the same Wave', async (t) => {
+for (const failure of [
+  { code: 'MODEL_RATE_LIMITED', message: '已达到大模型平台的请求频率限制。' },
+  { code: 'GENERATED_TEST_INVALID', message: '生成的测试代码无效。Part 1: Part member is truncated' }
+]) test(`class Wave ${failure.code} keeps selected methods incomplete and resumes the same Wave`, async (t) => {
   const { checkpoints, state } = await checkpointsFor(t);
   const waveId = createHash('sha256').update('failed-class-wave').digest('hex');
   const partId = createHash('sha256').update('failed-class-part').digest('hex');
@@ -455,8 +458,7 @@ test('class Wave model failure keeps selected methods incomplete and resumes the
             skippedScenarioIds: [...wave.selectedScenarioIds],
             candidateIds: [],
             modelFailure: {
-              code: 'MODEL_RATE_LIMITED',
-              message: '已达到大模型平台的请求频率限制。',
+              ...failure,
               stage: 'generation'
             }
           };
@@ -475,7 +477,8 @@ test('class Wave model failure keeps selected methods incomplete and resumes the
     runner.run(task(), ['A', 'B'], CATALOG_IDENTITY, new AbortController().signal),
     (error) => {
       assert.equal(error.name, 'MethodGenerationRequestError');
-      assert.equal(error.code, 'MODEL_RATE_LIMITED');
+      assert.equal(error.code, failure.code);
+      assert.equal(error.message, failure.message);
       return true;
     }
   );
@@ -484,7 +487,7 @@ test('class Wave model failure keeps selected methods incomplete and resumes the
   let wave = await checkpoints.taskWaveProgress('Task');
   assert.deepEqual(progress.completedMethodIds, []);
   assert.equal(state.snapshot().currentMethodIndex, -1);
-  assert.equal(state.snapshot().lastError?.code, 'MODEL_RATE_LIMITED');
+  assert.equal(state.snapshot().lastError?.code, failure.code);
   assert.equal(wave.activeMethodId, 'A');
   assert.deepEqual(wave.methodQueue, ['B']);
   assert.equal(wave.activeWave?.waveId, waveId);

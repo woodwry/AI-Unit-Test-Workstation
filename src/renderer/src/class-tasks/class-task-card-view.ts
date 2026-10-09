@@ -334,6 +334,9 @@ const EXECUTION_STEP_LABELS: Record<ClassTaskAtomicStep, string> = {
 
 function executionFor(task: ClassTaskSnapshot): ClassTaskCardView['execution'] {
   if (task.state === 'PRELOADING') {
+    if (task.currentAtomicStep === 'WAITING_FOR_MODULE') {
+      return { label: '等待同模块任务完成预加载', animated: true };
+    }
     return task.preloadState === 'RUNNING'
       ? { label: '正在预加载构建与覆盖信息', animated: true }
       : null;
@@ -366,9 +369,10 @@ function methodProgressFor(
     | 'generatedArtifacts'
     | 'coverageCurrent'
     | 'executionMode'
+    | 'ragEnabled'
   >
 ): ClassTaskCardView['methodProgress'] {
-  if (task.executionMode === 'FULL_SOURCE') return null;
+  if (!task.ragEnabled || task.executionMode === 'FULL_SOURCE') return null;
   const total = task.methodOrder.length;
   if (!METHOD_PROGRESS_STATES.has(task.state) || total === 0) return null;
 

@@ -12,6 +12,17 @@ import {
   resolveClassTaskTotalControl
 } from '../src/renderer/src/class-tasks/class-task-card-view.ts';
 
+test('queued preload distinguishes waiting for the module from active loading', () => {
+  const queued = buildClassTaskCardView(snapshot('PRELOADING', {
+    preloadState: 'RUNNING', currentAtomicStep: 'WAITING_FOR_MODULE'
+  }));
+  assert.equal(queued.execution.label, '等待同模块任务完成预加载');
+  const loading = buildClassTaskCardView(snapshot('PRELOADING', {
+    preloadState: 'RUNNING', currentAtomicStep: 'IDLE'
+  }));
+  assert.equal(loading.execution.label, '正在预加载构建与覆盖信息');
+});
+
 test('full-source hides method and batch progress while preserving stage actions and terminal results', () => {
   for (const state of ['RUNNING','PAUSE_REQUESTED','PAUSED','STOPPING','INTERRUPTED','TERMINATED']) {
     const task = snapshot(state, { executionMode: 'FULL_SOURCE', ragEnabled: false,
@@ -22,9 +33,43 @@ test('full-source hides method and batch progress while preserving stage actions
     assert.ok(view.statusLabel);
     assert.ok(actionsForClassTask(task).length);
   }
-  assert.equal(buildClassTaskCardView(snapshot('RUNNING', { executionMode: 'LEGACY_WAVE', ragEnabled: false, methodOrder: ['a','b'] })).methodProgress?.showBar, true);
+  assert.equal(buildClassTaskCardView(snapshot('RUNNING', { executionMode: 'LEGACY_WAVE', ragEnabled: true, methodOrder: ['a','b'] })).methodProgress?.showBar, true);
+  assert.equal(buildClassTaskCardView(snapshot('RUNNING', { executionMode: 'FULL_SOURCE', ragEnabled: true, methodOrder: ['a','b'] })).methodProgress, null);
   const result = buildClassTaskCardView(snapshot('COMPLETED', { executionMode: 'FULL_SOURCE', generatedArtifacts: [artifact()] }));
   assert.ok(result.testMethodCount > 0);
+});
+
+test('non-deep-coverage cards hide method progress before execution mode is assigned and in legacy snapshots', () => {
+  for (const executionMode of [undefined, 'LEGACY_WAVE', 'FULL_SOURCE']) {
+    for (const state of ['RUNNING', 'PAUSE_REQUESTED', 'PAUSED', 'STOPPING', 'TERMINATED']) {
+      for (const currentAtomicStep of ['IDLE', 'ANALYZE_METHOD', 'MODEL_GENERATION', 'MODEL_REPAIR', 'MAVEN_TEST']) {
+        const task = snapshot(state, {
+          ragEnabled: false,
+          executionMode,
+          methodOrder: ['a', 'b', 'c', 'd'],
+          currentAtomicStep,
+          activeGenerationBatch: { methodCount: 4, scenarioCount: 25 }
+        });
+        const view = buildClassTaskCardView(task);
+        assert.equal(view.methodProgress, null, `${state}/${currentAtomicStep}/${executionMode}`);
+        assert.ok(actionsForClassTask(task).length);
+        if (state !== 'TERMINATED') assert.ok(view.execution);
+      }
+    }
+  }
+});
+
+test('deep-coverage cards retain method progress before execution mode is assigned', () => {
+  for (const executionMode of [undefined, 'LEGACY_WAVE']) {
+    const view = buildClassTaskCardView(snapshot('RUNNING', {
+      ragEnabled: true,
+      executionMode,
+      methodOrder: ['a', 'b', 'c', 'd'],
+      currentAtomicStep: 'IDLE'
+    }));
+    assert.equal(view.methodProgress?.showBar, true);
+    assert.equal(view.methodProgress?.countLabel, '完成 0/4');
+  }
 });
 
 test('inactive tasks and handled terminal tasks delete immediately without confirmation', () => {
@@ -799,6 +844,7 @@ function snapshot(state, overrides = {}) {
     preloadState: state === 'PRELOADING' ? 'RUNNING' : state === 'PRELOAD_FAILED' ? 'FAILED' : 'READY',
     repairAttemptLimit: 5,
     unlimitedRepair: false,
+    ragEnabled: true,
     selectionMode: 'ALL_BY_DEFAULT',
     selectedMethodIds: [],
     methodOrder: [],

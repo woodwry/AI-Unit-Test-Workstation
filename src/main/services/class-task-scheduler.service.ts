@@ -239,11 +239,21 @@ export class ClassTaskSchedulerService {
       if (resume ? current.state !== 'PAUSED' : !RUN_TASK_ELIGIBLE_STATES.has(current.state)) {
         throw new Error(`Class task state changed before execution: ${current.state}.`);
       }
-      const preserveRecoveredReadyCheckpoint = !resume
+      const progress = !resume && typeof current.ragEnabled === 'boolean'
+        ? await this.checkpoints.taskProgress(current.id) : null;
+      const previousMode = progress?.executionMode
+        ?? (progress?.fullSource ? 'FULL_SOURCE' : progress?.ragRun ? 'LEGACY_WAVE' : null);
+      const modeChanged = !resume && previousMode !== null
+        && typeof current.ragEnabled === 'boolean'
+        && previousMode !== (current.ragEnabled ? 'LEGACY_WAVE' : 'FULL_SOURCE');
+      const emptyCompletedQueue = !resume && current.generatedArtifacts.length === 0
+        && current.methodOrder.length > 0
+        && current.methodOrder.every(id => progress?.completedMethodIds.includes(id));
+      const preserveRecoveredReadyCheckpoint = !resume && !modeChanged
         && !preserveCheckpoint
         && current.state === 'READY'
         && await this.hasResumableProgressForCurrentSelection(current);
-      const reset = !resume
+      const reset = modeChanged || emptyCompletedQueue || !resume
         && !preserveCheckpoint
         && !preserveRecoveredReadyCheckpoint
         && (
@@ -362,6 +372,8 @@ export class ClassTaskSchedulerService {
   ): Promise<boolean> {
     if (!(await this.checkpoints.hasResumableProgress?.(task.id) ?? false)) return false;
     const progress = await this.checkpoints.taskProgress(task.id);
+    if (task.generatedArtifacts.length === 0 && task.methodOrder.length > 0
+      && task.methodOrder.every(id => progress.completedMethodIds.includes(id))) return false;
     return sameOrderedEntries(progress.resolvedMethodOrder, task.methodOrder);
   }
 
@@ -406,7 +418,10 @@ export class ClassTaskSchedulerService {
     const message = error instanceof Error ? error.message : String(error);
     const errorCode = error && typeof error === 'object' && 'code' in error
       && typeof error.code === 'string'
-      && /^(?:MODEL|ANALYSIS|METHOD_GENERATION|RAG|REPORT|BRANCH_SNAPSHOT|TASK_JACOCO)_[A-Z0-9_]{1,121}$/.test(error.code)
+      && (/^(?:MODEL|ANALYSIS|METHOD_GENERATION|RAG|REPORT|BRANCH_SNAPSHOT|TASK_JACOCO)_[A-Z0-9_]{1,121}$/.test(error.code)
+        || error.code === 'GENERATED_TEST_INVALID'
+        || error.code === 'GENERATED_TEST_INCOMPLETE'
+        || error.code === 'GENERATED_TEST_TOO_LARGE')
       ? error.code
       : 'CLASS_TASK_EXECUTION_FAILED';
     return {

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { jitteredRetryDelayMilliseconds } from '../retry-delay.ts';
 
 export class AtomicJsonStoreCorruptError extends Error {
   readonly storagePath: string;
@@ -157,7 +158,7 @@ export class AtomicJsonStore<T> {
         if (retryDelay === undefined || !isTransientRenameError(error)) {
           throw error;
         }
-        await delay(retryDelay);
+        await delay(jitteredRetryDelayMilliseconds(retryDelay));
       }
     }
   }

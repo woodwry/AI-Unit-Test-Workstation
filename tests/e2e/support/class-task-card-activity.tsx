@@ -14,6 +14,7 @@ const initialTask: ClassTaskSnapshot = {
   preloadState: 'READY',
   repairAttemptLimit: 5,
   unlimitedRepair: false,
+  ragEnabled: true,
   selectionMode: 'EXPLICIT',
   selectedMethodIds: ['method-a'],
   methodOrder: ['method-a'],

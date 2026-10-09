@@ -7,6 +7,7 @@ import ts from 'typescript';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { CircleAlert, RefreshCw, Settings } from 'lucide-react';
+import { methodCoverageRefreshBlockReason } from '../src/renderer/src/class-tasks/method-configuration-refresh-state.ts';
 
 const app = await readFile('src/renderer/src/App.tsx', 'utf8');
 function productionFunction(name, environment) {
@@ -41,6 +42,7 @@ function harness(state = 'PRELOADING') {
     isSameWorkspaceRoot: (a, b) => a === b,
     omitRecordKey: (record, key) => Object.fromEntries(Object.entries(record).filter(([name]) => name !== key)),
     toErrorMessage: (error) => error.message,
+    methodCoverageRefreshBlockReason,
     window: { workstation: { getClassTaskMethods: async () => { calls += 1; return request(); } } }
   };
   const refresh = productionFunction('refreshClassTaskCatalogIfNeeded', environment);
@@ -162,6 +164,40 @@ test('genuine catalog failures retain the retryable error state', async () => {
   assert.equal(h.calls(), 1);
   assert.equal(h.states.value[h.task.id].status, 'error');
   assert.match(h.statuses.at(-1), /方法配置加载失败/);
+});
+
+test('manual refresh does not request or reset an active task catalog', async () => {
+  for (const state of ['PRELOADING', 'RUNNING', 'PAUSE_REQUESTED', 'PAUSED', 'STOPPING']) {
+    const h = harness(state);
+    h.catalogs.value = { [h.task.id]: h.catalog };
+    await h.refresh({ ...h.input, cachedCatalog: h.catalog, forceReload: true, manualRefresh: true });
+    assert.equal(h.calls(), 0, state);
+    assert.equal(h.states.value?.[h.task.id], undefined, state);
+    assert.equal(h.catalogs.value[h.task.id], h.catalog);
+    assert.match(h.statuses.at(-1), /不能手动刷新/);
+  }
+});
+
+test('a failed manual refresh keeps the catalog and clears its warning on a successful retry', async () => {
+  const h = harness('READY');
+  h.catalogs.value = { [h.task.id]: h.catalog };
+  h.request(async () => { throw new Error('Maven report failed'); });
+  const input = { ...h.input, cachedCatalog: h.catalog, forceReload: true, manualRefresh: true };
+  await h.refresh(input);
+  assert.deepEqual(h.states.value[h.task.id], { status: 'refresh_error', message: 'Maven report failed' });
+  assert.equal(h.catalogs.value[h.task.id], h.catalog);
+  assert.match(h.statuses.at(-1), /刷新失败，已保留/);
+  h.request(async () => h.catalog);
+  await h.refresh(input);
+  assert.equal(h.calls(), 2);
+  assert.equal(h.states.value[h.task.id], undefined);
+});
+
+test('manual refresh without an existing catalog still reports a genuine load failure', async () => {
+  const h = harness('READY');
+  h.request(async () => { throw new Error('Maven report failed'); });
+  await h.refresh({ ...h.input, forceReload: true, manualRefresh: true });
+  assert.equal(h.states.value[h.task.id].status, 'error');
 });
 
 function renderProductionPane(taskState, loadState, withCatalog = false) {

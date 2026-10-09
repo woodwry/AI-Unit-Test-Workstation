@@ -43,6 +43,20 @@ test('production task card shows breathing activity, live stages, pause and comp
     (window as unknown as { updateTaskCard: (patch: Partial<ClassTaskSnapshot>) => void }).updateTaskCard(value);
   }, patch);
 
+  for (const executionMode of [undefined, 'LEGACY_WAVE'] as const) {
+    for (const currentAtomicStep of ['IDLE', 'ANALYZE_METHOD', 'MODEL_GENERATION', 'MODEL_REPAIR', 'MAVEN_TEST'] as const) {
+      await update({ ragEnabled: false, executionMode, currentAtomicStep });
+      await expect(page.getByRole('progressbar')).toHaveCount(0);
+      await expect(page.locator('.class-task-card-progress-count')).toHaveCount(0);
+      await expect(page.locator('.class-task-card-progress-active-batch')).toHaveCount(0);
+      await expect(footer).toBeVisible();
+      await expect(page.getByRole('button', { name: '暂停当前类', exact: true })).toBeVisible();
+    }
+  }
+  await page.screenshot({ path: testInfo.outputPath('task-card-non-deep-coverage.png') });
+  await update({ ragEnabled: true, executionMode: 'LEGACY_WAVE', currentAtomicStep: 'MODEL_GENERATION' });
+  await expect(page.getByRole('progressbar')).toHaveCount(1);
+
   await expect(footer).toHaveText('正在生成单元测试');
   await expectAlignedIndicators();
   await expect(page.locator('.class-task-card-spinner-slot')).toHaveCount(0);

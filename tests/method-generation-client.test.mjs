@@ -28,12 +28,12 @@ const TEST_CODE_SHA = createHash('sha256').update(TEST_CODE).digest('hex');
 const WAVE_SESSION_ID = '723e4567-e89b-42d3-a456-426614174000';
 const WAVE_ID = 'd'.repeat(64);
 
-test('generation recovery polling backs off from one second to a ten second cap', () => {
+test('generation recovery polling jitters each capped exponential window', () => {
   assert.deepEqual(
     [0, 1, 2, 3, 4, 5, 6].map((idlePollCount) => (
-      methodGenerationRecoveryPollDelayMilliseconds(idlePollCount)
+      methodGenerationRecoveryPollDelayMilliseconds(idlePollCount, 1_000, 10_000, () => 0.5)
     )),
-    [1_000, 2_000, 4_000, 8_000, 10_000, 10_000, 10_000]
+    [750, 1_500, 3_000, 6_000, 7_500, 7_500, 7_500]
   );
 });
 

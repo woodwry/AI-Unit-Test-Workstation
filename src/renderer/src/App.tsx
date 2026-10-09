@@ -76,6 +76,7 @@ import {
   MethodConfigurationTab,
   type MethodSelectionDraft
 } from './class-tasks/MethodConfigurationTab';
+import { methodCoverageRefreshBlockReason } from './class-tasks/method-configuration-refresh-state';
 import {
   activateWorkbenchTab,
   closeWorkbenchTab,
@@ -229,6 +230,7 @@ type TabContextMenuState = {
 type ClassTaskMethodCatalogLoadState =
   | { status: 'loading' }
   | { status: 'waiting_for_preload' }
+  | { status: 'refresh_error'; message: string }
   | { status: 'error'; message: string };
 
 type RagSourceLoadState =
@@ -2110,6 +2112,14 @@ export function App({ editorSession }: AppProps): JSX.Element {
       || !isSameWorkspaceRoot(requestedWorkspaceRoot, activeWorkspaceRootRef.current)
       || deletedClassTaskIdsRef.current.has(taskId) || !getCurrentTask()) return;
 
+    if (input.manualRefresh) {
+      const refreshBlockReason = methodCoverageRefreshBlockReason(getCurrentTask()!.state);
+      if (refreshBlockReason) {
+        setStatus(refreshBlockReason);
+        return;
+      }
+    }
+
     if (classTaskMethodCatalogRequestIdsRef.current.has(taskId) && !input.forceReload) {
       return;
     }
@@ -2230,7 +2240,13 @@ export function App({ editorSession }: AppProps): JSX.Element {
         isSameWorkspaceRoot(requestedWorkspaceRoot, activeWorkspaceRootRef.current)
       ) {
         const message = toErrorMessage(error);
-        if (getCurrentTask()?.state === 'PRELOADING'
+        if (input.manualRefresh && input.cachedCatalog) {
+          setClassTaskMethodCatalogLoadStates((states) => ({
+            ...states,
+            [taskId]: { status: 'refresh_error', message }
+          }));
+          setStatus(`刷新失败，已保留上次的方法与覆盖率：${message}`);
+        } else if (getCurrentTask()?.state === 'PRELOADING'
           || (message.includes('当前类正在预加载') && !input.retriedAfterPreload)) {
           deferredForPreload = true;
           setClassTaskMethodCatalogLoadStates((states) => ({ ...states,
@@ -2767,6 +2783,8 @@ export function App({ editorSession }: AppProps): JSX.Element {
                     catalog={activeMethodConfigurationCatalog}
                     isSaving={savingMethodSelectionTaskId === activeWorkbenchTab.taskId}
                     isRefreshing={activeMethodConfigurationLoadState?.status === 'loading'}
+                    refreshError={activeMethodConfigurationLoadState?.status === 'refresh_error'
+                      ? activeMethodConfigurationLoadState.message : null}
                     saveError={methodSelectionSaveErrors[activeWorkbenchTab.taskId] ?? null}
                     onRefresh={refreshClassTaskMethodConfiguration}
                     onSave={(draft) => saveClassTaskMethodConfiguration(activeWorkbenchTab.taskId, draft)}

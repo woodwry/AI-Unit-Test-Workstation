@@ -52,6 +52,24 @@ const PART_TWO = [
   ''
 ].join('\n');
 
+test('retains each rejected Part diagnostic when no structurally valid Part remains', () => {
+  const part = validPart(1, [
+    'package demo;',
+    'class TaskServiceTmp1Part1Test {',
+    '  @org.junit.jupiter.api.Test void existingTest() { org.junit.jupiter.api.Assertions.assertTrue(true); }',
+    '  @SuppressWarnings("unchecked")',
+    '}'
+  ].join('\n'));
+  assert.throws(() => new MethodWavePartMergerService().merge({
+    methodId: 'a'.repeat(64), waveId: 'b'.repeat(64), waveIndex: 1,
+    outputTestClassName: 'TaskServiceTmp1Test', parts: [part]
+  }), error => {
+    assert.match(error.message, /No structurally valid Wave Part/);
+    assert.match(error.message, /Part 1: Part member is truncated/);
+    return true;
+  });
+});
+
 test('retains class-level test initialization supplied by later Parts', () => {
   // Regression: taking only Part 1's header drops the Mockito extension from
   // later Parts, leaving every merged @Mock and @InjectMocks field null.

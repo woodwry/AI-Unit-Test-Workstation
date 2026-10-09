@@ -229,6 +229,74 @@ test('exhausted full-source Stable preserves whole failed test and audits the so
   assert.equal(audit.repairAttemptLimit, 1);
   assert.match(audit.sourceCode, /void m1_ok\(\)/);
 });
+test('resuming interrupted Stable revalidates the retained source directly, including an empty candidate', async t => {
+  const f = await setup(t, 1), execute = f.options.maven.execute, resume = f.options.agent.resumeFullSourceGenerationStream;
+  let runs = 0, queues = 0;
+  f.options.agent.resumeFullSourceGenerationStream = async (id, feedback) => {
+    const turn = await resume(id, feedback);
+    if (turn.kind === 'candidate_ready') {
+      turn.candidate.testCode = turn.candidate.testCode.replace(/@org\.junit\.jupiter\.api\.Test void m(?:[2-9]|[12]\d|30)_ok\(\)\s*\{[^}]*\}/g,'');
+      turn.candidate.generatedCodeSha256 = sourceSha256(turn.candidate.testCode);
+      turn.candidate.ordinaryTestMethodCount = 1;
+    }
+    if (turn.kind === 'completed') turn.completion.stopReason = 'repair_exhausted';
+    return turn;
+  };
+  f.options.maven.execute = async input => {
+    const execution = await execute(input);
+    if (++runs === 1) {
+      execution.status = 'test_failed';
+      execution.mavenExecutions.at(-1).exitCode = 1;
+      execution.testReport.tests = execution.testReport.generatedTests = execution.testReport.errors = 1;
+      execution.mavenExecutions.at(-1).surefireReports[0].content = `<testsuite name="${input.qualifiedTestClassName}" tests="1" failures="0" errors="1" skipped="0"><testcase name="m1_ok" classname="${input.qualifiedTestClassName}"><error type="java.lang.NullPointerException" message="fixture"/></testcase></testsuite>`;
+      execution.testReport.failureDetails = Array.from({length:1}, (_,i) => ({
+        suiteName:input.qualifiedTestClassName,testClassName:input.qualifiedTestClassName,
+        testName:`m${i+1}_ok`,kind:'error',type:'java.lang.NullPointerException',message:'fixture'
+      }));
+      return execution;
+    }
+    if (runs === 2) throw new Error('interrupted after durable Stable replacement');
+    assert.equal(input.scope, 'pruned_method_candidate');
+    const saved = await f.checkpoints.fullSourceProgress(f.task.id);
+    assert.equal(new JavaTestStructureService().findTestMethods(await readFile(saved.managedFile.path,'utf8')).length,0);
+    return {status:'test_failed',mavenExecutions:execution.mavenExecutions.map(e=>({...e,scope:input.scope,surefireReports:[]}))};
+  };
+  const service = new FullSourceGenerationService(f.options);
+  await assert.rejects(service.execute(f.task,f.task.methodOrder,f.cp,new AbortController().signal),/interrupted after durable/);
+  const saved = await f.checkpoints.fullSourceProgress(f.task.id);
+  assert.equal(saved.execution,null);
+  assert.equal(saved.stableRepair.iteration,1);
+  f.options.mavenReadyQueue = { enqueue:async () => { queues++; return {status:'unproven',mavenExecutions:[]}; } };
+  const outcome = await new FullSourceGenerationService(f.options).execute(f.task,f.task.methodOrder,saved,new AbortController().signal);
+  assert.equal(queues,0);
+  assert.equal(outcome.terminalStatus,'RETAINED_FAILURE');
+  assert.equal(outcome.bundles.length,0);
+  const final = await f.checkpoints.fullSourceProgress(f.task.id);
+  assert.equal(final.stableRepair.annotatedMemberIds.length,1);
+  assert.equal(final.repairAttemptsUsed,1);
+  assert.equal(f.trace.starts,1);
+  assert.equal(f.trace.corrections,1);
+});
+
+test('unattributed full-source Maven failure retains its exact command and source before stopping', async t => {
+  const f=await setup(t);
+  const evidence={scope:'method_candidate',phase:'test_compile',command:'mvn test-compile',exitCode:1,
+    stdout:'[ERROR] /project/OtherTest.java:[9,1] external compile error',stderr:'',surefireReports:[]};
+  f.options.mavenReadyQueue={enqueue:async submission=>{
+    await submission.activate(); await submission.isolate();
+    return {candidateId:submission.candidateId,status:'unproven',mavenExecutions:[evidence]};
+  }};
+  await assert.rejects(new FullSourceGenerationService(f.options).execute(f.task,f.task.methodOrder,f.cp,new AbortController().signal),/Maven 错误无法归属/);
+  const saved=await f.checkpoints.fullSourceProgress(f.task.id);
+  const directory=join(f.task.workspaceRoot,'.ai-unit-test/full-source-candidates',sourceSha256(f.task.id).slice(0,24),saved.candidate.candidateId);
+  const file=(await readdir(directory)).find(n=>n.endsWith('.maven-unproven.json'));
+  assert.ok(file,'exact unattributed failure must be retained');
+  const audit=JSON.parse(await readFile(join(directory,file),'utf8'));
+  assert.equal(audit.sourceSha256,sourceSha256(audit.sourceCode));
+  assert.deepEqual(audit.result.mavenExecutions,[evidence]);
+  assert.equal(f.trace.passFeedback,0);
+});
+
 test('unknown issued initial cannot be reissued even after executor reload', async t => {
   const f = await setup(t);
   const issued = await f.checkpoints.saveFullSourceProgress(f.task.id, { ...f.cp, initialCallState: 'ISSUED' });

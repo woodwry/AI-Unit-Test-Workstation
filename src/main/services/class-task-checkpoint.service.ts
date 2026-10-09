@@ -247,6 +247,7 @@ export type ClassTaskCheckpointServiceOptions = {
 
 export type PrepareClassTaskRunOptions = {
   reset: boolean;
+  executionMode?: 'LEGACY_WAVE';
   preserveModelUsage?: boolean;
   catalogIdentity?: ClassTaskCatalogIdentity;
   resolvedMethodOrder?: readonly string[];
@@ -1283,6 +1284,10 @@ export class ClassTaskCheckpointService {
       const file = await this.store.update((current) => {
         const existing = current.tasks[taskId];
         const progress = options.reset ? emptyTaskCheckpoint() : detached(existing ?? emptyTaskCheckpoint());
+        if (options.executionMode) {
+          if (progress.fullSource) throw new Error('完整源码恢复身份已冻结，不能转换为 Wave 执行。');
+          progress.executionMode = options.executionMode;
+        }
         if (progress.fullSource && catalogIdentity && resolvedMethodOrder) {
           if (!sameStrings([...progress.fullSource.identity.methodIds], resolvedMethodOrder)
             || progress.fullSource.identity.reportPairId !== catalogIdentity.reportPairId) {
@@ -1583,7 +1588,10 @@ export class ClassTaskCheckpointService {
     failure: MethodGenerationFailure
   ): Promise<ClassTaskSnapshot> {
     requireIdentifier(taskId, 'taskId');
-    if (!/^MODEL_[A-Z0-9_]{1,121}$/.test(failure.code)) {
+    if (!/^MODEL_[A-Z0-9_]{1,121}$/.test(failure.code)
+      && failure.code !== 'GENERATED_TEST_INVALID'
+      && failure.code !== 'GENERATED_TEST_INCOMPLETE'
+      && failure.code !== 'GENERATED_TEST_TOO_LARGE') {
       throw new TypeError('Model failure code is invalid.');
     }
     const message = sanitizePublicText(failure.message)

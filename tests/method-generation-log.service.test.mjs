@@ -684,6 +684,32 @@ test('model log write failures are nonfatal and surface through finish warning',
   }
 });
 
+test('persists RAG preparation latency and degradation without copying source or secrets', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'rag-repair-preparation-log-'));
+  try {
+    const service = new MethodGenerationLogService();
+    await service.begin({ enabled: true, directory });
+    await service.recordRagRepairPreparation({
+      taskId: 'task-1', qualifiedClassName: 'demo.TaskService', sessionId: 'session-1',
+      candidateId: 'candidate-1', repairAttempt: 2, phase: 'refresh-index',
+      status: 'degraded', elapsedMilliseconds: 600_012,
+      degradationCode: 'RAG_INDEX_REFRESH_TIMEOUT', occurredAt: '2026-10-16T06:28:20.000Z',
+      testCode: 'private-source', error: 'apiKey=private-secret'
+    });
+    await service.finish();
+    const text = await readFile(join(directory, '2026-10-16', 'rag-repair-preparation.jsonl'), 'utf8');
+    const record = JSON.parse(text.trim());
+    assert.equal(record.phase, 'refresh-index');
+    assert.equal(record.status, 'degraded');
+    assert.equal(record.elapsedMilliseconds, 600_012);
+    assert.equal(record.degradationCode, 'RAG_INDEX_REFRESH_TIMEOUT');
+    assert.equal(record.repairAttempt, 2);
+    assert.doesNotMatch(text, /private-source|private-secret|testCode|apiKey/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('persists bounded repair telemetry without Maven output or user source', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'method-generation-log-'));
   try {

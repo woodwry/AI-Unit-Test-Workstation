@@ -4,6 +4,7 @@ import {
   type SpawnOptions
 } from 'node:child_process';
 import { join } from 'node:path';
+import { jitteredRetryDelayMilliseconds } from '../retry-delay.ts';
 import { StringDecoder } from 'node:string_decoder';
 import type { BackendLogSink } from './backend-log-sink.ts';
 import type { ResolvedBackendServiceCommand } from './backend-resource-resolver.ts';
@@ -359,7 +360,7 @@ export class ManagedBackendProcess {
     while (!this.lifecycleAbort.signal.aborted) {
       const ready = await this.probeReadiness(handshake);
       if (ready) return;
-      await this.sleep(delayMs, this.lifecycleAbort.signal);
+      await this.sleep(jitteredRetryDelayMilliseconds(delayMs), this.lifecycleAbort.signal);
       delayMs = Math.min(delayMs * 2, MAX_READINESS_DELAY_MS);
     }
     throw this.lifecycleAbort.signal.reason ?? new Error('readiness 轮询已取消');

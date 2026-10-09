@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { jitteredRetryDelayMilliseconds } from '../retry-delay.ts';
 import type { Dirent } from 'node:fs';
 import { access, lstat, readFile, readdir, rm, rmdir } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -78,6 +79,7 @@ import {
   type TerminateAllClassTasksResult
 } from './class-task-scheduler.service.ts';
 import { ClassTaskStore } from './class-task.store.ts';
+import type { WorkspaceStateService } from './workspace-state.service.ts';
 import { transitionClassTask } from './class-task-state-machine.ts';
 import { FormalTestFilePackerService } from './formal-test-file-packer.service.ts';
 import { DirectTestLocatorService } from './direct-test-locator.service.ts';
@@ -269,6 +271,7 @@ export type ClassTaskRuntimeOptions = {
   registry: ClassTaskRuntimeRegistryPort;
   scheduler: ClassTaskRuntimeSchedulerPort;
   coordinator: ClassTaskRuntimeCoordinatorPort;
+  readPersistedMethodCatalog?: (task: ClassTaskSnapshot) => Promise<ClassMethodCatalog | null>;
   reportTotals?: ModuleJacocoReportTotalsPort;
   recordTaskExecution?: () => Promise<void>;
   flushTaskState(): Promise<void>;
@@ -278,6 +281,7 @@ export type ClassTaskRuntimeOptions = {
 
 export type ProductionClassTaskRuntimeOptions = {
   storageDirectory: string;
+  workspaceStateService?: Pick<WorkspaceStateService, 'getViewState'>;
   aiClient: Pick<
     AiClient,
     | 'createMethodAnalysisSession'
@@ -428,12 +432,14 @@ export class ClassTaskRuntimeService {
   private readonly registry: ClassTaskRuntimeRegistryPort;
   private readonly scheduler: ClassTaskRuntimeSchedulerPort;
   private readonly coordinator: ClassTaskRuntimeCoordinatorPort;
+  private readonly readPersistedMethodCatalog: NonNullable<ClassTaskRuntimeOptions['readPersistedMethodCatalog']>;
   private readonly reportTotals: ModuleJacocoReportTotalsPort;
   private readonly recordTaskExecution: () => Promise<void>;
   private readonly flushTaskState: () => Promise<void>;
   private readonly flushPreloadCache: () => Promise<void>;
   private readonly clock: () => Date;
   private readonly preparations = new Set<Promise<unknown>>();
+  private readonly methodSelectionCatalogs = new Map<string, ClassMethodCatalog>();
   private startupPromise: Promise<ClassTaskSnapshot[]> | null = null;
   private quitPromise: Promise<void> | null = null;
 
@@ -441,6 +447,7 @@ export class ClassTaskRuntimeService {
     this.registry = options.registry;
     this.scheduler = options.scheduler;
     this.coordinator = options.coordinator;
+    this.readPersistedMethodCatalog = options.readPersistedMethodCatalog ?? (async () => null);
     this.reportTotals = options.reportTotals ?? new ModuleJacocoReportTotalsService();
     this.recordTaskExecution = options.recordTaskExecution ?? (async () => undefined);
     this.flushTaskState = options.flushTaskState;
@@ -471,6 +478,7 @@ export class ClassTaskRuntimeService {
     if (ACTIVE_STATES.has(task.state)) await this.scheduler.terminateTask(task.id);
     await this.coordinator.remove(task.id);
     await this.registry.remove(task.id);
+    this.methodSelectionCatalogs.delete(task.id);
   }
 
   async reorderClassTasks(request: ReorderClassTasksRequest): Promise<ClassTaskSnapshot[]> {
@@ -543,8 +551,24 @@ export class ClassTaskRuntimeService {
     // Unhandled results keep their frozen selection. The registry permits only
     // an unchanged save, without launching a disposable analysis session.
     if (!task.generatedArtifacts.some((artifact) => !artifact.accepted)) {
-      const catalog = await this.coordinator.prepare(request.taskId);
-      validateSelection(request, catalog);
+      // A restored page already has a local method catalog. Saving must not
+      // rebuild Maven coverage or open a remote analysis session.
+      const catalog = this.coordinator.peekPreparedMethodCatalog(task.id)
+        ?? this.methodSelectionCatalogs.get(task.id)
+        ?? await this.readPersistedMethodCatalog(task);
+      const unchangedSelection = request.selectionMode === task.selectionMode
+        && request.selectedMethodIds.length === task.selectedMethodIds.length
+        && request.selectedMethodIds.every((id, index) => id === task.selectedMethodIds[index])
+        && request.methodOrder.length === task.methodOrder.length
+        && request.methodOrder.every((id, index) => id === task.methodOrder[index]);
+      // A restored page can show the saved selection before a live catalog is
+      // available. Updating only its settings must not start Maven analysis.
+      if (catalog) {
+        validateSelection(request, catalog);
+        this.methodSelectionCatalogs.set(task.id, detached(catalog));
+      } else if (!unchangedSelection) {
+        throw new Error('方法目录尚未加载，请打开或刷新方法配置后再保存。');
+      }
     }
     return this.registry.saveSelection(
       request.taskId,
@@ -561,6 +585,7 @@ export class ClassTaskRuntimeService {
     task: ClassTaskSnapshot,
     catalog: ClassMethodCatalog
   ): Promise<ClassMethodCatalog> {
+    this.methodSelectionCatalogs.set(task.id, detached(catalog));
     const preparedReport = this.coordinator.peekPreparedCoverageReport(task.id);
     const reportCoverageTotals = preparedReport
       ? preparedReport.reportPairId === catalog.reportPairId
@@ -1198,6 +1223,10 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
   private readonly dependencies: ProductionCoordinatorDependencies;
   private readonly resources = new Map<string, ProductionTaskResources>();
   private readonly partStore = new MethodWavePartStoreService();
+  private readonly reportTotals = new ModuleJacocoReportTotalsService();
+  // Keep a class's complete preload ahead of later classes, even when individual
+  // Maven/Analyzer stages release and reacquire the shared module operation lock.
+  private readonly preparationQueue = new ModuleOperationLock();
 
   constructor(dependencies: ProductionCoordinatorDependencies) {
     this.dependencies = dependencies;
@@ -1321,8 +1350,15 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     preparation.controller = controller;
     preparation.forceCoverageRefresh = forceCoverageRefresh;
     resources.preparation = preparation;
-    preparation.promise = Promise.resolve()
-      .then(() => this.prepareTask(taskId, resources, preparation))
+    preparation.promise = this.preparationQueue.runExclusive(
+      this.dependencies.registry.snapshot(taskId).moduleKey,
+      () => this.prepareTask(taskId, resources, preparation),
+      controller.signal,
+      {
+        onWaitStart: () => this.markPreparationWaiting(taskId, resources, preparation, true),
+        onWaitEnd: () => this.markPreparationWaiting(taskId, resources, preparation, false)
+      }
+    )
       .catch(async (error) => {
         if (!controller.signal.aborted || error instanceof ModulePreloadFailureError) {
           await this.recordPreparationFailure(taskId, error);
@@ -2814,6 +2850,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coverageBaseline: detached(acceptedCoverage),
       coverageCurrent: detached(acceptedCoverage),
       coverageContributions: [],
+      completionAttentionPending: false,
       updatedAt: this.now()
     });
     await this.cleanupHandledCoverageRollback(task);
@@ -2881,13 +2918,20 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coveredMethodIds: [],
       coverageCurrent: detached(task.coverageBaseline),
       coverageContributions: [],
+      completionAttentionPending: false,
       updatedAt: this.now()
     });
     if (restored) {
       await this.cleanupHandledCoverageRollback(task);
-      if (restored.catalog) this.dependencies.options.onMethodCatalogChanged?.({
-        workspaceRoot: task.workspaceRoot, catalog: detached(restored.catalog)
-      });
+      if (restored.catalog && restored.pair) {
+        resources.restoredCoverageCatalog = await this.scopeMethodCatalogTotals(
+          task, restored.catalog, restored.pair.reportPath
+        );
+        this.dependencies.options.onMethodCatalogChanged?.({
+          workspaceRoot: task.workspaceRoot,
+          catalog: detached(resources.restoredCoverageCatalog)
+        });
+      }
     }
     return this.requireResult(taskId, resources);
   }
@@ -3791,6 +3835,22 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
     }
   }
 
+  private async markPreparationWaiting(
+    taskId: string,
+    resources: ProductionTaskResources,
+    preparation: TaskPreparation,
+    waiting: boolean
+  ): Promise<void> {
+    if (resources.preparation !== preparation) return;
+    const current = this.dependencies.registry.snapshot(taskId);
+    if (current.state !== 'PRELOADING') return;
+    await this.dependencies.registry.save({
+      ...current,
+      currentAtomicStep: waiting ? 'WAITING_FOR_MODULE' : 'IDLE',
+      updatedAt: this.now()
+    });
+  }
+
   private async markPreloadReady(
     taskId: string,
     resources: ProductionTaskResources,
@@ -3836,6 +3896,10 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
   ): Promise<void> {
     const baseline = this.dependencies.coverageLedger.baseline(resources.taskId).counts;
     const task = this.dependencies.registry.snapshot(resources.taskId);
+    const prepared = this.requirePrepared(resources);
+    prepared.catalog = await this.scopeMethodCatalogTotals(
+      task, prepared.catalog, prepared.pair.reportPath
+    );
     await this.dependencies.registry.save({
       ...task,
       generatedArtifacts: uniqueArtifacts([
@@ -3854,6 +3918,17 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       workspaceRoot: task.workspaceRoot,
       catalog: detached(this.requirePrepared(resources).catalog)
     });
+  }
+
+  private async scopeMethodCatalogTotals(
+    task: ClassTaskSnapshot,
+    catalog: ClassMethodCatalog,
+    reportPath: string
+  ): Promise<ClassMethodCatalog> {
+    // Analyzer report totals cover the module. Events must use the same
+    // target-source counters as direct method-catalog reads.
+    const totals = await this.reportTotals.readReport(reportPath, task.qualifiedClassName);
+    return totals ? { ...catalog, reportCoverageTotals: totals } : catalog;
   }
 
   private updatePreparedCoverage(
@@ -4608,6 +4683,17 @@ export function createProductionClassTaskRuntime(
     registry: runtimeRegistry,
     scheduler,
     coordinator,
+    readPersistedMethodCatalog: async (task) => {
+      const view = await options.workspaceStateService?.getViewState(task.workspaceRoot);
+      const tab = view?.workbenchTabs?.find((entry) =>
+        entry.kind === 'method_configuration'
+        && entry.taskId === task.id
+        && entry.qualifiedClassName === task.qualifiedClassName
+        && identity.comparisonKey(entry.sourceFilePath) === identity.comparisonKey(task.sourceFilePath)
+        && entry.catalog?.taskId === task.id
+      );
+      return tab?.kind === 'method_configuration' ? tab.catalog ?? null : null;
+    },
     recordTaskExecution: options.recordTaskExecution,
     flushTaskState: async () => {
       await checkpoints.flush();
@@ -4719,7 +4805,8 @@ function throwIfAborted(signal: AbortSignal): void {
 export function analysisResponseTimeoutRetryDelayMilliseconds(
   retryIndex: number,
   initialDelayMilliseconds = DEFAULT_ANALYSIS_RESPONSE_TIMEOUT_RETRY_INITIAL_DELAY_MILLISECONDS,
-  maxDelayMilliseconds = DEFAULT_ANALYSIS_RESPONSE_TIMEOUT_RETRY_MAX_DELAY_MILLISECONDS
+  maxDelayMilliseconds = DEFAULT_ANALYSIS_RESPONSE_TIMEOUT_RETRY_MAX_DELAY_MILLISECONDS,
+  random: () => number = Math.random
 ): number {
   if (!Number.isSafeInteger(retryIndex) || retryIndex < 0) {
     throw new TypeError('Analysis response timeout retry index must be a non-negative integer.');
@@ -4730,7 +4817,10 @@ export function analysisResponseTimeoutRetryDelayMilliseconds(
   if (!Number.isSafeInteger(maxDelayMilliseconds) || maxDelayMilliseconds <= 0) {
     throw new TypeError('Analysis response timeout retry maximum delay must be a positive integer.');
   }
-  return Math.min(maxDelayMilliseconds, initialDelayMilliseconds * (2 ** retryIndex));
+  return jitteredRetryDelayMilliseconds(
+    Math.min(maxDelayMilliseconds, initialDelayMilliseconds * (2 ** retryIndex)),
+    random
+  );
 }
 
 async function waitForAnalysisResponseTimeoutRetry(

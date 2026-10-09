@@ -71,6 +71,19 @@ export type MavenBatchLogRecord = {
   trace: MavenBatchExecutionTraceLog;
 };
 
+export type RagRepairPreparationLogRecord = {
+  taskId: string;
+  qualifiedClassName: string;
+  sessionId: string;
+  candidateId: string;
+  repairAttempt: number;
+  phase: 'prepare-diagnostic' | 'refresh-index' | 'ready';
+  status: 'ready' | 'degraded' | 'cancelled';
+  elapsedMilliseconds: number;
+  degradationCode: string | null;
+  occurredAt: string;
+};
+
 export type MethodRepairTelemetryRecord = {
   taskId: string;
   className: string;
@@ -145,6 +158,34 @@ export class MethodGenerationLogService {
     const write = this.queue.then(() => this.write(record, modelCall));
     this.queue = write.catch(() => {
       this.firstError ??= 'Method-generation log write failed.';
+    });
+    return this.queue;
+  }
+
+  recordRagRepairPreparation(record: RagRepairPreparationLogRecord): Promise<void> {
+    if (!this.settings.enabled || !this.settings.directory) return Promise.resolve();
+    // Select public metadata explicitly; never persist an exception object or source.
+    const persisted = {
+      taskId: record.taskId.slice(0, 128),
+      qualifiedClassName: record.qualifiedClassName.slice(0, 512),
+      sessionId: record.sessionId.slice(0, 128),
+      candidateId: record.candidateId.slice(0, 128),
+      repairAttempt: record.repairAttempt,
+      phase: record.phase,
+      status: record.status,
+      elapsedMilliseconds: Math.max(0, Math.floor(record.elapsedMilliseconds)),
+      degradationCode: record.degradationCode?.slice(0, 128) ?? null,
+      occurredAt: record.occurredAt
+    };
+    const write = this.queue.then(async () => {
+      const occurredAt = parseLogTimestamp(persisted.occurredAt, 'RAG preparation');
+      const directory = join(this.settings.directory as string, formatDate(occurredAt));
+      await fs.mkdir(directory, { recursive: true });
+      await fs.appendFile(join(directory, 'rag-repair-preparation.jsonl'),
+        redactedJson(persisted).replace(/\r?\n\s*/g, '') + '\n', 'utf8');
+    });
+    this.queue = write.catch(() => {
+      this.firstError ??= 'RAG preparation log write failed.';
     });
     return this.queue;
   }

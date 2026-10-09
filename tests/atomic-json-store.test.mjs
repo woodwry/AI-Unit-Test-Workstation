@@ -108,6 +108,7 @@ test('writes through a same-directory unique temp file and keeps a valid backup'
 });
 
 test('retries a transient Windows EPERM when publishing the main file', async (context) => {
+  const random = context.mock.method(Math, 'random', () => 0.5);
   const path = await makeStorePath(context);
   let attempts = 0;
   const store = new AtomicJsonStore(
@@ -128,6 +129,7 @@ test('retries a transient Windows EPERM when publishing the main file', async (c
   await store.write(value);
 
   assert.equal(attempts, 2);
+  assert.equal(random.mock.callCount(), 1, 'the transient rename wait must draw jitter');
   assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), value);
 });
 

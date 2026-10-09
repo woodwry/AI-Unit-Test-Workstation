@@ -33,6 +33,17 @@ async function fixture(t) {
   return { service, storagePath, identity, batch, taskId: task.id, getTask: () => task };
 }
 
+test('legacy execution mode remains explicit after RAG run cleanup and checkpoint reload', async t => {
+  const f=await fixture(t), cp=f.service();
+  await cp.prepareRun(f.taskId,{reset:false,catalogIdentity:{analysisSessionId:f.identity.analysisSessionId,
+    reportPairId:f.identity.reportPairId},resolvedMethodOrder:f.identity.methodIds,executionMode:'LEGACY_WAVE'});
+  assert.equal((await f.service().taskProgress(f.taskId)).executionMode,'LEGACY_WAVE');
+  assert.equal(await f.service().executionModeForRun(f.taskId),'LEGACY_WAVE');
+  const full=await fixture(t), fullCheckpoint=full.service();
+  await fullCheckpoint.prepareFullSourceRun(full.taskId,full.identity);
+  await assert.rejects(fullCheckpoint.prepareRun(full.taskId,{reset:false,executionMode:'LEGACY_WAVE'}),/完整源码/);
+});
+
 test('normal APIs freeze full-source selection and initial-issued state across reload', async t => {
   const f = await fixture(t); const cp = f.service();
   const prepared = await cp.prepareFullSourceRun(f.taskId, f.identity);
