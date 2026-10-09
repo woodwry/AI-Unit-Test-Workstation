@@ -116,6 +116,34 @@ async function createHarness(t, initialTasks, execution, options = {}) {
   return { checkpoints, registry, runner, scheduler };
 }
 
+for (const [state, frozen, ragEnabled] of [
+  ['FAILED','FULL_SOURCE',true], ['FAILED','LEGACY_WAVE',false], ['READY','LEGACY_WAVE',false]
+]) test(`${state} rerun discards ${frozen} progress after changing coverage mode`, async t => {
+  const id='ModeChanged';
+  const {checkpoints,scheduler} = await createHarness(t,[task(id,state,{ragEnabled})],
+    {execute:async()=>null},{validateTask:async()=>{throw new Error('stop after preparation');}});
+  const oldProgress=checkpoints.taskProgress.bind(checkpoints), prepare=checkpoints.prepareRun.bind(checkpoints);
+  checkpoints.taskProgress=async taskId=>({...await oldProgress(taskId),executionMode:frozen,resolvedMethodOrder:['first','second']});
+  checkpoints.hasResumableProgress=async()=>true;
+  const resets=[];
+  checkpoints.prepareRun=async (taskId,options)=>{resets.push(options.reset);return prepare(taskId,options);};
+  await scheduler.runTask(id,{preserveCheckpoint:state==='FAILED'});
+  assert.equal(resets[0],true);
+});
+
+for (const state of ['READY','FAILED']) test(`a ${state} task with no artifacts cannot reuse an entirely completed method queue`, async t => {
+  const id='Revoked';
+  const {checkpoints,scheduler}=await createHarness(t,[task(id,state,{ragEnabled:false})],{execute:async()=>null},
+    {validateTask:async()=>{throw new Error('stop after preparation');}});
+  const progress=checkpoints.taskProgress.bind(checkpoints),prepare=checkpoints.prepareRun.bind(checkpoints);
+  checkpoints.taskProgress=async taskId=>({...await progress(taskId),resolvedMethodOrder:['first','second'],completedMethodIds:['first','second']});
+  checkpoints.hasResumableProgress=async()=>true;
+  const resets=[];
+  checkpoints.prepareRun=async(taskId,options)=>{resets.push(options.reset);return prepare(taskId,options);};
+  await scheduler.runTask(id);
+  assert.equal(resets[0],true);
+});
+
 test('five classes may execute concurrently while every class stays method-serial and ordered', async (t) => {
   const taskIds = ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon'];
   const activeMethods = new Map();
@@ -475,6 +503,21 @@ test('execution failure preserves a safe structured model error code for the car
   assert.equal(failed.lastError?.code, 'MODEL_NOT_FOUND');
   assert.equal(registry.snapshot('ModelFailure').lastError?.code, 'MODEL_NOT_FOUND');
 });
+
+for (const code of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE', 'GENERATED_TEST_TOO_LARGE']) {
+  test(`generation output failure preserves ${code} and its diagnostic in the task card`, async t => {
+    const message = '生成的测试代码无效。Part 1: Part member is truncated';
+    const { scheduler, registry, checkpoints } = await createHarness(t, [task('GenerationFailure')], {
+      async execute() { throw new MethodGenerationRequestError(code, message); }
+    });
+    const failed = await scheduler.runTask('GenerationFailure');
+    assert.equal(failed.state, 'FAILED');
+    assert.equal(failed.lastError?.code, code);
+    assert.equal(failed.lastError?.message, message);
+    assert.deepEqual((await checkpoints.taskProgress('GenerationFailure')).completedMethodIds, []);
+    assert.equal(registry.snapshot('GenerationFailure').currentMethodIndex, -1);
+  });
+}
 
 test('execution failure preserves a safe coverage-artifact error code for recovery', async (t) => {
   const { scheduler, registry } = await createHarness(t, [task('MissingReport')], {

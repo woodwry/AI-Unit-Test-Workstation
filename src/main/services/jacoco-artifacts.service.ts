@@ -248,8 +248,15 @@ export class JacocoArtifactsService {
       pair: this.pairPaths(versionDirectory, 'coverage')
     };
     this.requireInside(session.versionsDirectory, versionDirectory);
+    // Accept/revoke cleanup and restoring retained coverage can leave a valid
+    // session without its disposable versions directory.
+    await this.requireRealPathInside(session.targetDirectory, session.versionsDirectory);
+    await this.fileSystem.mkdir(session.versionsDirectory, { recursive: true });
+    await this.requireRealPathInside(session.targetDirectory, session.versionsDirectory);
+    let versionCreated = false;
     try {
       await this.fileSystem.mkdir(versionDirectory, { recursive: false });
+      versionCreated = true;
       await this.fileSystem.mkdir(version.surefireReportsDirectory, { recursive: false });
       await this.requireRealPathInside(session.targetDirectory, versionDirectory);
       await this.fileSystem.copyFile(
@@ -263,7 +270,9 @@ export class JacocoArtifactsService {
       );
       return version;
     } catch (error) {
-      await this.removePath(session.targetDirectory, versionDirectory, true);
+      if (versionCreated) {
+        await this.removePath(session.targetDirectory, versionDirectory, true);
+      }
       throw error;
     }
   }

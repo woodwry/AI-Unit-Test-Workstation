@@ -463,6 +463,16 @@
   opacity: .55;
 }
 
+.class-task-method-refresh-error {
+  background: color-mix(in srgb, var(--workbench-bg) 90%, #a84148);
+  border-bottom: 1px solid #a84148;
+  color: #ff9aa0;
+  flex: 0 0 auto;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  padding: 8px 18px;
+}
+
 @keyframes class-task-save-success-enter {
   from {
     opacity: 0;

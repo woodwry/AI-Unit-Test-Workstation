@@ -1968,19 +1968,29 @@ test('pauses a partially successful Wave and recovers only its model-failed Part
     wave.parts[1],
     testCode('TaskServiceTmp1Part2Test', 'recovered')
   );
+  Object.assign(first, { aggregateUsage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+    modelCallCount: 1, usageReportedCallCount: 1 });
+  Object.assign(failedSecond, { aggregateUsage: { inputTokens: 11, outputTokens: 21, totalTokens: 32 },
+    modelCallCount: 1, usageReportedCallCount: 1 });
+  Object.assign(recoveredSecond, { aggregateUsage: { inputTokens: 12, outputTokens: 22, totalTokens: 34 },
+    modelCallCount: 1, usageReportedCallCount: 1 });
   const failedCompletion = {
     parts: [first, failedSecond],
     succeededPartCount: 1,
     failedPartCount: 1,
     cancelledPartCount: 0,
-    modelCallCount: 1
+    aggregateUsage: { inputTokens: 21, outputTokens: 41, totalTokens: 62 },
+    modelCallCount: 2,
+    usageReportedCallCount: 2
   };
   const recoveredCompletion = {
     parts: [first, recoveredSecond],
     succeededPartCount: 2,
     failedPartCount: 0,
     cancelledPartCount: 0,
-    modelCallCount: 1
+    aggregateUsage: { inputTokens: 22, outputTokens: 42, totalTokens: 64 },
+    modelCallCount: 2,
+    usageReportedCallCount: 2
   };
   let recoveryRequest;
   const recoveredSessionId = '88888888-8888-4888-8888-888888888888';
@@ -2060,6 +2070,8 @@ test('pauses a partially successful Wave and recovers only its model-failed Part
   assert.deepEqual(recoveredOutcome.completedScenarioIds, ['scenario-1', 'scenario-2']);
   assert.deepEqual(recoveredOutcome.skippedScenarioIds, []);
   assert.equal(h.mavenInputs.length, 1);
+  assert.deepEqual(h.modelUsageIncrements.map(value => value.tokenUsage.totalTokens), [62, 34]);
+  assert.deepEqual(h.modelUsageIncrements.map(value => value.modelCallCount), [2, 1]);
 });
 
 test('reuses a persisted passing Wave TMP after the Analyzer report pair changes', async (t) => {
@@ -2639,8 +2651,7 @@ test('resumes a persisted MODEL_REPAIR candidate from fresh Maven evidence witho
 });
 
 for (const modelFailure of [
-  new Error('model quota exhausted'),
-  new MethodGenerationRequestError('MODEL_OUTPUT_BUDGET_EXHAUSTED', 'model returned no test code')
+  new Error('model quota exhausted')
 ]) {
 test(`rolls back a Wave repair attempt without pruning tests: ${modelFailure.message}`, async (t) => {
   const wave = workWave(1);
@@ -4827,15 +4838,124 @@ test('all invalid successful Parts remain retryable without consuming scenarios'
   assert.deepEqual(outcome.completedScenarioIds, []);
   assert.deepEqual(outcome.skippedScenarioIds, []);
   assert.deepEqual(outcome.candidateIds, []);
-  assert.deepEqual(outcome.modelFailure, {
-    code: 'GENERATED_TEST_INVALID',
-    message: '生成的测试代码无效，没有可用的测试候选。',
-    stage: 'generation'
-  });
+  assert.equal(outcome.modelFailure.code, 'GENERATED_TEST_INVALID');
+  assert.equal(outcome.modelFailure.stage, 'generation');
+  assert.match(outcome.modelFailure.message, /生成的测试代码无效/);
+  assert.match(outcome.modelFailure.message, /Part Java type is truncated/);
   assert.equal(h.mavenInputs.length, 0);
   assert.deepEqual(h.savedCandidates, []);
   assert.equal(h.savedWaves.at(-1).waveSessionId, null);
   assert.match(h.savedWaves.at(-1).recoveryRequestId, /^[0-9a-f-]{36}$/);
+});
+
+test('reexecuting a structurally invalid Wave requests new model output and accounts for both attempts', async (t) => {
+  const wave = workWave(1);
+  const invalid = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test')
+    .replace(/}\n$/, '  @SuppressWarnings("unchecked")\n}\n'));
+  const valid = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test', 'regenerated'));
+  const firstUsage = { inputTokens: 10, outputTokens: 20, totalTokens: 30 };
+  const secondUsage = { inputTokens: 11, outputTokens: 21, totalTokens: 32 };
+  Object.assign(invalid, { aggregateUsage: firstUsage, modelCallCount: 1, usageReportedCallCount: 1 });
+  Object.assign(valid, { aggregateUsage: secondUsage, modelCallCount: 1, usageReportedCallCount: 1 });
+  let initialCalls = 0;
+  let freshCalls = 0;
+  const recoveryRequests = [];
+  const h = await harness(t, {
+    wave,
+    async runWave({ onProgress }) {
+      initialCalls += 1;
+      const completion = { parts: [invalid], succeededPartCount: 1, failedPartCount: 0,
+        cancelledPartCount: 0, aggregateUsage: firstUsage, modelCallCount: 1, usageReportedCallCount: 1 };
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, invalid, 'part_succeeded'));
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    },
+    agentOverrides: {
+      async recoverMethodGenerationWaveStream(request, _modelContext, onProgress) {
+        recoveryRequests.push(structuredClone(request));
+        // Mirror the Agent: supplied terminal Parts are replayed without a model call.
+        const parts = request.terminalParts.length ? request.terminalParts : [valid];
+        if (!request.terminalParts.length) freshCalls += 1;
+        const succeededPartCount = parts.filter(part => part.status === 'succeeded').length;
+        const completion = { parts, succeededPartCount, failedPartCount: 1 - succeededPartCount,
+          cancelledPartCount: 0, aggregateUsage: succeededPartCount ? secondUsage : firstUsage,
+          modelCallCount: 1, usageReportedCallCount: 1 };
+        const sessionId = '88888888-8888-4888-8888-888888888888';
+        if (!request.terminalParts.length) {
+          await onProgress({ ...terminalEvent(4, wave, valid, 'part_succeeded'), waveSessionId: sessionId });
+        }
+        await onProgress(waveEvent(5, wave, 'wave_completed', { completion, waveSessionId: sessionId }));
+        return { waveSessionId: sessionId, eventSequence: 5, completion };
+      }
+    }
+  });
+  const progress = { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null };
+  const first = await h.service.executeWave(h.task, wave, progress, activeWaveCheckpoint(wave),
+    new AbortController().signal);
+  assert.equal(first.modelFailure.code, 'GENERATED_TEST_INVALID');
+  assert.deepEqual(first.completedScenarioIds, []);
+  assert.deepEqual(first.skippedScenarioIds, []);
+  assert.equal(h.mavenInputs.length, 0);
+  const rejected = structuredClone(h.savedWaves.at(-1));
+  assert.equal(rejected.parts[0].status, 'FAILED');
+  const second = await h.service.executeWave(h.task, wave, progress, rejected,
+    new AbortController().signal);
+  assert.deepEqual(recoveryRequests[0].terminalParts, []);
+  assert.equal(initialCalls, 1);
+  assert.equal(freshCalls, 1);
+  assert.deepEqual(second.completedScenarioIds, ['scenario-1']);
+  assert.deepEqual(second.skippedScenarioIds, []);
+  assert.equal(h.mavenInputs.length, 1);
+  assert.deepEqual(h.modelUsageIncrements.map(value => value.tokenUsage.totalTokens), [30, 32]);
+  assert.deepEqual(h.modelUsageIncrements.map(value => value.modelCallCount), [1, 1]);
+  const recordedIndex = h.savedWaves.findIndex(value => value.initialUsageRecorded);
+  assert.ok(h.savedWaves.slice(recordedIndex).every(value => value.initialUsageRecorded),
+    'usage accounting must remain monotonic, as required by the durable checkpoint service');
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 0);
+  assert.equal(h.savedCandidates.at(-1).repairAttemptLimit, h.task.repairAttemptLimit);
+});
+
+test('a long Part merge diagnostic remains within the durable checkpoint limit', async t => {
+  const wave = workWave(1);
+  const part = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test'));
+  const completion = { parts: [part], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  const h = await harness(t, { wave,
+    serviceOverrides: { partMerger: { merge() { throw new Error('truncated member '.repeat(100)); } } },
+    async runWave({ onProgress }) {
+      await onProgress(terminalEvent(1, wave, part, 'part_succeeded'));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 1, completion };
+    }
+  });
+  const result = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal);
+  assert.equal(result.modelFailure.code, 'GENERATED_TEST_INVALID');
+  assert.ok(h.savedWaves.at(-1).parts[0].failureReason.length <= 1000);
+  assert.match(h.savedWaves.at(-1).parts[0].failureReason, /^GENERATED_TEST_INVALID:/);
+});
+
+for (const reason of [
+  'No structurally valid Wave Part can be merged.',
+  'RECOVERED_PART_FAILED: No structurally valid Wave Part can be merged.',
+  'RECOVERED_PART_FAILED: RECOVERED_PART_FAILED: No structurally valid Wave Part can be merged.'
+]) test(`legacy invalid Wave retries generation after ${reason}`, async (t) => {
+  const wave = workWave(1);
+  let request;
+  const h = await harness(t, { wave,
+    async runWave() { throw new Error('use recovery with a fresh Part attempt'); },
+    agentOverrides: {
+      async recoverMethodGenerationWaveStream(value) { request = value; throw new Error('stop at recovery'); }
+    }
+  });
+  const checkpoint = activeWaveCheckpoint(wave);
+  checkpoint.recoveryRequestId = '99999999-9999-4999-8999-999999999999';
+  checkpoint.parts[0].status = 'FAILED';
+  checkpoint.parts[0].failureReason = reason;
+  await assert.rejects(h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    checkpoint, new AbortController().signal), /stop at recovery/);
+  assert.deepEqual(request.terminalParts, []);
 });
 
 test('merged repair retains the ordered union of accepted Parts type API members', async (t) => {
@@ -6155,7 +6275,64 @@ test('finite Wave repair exhaustion enters deterministic stable repair without a
   assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
 });
 
-for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE']) {
+for (const [name, corrupt] of [
+  ['package', code => code.replace('package demo;', 'package wrong;')],
+  ['class name', code => code.replace('class TaskServiceTmp1Test', 'class WrongTest')],
+  ['incomplete', code => code.slice(0, code.lastIndexOf('}'))],
+  ['test count', code => code.replace('@Test', '')],
+  ['extra tests', code => code.replace(/}\n$/, '@Test void extra() {}\n}\n')],
+  ['import', code => code.replace('import org.junit.jupiter.api.Test;', 'import org.junit.jupiter.api.Test')]
+]) test(`client ${name} validation failure consumes a repair and continues from the accepted source`, async (t) => {
+  const wave = workWave(1);
+  const first = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test', 'generated'));
+  const completion = { parts: [first], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
+  let seed;
+  let repairs = 0;
+  const h = await harness(t, { wave, taskOverrides: { repairAttemptLimit: 3 },
+    async runWave({ onProgress }) {
+      await onProgress(waveEvent(1, wave, 'wave_started'));
+      await onProgress(terminalEvent(2, wave, first, 'part_succeeded'));
+      await onProgress(waveEvent(3, wave, 'wave_completed', { completion }));
+      return { waveSessionId: '44444444-4444-4444-8444-444444444444', eventSequence: 3, completion };
+    },
+    getMethodRepairContext() { throw new Error('fallback context'); },
+    async mavenExecute(_input, { callIndex, workspaceRoot }) {
+      const actual = await readFile(join(workspaceRoot,
+        'module/src/test/java/demo/TaskServiceTmp1Test.java'), 'utf8');
+      assert.equal(actual, seed?.candidate.testCode ?? actual);
+      return callIndex === 1 ? failedExecution('generated') : passedExecution();
+    },
+    agentOverrides: {
+      async recoverMethodGenerationStream(request) {
+        seed = structuredClone(request);
+        return { kind: 'candidate_ready', sessionId: '88888888-8888-4888-8888-888888888888',
+          eventSequence: 1, candidate: structuredClone(seed.candidate) };
+      },
+      async resumeMethodGenerationStream(_sessionId, request) {
+        if (request.execution.status === 'passed') return { kind: 'completed',
+          sessionId: '88888888-8888-4888-8888-888888888888', eventSequence: 3,
+          completion: { stopReason: 'verified', bestCandidateId: seed.candidate.candidateId } };
+        repairs += 1;
+        const code = repairs === 1 ? corrupt(seed.candidate.testCode) : seed.candidate.testCode;
+        return { kind: 'candidate_ready', sessionId: '88888888-8888-4888-8888-888888888888',
+          eventSequence: 2, candidate: { ...seed.candidate, candidateVersion: repairs + 1,
+            repairAttempt: repairs, testCode: code, generatedCodeSha256: sha256(code),
+            ordinaryTestMethodCount: name === 'extra tests' && repairs === 1 ? 2 : 1 } };
+      }
+    }
+  });
+  const result = await h.service.executeWave(h.task, wave,
+    { completedTestMethodPlanIds: [], completedBatches: [], inProgressBatch: null },
+    activeWaveCheckpoint(wave), new AbortController().signal);
+  assert.equal(repairs, 2);
+  assert.equal(h.mavenInputs.length, 2);
+  assert.equal(h.savedCandidates.at(-1).llmRepairAttemptsUsed, 2);
+  assert.equal(h.savedCandidates.at(-1).status, 'PASSED');
+  assert.deepEqual(result.completedScenarioIds, ['scenario-1']);
+});
+
+for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE',
+  'GENERATED_TEST_TOO_LARGE', 'MODEL_OUTPUT_BUDGET_EXHAUSTED']) {
 test(`${outputErrorCode} exhausts the configured repair budget before stable repair`, async (t) => {
   const wave = workWave(1);
   wave.parts[0].methodTestPlan.minimumTestCount = 2;
@@ -6262,8 +6439,10 @@ test(`${outputErrorCode} exhausts the configured repair budget before stable rep
 });
 }
 
-for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE']) {
-test(`${outputErrorCode} rebuilds a failed repair session with the remaining budget and accepted candidate`, async (t) => {
+for (const unlimitedRepair of [false, true]) {
+for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE',
+  'GENERATED_TEST_TOO_LARGE', 'MODEL_OUTPUT_BUDGET_EXHAUSTED']) {
+test(`${outputErrorCode} rebuilds a failed repair session with the remaining budget and accepted candidate (unlimited=${unlimitedRepair})`, async (t) => {
   const wave = workWave(1);
   const partResult = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test'));
   const completion = { parts: [partResult], succeededPartCount: 1, failedPartCount: 0, cancelledPartCount: 0 };
@@ -6271,7 +6450,7 @@ test(`${outputErrorCode} rebuilds a failed repair session with the remaining bud
   let resumes = 0;
   const h = await harness(t, {
     wave,
-    taskOverrides: { repairAttemptLimit: 6 },
+    taskOverrides: { repairAttemptLimit: unlimitedRepair ? null : 6, unlimitedRepair },
     async runWave({ onProgress }) {
       await onProgress(waveEvent(1, wave, 'wave_started'));
       await onProgress(terminalEvent(2, wave, partResult, 'part_succeeded'));
@@ -6313,8 +6492,10 @@ test(`${outputErrorCode} rebuilds a failed repair session with the remaining bud
   assert.deepEqual(outcome.completedScenarioIds, ['scenario-1']);
 });
 }
+}
 
-for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE']) {
+for (const outputErrorCode of ['GENERATED_TEST_INVALID', 'GENERATED_TEST_INCOMPLETE',
+  'GENERATED_TEST_TOO_LARGE', 'MODEL_OUTPUT_BUDGET_EXHAUSTED']) {
 test(`${outputErrorCode} after rejecting a changed test identity consumes one repair and continues the Wave`, async (t) => {
   const wave = workWave(1);
   const partResult = succeeded(wave.parts[0], testCode('TaskServiceTmp1Part1Test'));

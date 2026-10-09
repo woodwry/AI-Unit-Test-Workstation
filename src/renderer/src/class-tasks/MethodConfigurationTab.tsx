@@ -22,6 +22,7 @@ import {
 } from './method-list-state';
 import { inspectRagConfigurationReadiness } from '../rag-embedding-interface-state';
 import { resolveRepairConfiguration } from './method-configuration-repair-state';
+import { methodCoverageRefreshBlockReason } from './method-configuration-refresh-state';
 import './class-tasks.css';
 
 export type MethodSelectionDraft = {
@@ -38,6 +39,7 @@ type MethodConfigurationTabProps = {
   catalog: ClassMethodCatalog;
   isSaving?: boolean;
   isRefreshing?: boolean;
+  refreshError?: string | null;
   saveError?: string | null;
   onRefresh: () => void | Promise<void>;
   onSave: (draft: MethodSelectionDraft) => boolean | Promise<boolean>;
@@ -106,6 +108,7 @@ export function MethodConfigurationTab({
   catalog,
   isSaving = false,
   isRefreshing = false,
+  refreshError = null,
   saveError = null,
   onRefresh,
   onSave
@@ -189,8 +192,10 @@ export function MethodConfigurationTab({
   const allSelected = areAllMethodsSelected(listState);
   const configurationLocked = isConfigurationLocked(task.state);
   const ragUnconfigured = ragConfigurationState === 'unconfigured';
+  const refreshBlockReason = methodCoverageRefreshBlockReason(task.state);
   const refreshLocked = isSaving
     || isRefreshing
+    || refreshBlockReason !== null
     || ragConfigurationState === 'checking';
   const selectionLocked = isSaving
     || isRefreshing
@@ -300,7 +305,7 @@ export function MethodConfigurationTab({
             type="button"
             className="class-task-method-refresh"
             aria-label="刷新方法与覆盖率信息"
-            title="刷新方法与覆盖率信息"
+            title={refreshBlockReason ?? '刷新方法与覆盖率信息'}
             disabled={refreshLocked}
             onClick={() => void onRefresh()}
           >
@@ -425,6 +430,12 @@ export function MethodConfigurationTab({
           </div>
         </div>
       </header>
+
+      {refreshError && (
+        <div className="class-task-method-refresh-error" role="alert">
+          刷新失败，已保留上次的方法与覆盖率：{refreshError}
+        </div>
+      )}
 
       <div className="class-task-method-toolbar">
         <label className="class-task-method-query">

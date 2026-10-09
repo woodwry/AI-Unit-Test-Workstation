@@ -78,6 +78,7 @@ import {
   type TerminateAllClassTasksResult
 } from './class-task-scheduler.service.ts';
 import { ClassTaskStore } from './class-task.store.ts';
+import type { WorkspaceStateService } from './workspace-state.service.ts';
 import { transitionClassTask } from './class-task-state-machine.ts';
 import { FormalTestFilePackerService } from './formal-test-file-packer.service.ts';
 import { DirectTestLocatorService } from './direct-test-locator.service.ts';
@@ -269,6 +270,7 @@ export type ClassTaskRuntimeOptions = {
   registry: ClassTaskRuntimeRegistryPort;
   scheduler: ClassTaskRuntimeSchedulerPort;
   coordinator: ClassTaskRuntimeCoordinatorPort;
+  readPersistedMethodCatalog?: (task: ClassTaskSnapshot) => Promise<ClassMethodCatalog | null>;
   reportTotals?: ModuleJacocoReportTotalsPort;
   recordTaskExecution?: () => Promise<void>;
   flushTaskState(): Promise<void>;
@@ -278,6 +280,7 @@ export type ClassTaskRuntimeOptions = {
 
 export type ProductionClassTaskRuntimeOptions = {
   storageDirectory: string;
+  workspaceStateService?: Pick<WorkspaceStateService, 'getViewState'>;
   aiClient: Pick<
     AiClient,
     | 'createMethodAnalysisSession'
@@ -428,12 +431,14 @@ export class ClassTaskRuntimeService {
   private readonly registry: ClassTaskRuntimeRegistryPort;
   private readonly scheduler: ClassTaskRuntimeSchedulerPort;
   private readonly coordinator: ClassTaskRuntimeCoordinatorPort;
+  private readonly readPersistedMethodCatalog: NonNullable<ClassTaskRuntimeOptions['readPersistedMethodCatalog']>;
   private readonly reportTotals: ModuleJacocoReportTotalsPort;
   private readonly recordTaskExecution: () => Promise<void>;
   private readonly flushTaskState: () => Promise<void>;
   private readonly flushPreloadCache: () => Promise<void>;
   private readonly clock: () => Date;
   private readonly preparations = new Set<Promise<unknown>>();
+  private readonly methodSelectionCatalogs = new Map<string, ClassMethodCatalog>();
   private startupPromise: Promise<ClassTaskSnapshot[]> | null = null;
   private quitPromise: Promise<void> | null = null;
 
@@ -441,6 +446,7 @@ export class ClassTaskRuntimeService {
     this.registry = options.registry;
     this.scheduler = options.scheduler;
     this.coordinator = options.coordinator;
+    this.readPersistedMethodCatalog = options.readPersistedMethodCatalog ?? (async () => null);
     this.reportTotals = options.reportTotals ?? new ModuleJacocoReportTotalsService();
     this.recordTaskExecution = options.recordTaskExecution ?? (async () => undefined);
     this.flushTaskState = options.flushTaskState;
@@ -471,6 +477,7 @@ export class ClassTaskRuntimeService {
     if (ACTIVE_STATES.has(task.state)) await this.scheduler.terminateTask(task.id);
     await this.coordinator.remove(task.id);
     await this.registry.remove(task.id);
+    this.methodSelectionCatalogs.delete(task.id);
   }
 
   async reorderClassTasks(request: ReorderClassTasksRequest): Promise<ClassTaskSnapshot[]> {
@@ -543,8 +550,24 @@ export class ClassTaskRuntimeService {
     // Unhandled results keep their frozen selection. The registry permits only
     // an unchanged save, without launching a disposable analysis session.
     if (!task.generatedArtifacts.some((artifact) => !artifact.accepted)) {
-      const catalog = await this.coordinator.prepare(request.taskId);
-      validateSelection(request, catalog);
+      // A restored page already has a local method catalog. Saving must not
+      // rebuild Maven coverage or open a remote analysis session.
+      const catalog = this.coordinator.peekPreparedMethodCatalog(task.id)
+        ?? this.methodSelectionCatalogs.get(task.id)
+        ?? await this.readPersistedMethodCatalog(task);
+      const unchangedSelection = request.selectionMode === task.selectionMode
+        && request.selectedMethodIds.length === task.selectedMethodIds.length
+        && request.selectedMethodIds.every((id, index) => id === task.selectedMethodIds[index])
+        && request.methodOrder.length === task.methodOrder.length
+        && request.methodOrder.every((id, index) => id === task.methodOrder[index]);
+      // A restored page can show the saved selection before a live catalog is
+      // available. Updating only its settings must not start Maven analysis.
+      if (catalog) {
+        validateSelection(request, catalog);
+        this.methodSelectionCatalogs.set(task.id, detached(catalog));
+      } else if (!unchangedSelection) {
+        throw new Error('方法目录尚未加载，请打开或刷新方法配置后再保存。');
+      }
     }
     return this.registry.saveSelection(
       request.taskId,
@@ -561,6 +584,7 @@ export class ClassTaskRuntimeService {
     task: ClassTaskSnapshot,
     catalog: ClassMethodCatalog
   ): Promise<ClassMethodCatalog> {
+    this.methodSelectionCatalogs.set(task.id, detached(catalog));
     const preparedReport = this.coordinator.peekPreparedCoverageReport(task.id);
     const reportCoverageTotals = preparedReport
       ? preparedReport.reportPairId === catalog.reportPairId
@@ -2814,6 +2838,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coverageBaseline: detached(acceptedCoverage),
       coverageCurrent: detached(acceptedCoverage),
       coverageContributions: [],
+      completionAttentionPending: false,
       updatedAt: this.now()
     });
     await this.cleanupHandledCoverageRollback(task);
@@ -2881,6 +2906,7 @@ implements ClassTaskRuntimeCoordinatorPort, MethodExecutionPort {
       coveredMethodIds: [],
       coverageCurrent: detached(task.coverageBaseline),
       coverageContributions: [],
+      completionAttentionPending: false,
       updatedAt: this.now()
     });
     if (restored) {
@@ -4608,6 +4634,17 @@ export function createProductionClassTaskRuntime(
     registry: runtimeRegistry,
     scheduler,
     coordinator,
+    readPersistedMethodCatalog: async (task) => {
+      const view = await options.workspaceStateService?.getViewState(task.workspaceRoot);
+      const tab = view?.workbenchTabs?.find((entry) =>
+        entry.kind === 'method_configuration'
+        && entry.taskId === task.id
+        && entry.qualifiedClassName === task.qualifiedClassName
+        && identity.comparisonKey(entry.sourceFilePath) === identity.comparisonKey(task.sourceFilePath)
+        && entry.catalog?.taskId === task.id
+      );
+      return tab?.kind === 'method_configuration' ? tab.catalog ?? null : null;
+    },
     recordTaskExecution: options.recordTaskExecution,
     flushTaskState: async () => {
       await checkpoints.flush();

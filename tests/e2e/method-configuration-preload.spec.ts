@@ -185,6 +185,88 @@ test('production App waits for preload, opens methods automatically and retains 
 
 const runningRefreshConflict = "Error invoking remote method 'class-task:methods:get': Error: 当前类任务正在运行，暂时无法刷新方法与覆盖率信息。";
 
+test('active tasks disable manual refresh while published coverage keeps updating', async ({ page }) => {
+  const errors = await mountApp(page, { readyInitially: true });
+  const table = page.locator('.class-task-method-table');
+  const refresh = page.getByRole('button', { name: '刷新方法与覆盖率信息', exact: true });
+  await expect(table).toContainText('run()');
+  for (const state of ['RUNNING', 'PAUSE_REQUESTED', 'PAUSED', 'STOPPING']) {
+    await page.evaluate(state => (window as any).preloadFixture.update({ state }), state);
+    await expect(refresh).toBeDisabled();
+    await expect(refresh).toHaveAttribute('title', /不能手动刷新/);
+  }
+  await page.evaluate(() => {
+    (window as any).preloadFixture.update({ state: 'RUNNING' });
+    (window as any).preloadFixture.publishCoverage(1);
+  });
+  await expect(table).toContainText('50%');
+  expect(await page.evaluate(() => (window as any).preloadFixture.catalogCalls())).toBe(1);
+  await page.evaluate(() => (window as any).preloadFixture.update({ state: 'COMPLETED' }));
+  await expect(refresh).toBeEnabled();
+  await refresh.click();
+  await expect.poll(() => page.evaluate(() => (window as any).preloadFixture.catalogRequests()
+    .filter((request: any) => request.forceReload).length)).toBe(1);
+  await expect(refresh).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+test('a manual refresh racing with execution retains the table and the draft without a shared read', async ({ page }, testInfo) => {
+  const errors = await mountApp(page, { readyInitially: true });
+  const table = page.locator('.class-task-method-table');
+  const refresh = page.getByRole('button', { name: '刷新方法与覆盖率信息', exact: true });
+  await expect(table).toContainText('run()');
+  const selected = table.getByRole('checkbox').first();
+  await selected.click();
+  const checked = await selected.getAttribute('aria-checked');
+  await page.evaluate(() => (window as any).preloadFixture.armRace());
+  await refresh.click();
+  await expect.poll(() => page.evaluate(() => (window as any).preloadFixture.catalogCalls())).toBe(2);
+  await page.evaluate(message => {
+    (window as any).preloadFixture.update({ state: 'RUNNING' });
+    (window as any).preloadFixture.rejectForce(message);
+  }, runningRefreshConflict);
+  await expect(table).toBeVisible();
+  await expect(selected).toHaveAttribute('aria-checked', checked!);
+  await expect(page.locator('.class-task-method-refresh-error')).toContainText('已保留');
+  await expect(page.locator('.class-task-method-retry')).toHaveCount(0);
+  await expect(refresh).toBeDisabled();
+  expect(await page.evaluate(() => (window as any).preloadFixture.catalogRequests()
+    .map((request: any) => Boolean(request.forceReload)))).toEqual([false, true]);
+  await page.screenshot({ path: testInfo.outputPath('manual-refresh-running-race.png') });
+  await page.evaluate(() => (window as any).preloadFixture.publishCoverage(1));
+  await expect(table).toContainText('50%');
+  await expect(page.locator('.class-task-method-refresh-error')).toHaveCount(0);
+  await expect(selected).toHaveAttribute('aria-checked', checked!);
+  expect(errors).toEqual([]);
+});
+
+test('a failed manual Maven refresh retains existing coverage and succeeds on retry', async ({ page }, testInfo) => {
+  const errors = await mountApp(page, { readyInitially: true });
+  const table = page.locator('.class-task-method-table');
+  const refresh = page.getByRole('button', { name: '刷新方法与覆盖率信息', exact: true });
+  await expect(table).toContainText('run()');
+  await page.evaluate(() => (window as any).preloadFixture.publishCoverage(1));
+  await expect(table).toContainText('50%');
+  await page.evaluate(() => (window as any).preloadFixture.armRace());
+  await refresh.click();
+  await expect.poll(() => page.evaluate(() => (window as any).preloadFixture.catalogCalls())).toBe(2);
+  await page.evaluate(() => (window as any).preloadFixture.rejectForce('fixture Maven failure'));
+  await expect(table).toBeVisible();
+  await expect(table).toContainText('50%');
+  await expect(page.locator('.class-task-method-refresh-error')).toContainText('fixture Maven failure');
+  await expect(page.getByText('覆盖率信息读取失败', { exact: true })).toHaveCount(0);
+  await expect(refresh).toBeEnabled();
+  await page.screenshot({ path: testInfo.outputPath('manual-refresh-retained-table.png') });
+  await page.evaluate(() => (window as any).preloadFixture.clearRace());
+  await refresh.click();
+  await expect.poll(() => page.evaluate(() => (window as any).preloadFixture.catalogCalls())).toBe(3);
+  await expect(page.locator('.class-task-method-refresh-error')).toHaveCount(0);
+  await expect(table).toBeVisible();
+  expect(await page.evaluate(() => (window as any).preloadFixture.catalogRequests()
+    .map((request: any) => Boolean(request.forceReload)))).toEqual([false, true, true]);
+  expect(errors).toEqual([]);
+});
+
 test('each published formal catalog updates the open method table during generation and retains the draft', async ({ page }) => {
   const errors = await mountApp(page);
   await page.evaluate(() => (window as any).preloadFixture.update({ state: 'READY', preloadState: 'READY' }));

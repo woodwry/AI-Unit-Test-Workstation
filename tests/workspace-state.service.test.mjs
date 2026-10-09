@@ -269,6 +269,24 @@ test('RAG 知识库活动视图按工作区持久化', async (context) => {
   assert.equal((await fixture.service.getViewState(root))?.activityView, 'rag-knowledge');
 });
 
+test('用户管理活动视图保存后可由新服务实例恢复', async (context) => {
+  const root = String.raw`D:\projects\manager`;
+  const fixture = await createWorkspaceStateFixture(context, {}, new Set([root]));
+  const view = {
+    workspaceRoot: root,
+    expandedPaths: [],
+    openFilePaths: [],
+    activityView: 'user-management'
+  };
+
+  await fixture.service.saveViewState(view);
+  const reopened = new WorkspaceStateService(fixture.storagePath, root, root);
+
+  assert.deepEqual(await reopened.getViewState(root), view);
+  const stored = JSON.parse(await readFile(fixture.storagePath, 'utf8'));
+  assert.equal(stored.viewStates['d:/projects/manager'].activityView, 'user-management');
+});
+
 test('状态格式校验使用不泄露路径的固定错误', () => {
   assert.throws(
     () => validateStoredWorkspaceState({

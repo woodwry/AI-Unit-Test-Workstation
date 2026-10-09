@@ -1032,6 +1032,7 @@ if (hasSingleInstanceLock) {
   });
   classTaskRuntime = createProductionClassTaskRuntime({
     storageDirectory: app.getPath('userData'),
+    workspaceStateService,
     aiClient,
     shellService,
     mavenAnalysisContextService,

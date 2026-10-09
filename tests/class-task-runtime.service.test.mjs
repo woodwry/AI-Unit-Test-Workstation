@@ -27,6 +27,8 @@ import {
 import { MethodGenerationRequestError } from '../src/main/services/method-generation-contract.ts';
 import { ClassTaskApplicationInterruptedError } from '../src/main/services/class-task-interruption.ts';
 import { ClassTaskFileTransactionService } from '../src/main/services/class-task-file-transaction.service.ts';
+import { ClassTaskStore } from '../src/main/services/class-task.store.ts';
+import { WorkspaceStateService } from '../src/main/services/workspace-state.service.ts';
 import { MethodWavePartStoreService } from '../src/main/services/method-wave-part-store.service.ts';
 import { TestWriterService } from '../src/main/services/test-writer.service.ts';
 import { ShellService, CommandCancelledError } from '../src/main/services/shell.service.ts';
@@ -849,6 +851,7 @@ function harness(initial = [task()], options = {}) {
     scheduler,
     coordinator,
     reportTotals: options.reportTotals,
+    readPersistedMethodCatalog: options.readPersistedMethodCatalog,
     recordTaskExecution: async () => { recordedTaskExecutions.push('recorded'); },
     flushTaskState: async () => events.push('flush-tasks'),
     flushPreloadCache: async () => events.push('flush-cache'),
@@ -1215,6 +1218,126 @@ test('manual method refresh asks the coordinator to rebuild its prepared catalog
   assert.deepEqual(prepareCalls, [{ taskId: TASK_ID, forceReload: true }]);
 });
 
+test('configuration save validates the displayed catalog without preparing another analysis session', async () => {
+  const h=harness(); await h.runtime.startup();
+  h.coordinator.prepare=async()=>{throw new Error('configuration save must not prepare');};
+  const saved=await h.runtime.saveMethodSelection({workspaceRoot:WORKSPACE,taskId:TASK_ID,
+    selectionMode:'EXPLICIT',selectedMethodIds:['method-id'],methodOrder:['method-id'],
+    ragEnabled:false,repairAttemptLimit:1,unlimitedRepair:false});
+  assert.equal(saved.ragEnabled,false);
+});
+
+test('configuration save after revocation uses the last displayed catalog after its analysis session was released', async () => {
+  const h=harness(); await h.runtime.startup();
+  await h.runtime.getClassTaskMethods({workspaceRoot:WORKSPACE,taskId:TASK_ID});
+  h.coordinator.peekPreparedMethodCatalog=()=>null;
+  h.coordinator.prepare=async()=>{throw new Error('released session must not be rebuilt for saving');};
+  const saved=await h.runtime.saveMethodSelection({workspaceRoot:WORKSPACE,taskId:TASK_ID,
+    selectionMode:'EXPLICIT',selectedMethodIds:['method-id'],methodOrder:['method-id'],
+    ragEnabled:true,repairAttemptLimit:1,unlimitedRepair:false});
+  assert.equal(saved.ragEnabled,true);
+  await assert.rejects(h.runtime.saveMethodSelection({workspaceRoot:WORKSPACE,taskId:TASK_ID,
+    selectionMode:'EXPLICIT',selectedMethodIds:['unknown'],methodOrder:['unknown'],ragEnabled:true}),/unavailable or unknown/);
+});
+
+test('configuration save after restart can change mode without rebuilding the unchanged saved method selection', async () => {
+  const h = harness();
+  await h.runtime.startup();
+  h.coordinator.peekPreparedMethodCatalog = () => null;
+  h.coordinator.prepare = async () => { throw new Error('cold save must not launch analysis'); };
+  const saved = await h.runtime.saveMethodSelection({
+    workspaceRoot: WORKSPACE, taskId: TASK_ID, selectionMode: 'EXPLICIT',
+    selectedMethodIds: ['method-id'], methodOrder: ['method-id'],
+    ragEnabled: true, repairAttemptLimit: 1, unlimitedRepair: false
+  });
+  assert.deepEqual(saved.selectedMethodIds, ['method-id']);
+  assert.deepEqual(saved.methodOrder, ['method-id']);
+  assert.equal(saved.ragEnabled, true);
+});
+
+test('configuration save after restart still rejects a new unknown method using a current catalog', async () => {
+  const h = harness(undefined, { readPersistedMethodCatalog: async () => catalog() });
+  await h.runtime.startup();
+  h.coordinator.peekPreparedMethodCatalog = () => null;
+  await assert.rejects(h.runtime.saveMethodSelection({
+    workspaceRoot: WORKSPACE, taskId: TASK_ID, selectionMode: 'EXPLICIT',
+    selectedMethodIds: ['unknown'], methodOrder: ['unknown'],
+    ragEnabled: false, repairAttemptLimit: 1, unlimitedRepair: false
+  }), /unavailable or unknown/);
+  assert.deepEqual(h.registry.snapshot(TASK_ID).selectedMethodIds, ['method-id']);
+});
+
+for (const ragEnabled of [false, true]) {
+  test(`cold configuration save restores a persisted method catalog without analysis (deep coverage ${ragEnabled})`, async (t) => {
+    const h = await completedResultFileFixture(t, 'READY', { includePendingArtifact: false });
+    const [before] = await h.runtime.listClassTasks({ workspaceRoot: h.workspaceRoot });
+    const cached = { ...catalog(), fingerprint: 'a'.repeat(64) };
+    cached.methods.push({ ...cached.methods[0], methodId: 'new-method-id', methodName: 'newMethod', jacocoOrder: 1 });
+    cached.methods.push({ ...cached.methods[0], methodId: 'blocked-method-id',
+      methodName: 'blockedMethod', jacocoOrder: 2, generatable: false });
+    await h.workspaceStateService.saveViewState({
+      workspaceRoot: h.workspaceRoot, expandedPaths: [], openFilePaths: [],
+      workbenchTabs: [{ kind: 'method_configuration', taskId: TASK_ID,
+        sourceFilePath: before.sourceFilePath, qualifiedClassName: before.qualifiedClassName, catalog: cached }]
+    });
+
+    const selected = ['new-method-id', 'method-id'];
+    const saved = await h.runtime.saveMethodSelection({
+      workspaceRoot: h.workspaceRoot, taskId: TASK_ID, selectionMode: 'EXPLICIT',
+      selectedMethodIds: selected, methodOrder: selected,
+      ragEnabled, repairAttemptLimit: 6, unlimitedRepair: false
+    });
+    const stored = await new ClassTaskStore(join(h.storageDirectory, 'class-tasks-v2.json')).load();
+    assert.deepEqual(stored.tasks[TASK_ID].selectedMethodIds, selected);
+    assert.deepEqual(stored.tasks[TASK_ID].methodOrder, selected);
+    assert.equal(saved.ragEnabled, ragEnabled);
+    assert.equal(saved.repairAttemptLimit, 6);
+    assert.equal(saved.state, 'READY');
+    assert.deepEqual(h.externalCalls, []);
+
+    await assert.rejects(h.runtime.saveMethodSelection({
+      workspaceRoot: h.workspaceRoot, taskId: TASK_ID, selectionMode: 'EXPLICIT',
+      selectedMethodIds: ['unknown'], methodOrder: ['unknown'],
+      ragEnabled, repairAttemptLimit: 6, unlimitedRepair: false
+    }), /unavailable or unknown/);
+    await assert.rejects(h.runtime.saveMethodSelection({
+      workspaceRoot: h.workspaceRoot, taskId: TASK_ID, selectionMode: 'EXPLICIT',
+      selectedMethodIds: ['blocked-method-id'], methodOrder: ['blocked-method-id'],
+      ragEnabled, repairAttemptLimit: 6, unlimitedRepair: false
+    }), /unavailable or unknown/);
+    assert.deepEqual(h.externalCalls, []);
+  });
+}
+
+test('cold configuration save with no catalog fails promptly instead of launching analysis', async (t) => {
+  const h = await completedResultFileFixture(t, 'READY', { includePendingArtifact: false });
+  await assert.rejects(h.runtime.saveMethodSelection({
+    workspaceRoot: h.workspaceRoot, taskId: TASK_ID, selectionMode: 'EXPLICIT',
+    selectedMethodIds: ['new-method-id'], methodOrder: ['new-method-id'],
+    ragEnabled: true, repairAttemptLimit: 6, unlimitedRepair: false
+  }), /方法目录尚未加载/);
+  const [after] = await h.runtime.listClassTasks({ workspaceRoot: h.workspaceRoot });
+  assert.equal(after.state, 'READY');
+  assert.deepEqual(after.selectedMethodIds, ['method-id']);
+  assert.deepEqual(h.externalCalls, []);
+});
+
+test('cold configuration save cannot borrow a persisted catalog from a different source file', async (t) => {
+  const h = await completedResultFileFixture(t, 'READY', { includePendingArtifact: false });
+  await h.workspaceStateService.saveViewState({
+    workspaceRoot: h.workspaceRoot, expandedPaths: [], openFilePaths: [],
+    workbenchTabs: [{ kind: 'method_configuration', taskId: TASK_ID,
+      sourceFilePath: join(h.workspaceRoot, 'Other.java'), qualifiedClassName: 'example.Task',
+      catalog: { ...catalog(), fingerprint: 'a'.repeat(64) } }]
+  });
+  await assert.rejects(h.runtime.saveMethodSelection({
+    workspaceRoot: h.workspaceRoot, taskId: TASK_ID, selectionMode: 'EXPLICIT',
+    selectedMethodIds: [], methodOrder: [], ragEnabled: false,
+    repairAttemptLimit: 6, unlimitedRepair: false
+  }), /方法目录尚未加载/);
+  assert.deepEqual(h.externalCalls, []);
+});
+
 test('commands translate requests to the registry, coordinator, and scheduler', async () => {
   const { runtime, events } = harness([]);
   await runtime.startup();
@@ -1250,7 +1373,7 @@ test('commands translate requests to the registry, coordinator, and scheduler', 
   await runtime.stopModulePreload({ workspaceRoot: WORKSPACE, taskId: TASK_ID });
 
   assert.deepEqual(events.filter((entry) => /^(add|prepare|selection|run|finish|release-run|pause|resume|terminate:|result|accept|revoke|retry|stop)/.test(entry)), [
-    'add:1', `prepare:${TASK_ID}`, `prepare:${TASK_ID}`, `prepare:${TASK_ID}`,
+    'add:1', `prepare:${TASK_ID}`, `prepare:${TASK_ID}`,
     'selection:EXPLICIT:method-id', `run:${TASK_ID}`, `finish:${TASK_ID}`,
     `release-run:${TASK_ID}`, `pause:${TASK_ID}`, `resume:${TASK_ID}`,
     `finish:${TASK_ID}`, `release-run:${TASK_ID}`, `terminate:${TASK_ID}`,
@@ -4257,6 +4380,60 @@ test('revoke removes an available pending result and restores persisted baseline
   assert.deepEqual(fixture.externalCalls, []);
 });
 
+test('revoking a completed pending result survives a cold startup without becoming an empty-result failure', async (t) => {
+  const fixture = await completedResultFileFixture(t, 'COMPLETED', {
+    completionAttentionPending: true
+  });
+  const [before] = await fixture.runtime.listClassTasks({ workspaceRoot: fixture.workspaceRoot });
+  assert.equal(before.completionAttentionPending, true);
+
+  await fixture.runtime.revokeTaskResult({
+    workspaceRoot: fixture.workspaceRoot,
+    taskId: TASK_ID
+  });
+  await fixture.runtime.beforeQuit();
+  const reopened = await new ClassTaskStore(
+    join(fixture.storageDirectory, 'class-tasks-v2.json')
+  ).loadForStartup();
+  const restored = reopened.tasks[TASK_ID];
+
+  assert.equal(restored.state, 'COMPLETED');
+  assert.equal(restored.lastError, null);
+  assert.equal(restored.completionAttentionPending, false);
+  assert.deepEqual(restored.generatedArtifacts, []);
+  assert.deepEqual(restored.coverageCurrent, before.coverageBaseline);
+  assert.deepEqual(restored.coverageContributions, []);
+  assert.deepEqual(restored.selectedMethodIds, before.selectedMethodIds);
+  assert.deepEqual(restored.methodOrder, before.methodOrder);
+  assert.equal(restored.ragEnabled, before.ragEnabled);
+  assert.equal(restored.modelCallCount, before.modelCallCount);
+  assert.deepEqual(restored.tokenUsage, before.tokenUsage);
+  await assert.rejects(access(fixture.testFilePath), { code: 'ENOENT' });
+  assert.deepEqual(fixture.externalCalls, []);
+});
+
+test('accepting a completed pending result persists that its completion attention was handled', async (t) => {
+  const fixture = await completedResultFileFixture(t, 'COMPLETED', {
+    completionAttentionPending: true
+  });
+
+  await fixture.runtime.acceptTaskResult({
+    workspaceRoot: fixture.workspaceRoot,
+    taskId: TASK_ID
+  });
+  const reopened = await new ClassTaskStore(
+    join(fixture.storageDirectory, 'class-tasks-v2.json')
+  ).loadForStartup();
+  const restored = reopened.tasks[TASK_ID];
+
+  assert.equal(restored.state, 'COMPLETED');
+  assert.equal(restored.lastError, null);
+  assert.equal(restored.completionAttentionPending, false);
+  assert.equal(restored.generatedArtifacts[0]?.accepted, true);
+  assert.equal(await readFile(fixture.testFilePath, 'utf8'), fixture.testFileContent);
+  assert.deepEqual(fixture.externalCalls, []);
+});
+
 test('revoke deletes only pending files and preserves previously accepted files', async (t) => {
   const fixture = await completedResultFileFixture(t, 'COMPLETED', {
     includeAcceptedArtifact: true
@@ -5953,7 +6130,8 @@ async function completedResultFileFixture(
   resultState = 'COMPLETED',
   {
     includeAcceptedArtifact = false, withoutCoverage = false, ordinaryTestMethodCount = 1,
-    includeSiblingTask = false, siblingInAnotherWorkspace = false
+    includeSiblingTask = false, siblingInAnotherWorkspace = false,
+    completionAttentionPending = false, includePendingArtifact = true
   } = {}
 ) {
   const root = await mkdtemp(join(tmpdir(), 'class-task-runtime-result-file-'));
@@ -6037,14 +6215,16 @@ async function completedResultFileFixture(
         })
       } : {}),
       [TASK_ID]: task(TASK_ID, resultState, {
+        completionAttentionPending,
         workspaceRoot,
         sourceFilePath,
         qualifiedClassName: 'example.Task',
         moduleKey: `${moduleRoot.replaceAll('\\', '/').toLowerCase()}/pom.xml`,
         moduleDisplayPath: moduleRoot,
-        generatedArtifacts: includeAcceptedArtifact
-          ? [acceptedArtifact, artifact]
-          : [artifact],
+        generatedArtifacts: [
+          ...(includeAcceptedArtifact ? [acceptedArtifact] : []),
+          ...(includePendingArtifact ? [artifact] : [])
+        ],
         coverageBaseline: withoutCoverage ? null : {
           lineCovered: 0, lineMissed: 1, lineTotal: 1,
           branchCovered: 0, branchMissed: 0, branchTotal: 0
@@ -6053,14 +6233,14 @@ async function completedResultFileFixture(
           lineCovered: 1, lineMissed: 0, lineTotal: 1,
           branchCovered: 0, branchMissed: 0, branchTotal: 0
         },
-        coverageContributions: [{
+        coverageContributions: includePendingArtifact ? [{
           artifactId: artifact.id,
           filePath: testFilePath,
           addedLineCount: 1,
           lineTotal: 1,
           addedBranchCount: 0,
           branchTotal: 0
-        }],
+        }] : [],
         startedAt: '2026-08-09T00:00:00.000Z',
         finishedAt: '2026-08-09T00:01:00.000Z'
       })
@@ -6068,12 +6248,16 @@ async function completedResultFileFixture(
   }), 'utf8');
 
   const externalCalls = [];
+  const workspaceStateService = new WorkspaceStateService(
+    join(storageDirectory, 'workspace-state.json'), root, root
+  );
   const forbidden = (name) => async () => {
     externalCalls.push(name);
     throw new Error(`${name} must not run while reading or rejecting a missing result file`);
   };
   const runtime = createProductionClassTaskRuntime({
     storageDirectory,
+    workspaceStateService,
     aiClient: new Proxy({}, { get: (_target, key) => forbidden(`ai:${String(key)}`) }),
     shellService: new Proxy({}, { get: (_target, key) => forbidden(`shell:${String(key)}`) }),
     mavenAnalysisContextService: { collect: forbidden('analysis-context') },
@@ -6096,6 +6280,8 @@ async function completedResultFileFixture(
   });
   return {
     runtime,
+    storageDirectory,
+    workspaceStateService,
     workspaceRoot,
     testFilePath,
     testFileContent,

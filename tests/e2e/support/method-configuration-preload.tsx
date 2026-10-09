@@ -201,6 +201,7 @@ Object.assign(window, {
       });
     },
     armRace() { racing = true; },
+    clearRace() { racing = false; },
     holdRevoke() {
       pendingRevoke = new Promise<void>((resolve, reject) => { finishRevoke = resolve; rejectRevoke = reject; });
     },

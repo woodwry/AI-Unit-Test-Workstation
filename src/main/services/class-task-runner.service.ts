@@ -165,6 +165,7 @@ export class ClassTaskRunnerService {
     }
     const progress = await this.checkpoints.prepareRun(task.id, {
       reset: false,
+      ...(task.ragEnabled ? { executionMode: 'LEGACY_WAVE' as const } : {}),
       catalogIdentity,
       resolvedMethodOrder: methodOrder,
       completedMethodIdsFromArtifacts: generatedArtifactMethodIds(task),

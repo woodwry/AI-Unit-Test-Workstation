@@ -28,6 +28,19 @@ test('frozen full-source refuses an unsupported adapter without falling back to 
   assert.equal(waveCalls, 0);
 });
 
+test('the legacy runner freezes its actual mode before executing a method', async t => {
+  const root=await mkdtemp(join(tmpdir(),'legacy-mode-runner-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const facts=fullSourceFacts(1);
+  let task={id:randomUUID(),ragEnabled:true,state:'RUNNING',currentAtomicStep:'IDLE',currentMethodIndex:-1,
+    methodOrder:facts.methods.map(m=>m.methodId),generatedArtifacts:[]};
+  const checkpoints=new ClassTaskCheckpointService({storagePath:join(root,'checkpoint.json'),
+    taskState:{snapshot:()=>structuredClone(task),save:async value=>(task=structuredClone(value))}});
+  const runner=new ClassTaskRunnerService({checkpoints,methodExecution:{execute:async()=>{
+    assert.equal((await checkpoints.taskProgress(task.id)).executionMode,'LEGACY_WAVE');return null;
+  }}});
+  await runner.run(task,task.methodOrder,{analysisSessionId:randomUUID(),reportPairId:facts.reportPairId},new AbortController().signal);
+});
+
 test('new false runner calls full-source once with all selected methods before Wave/group routing', async t => {
   const root = await mkdtemp(join(tmpdir(), 'full-source-runner-')); t.after(() => rm(root, { recursive: true, force: true }));
   const facts = fullSourceFacts();

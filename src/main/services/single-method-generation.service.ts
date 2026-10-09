@@ -724,6 +724,11 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       part.modelCallCount ??= 0;
       part.usageReportedCallCount ??= 0;
     }
+    // A recovery completion includes reused terminal Parts. Their usage was
+    // already recorded; account only for Parts that make a fresh attempt.
+    let freshUsagePartIndexes: Set<number> | null = activeWave.initialUsageRecorded
+      ? new Set<number>()
+      : null;
     const startRequest = activeWave.startRequest ?? generatedStartRequest;
     assertWaveStartRequestIdentity(startRequest, task, wave, waveCheckpoint.waveIndex, context);
     if (!activeWave.startRequest) {
@@ -878,9 +883,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         };
       }
       if (checkpointPart.status === 'FAILED'
-        && !/^MODEL_[A-Z0-9_]{1,121}:/.test(
-          checkpointPart.failureReason ?? ''
-        )) {
+        && !isRetryableWavePartFailure(checkpointPart.failureReason)) {
         return {
           partIndex: part.partIndex,
           partBatchId: part.partBatchId,
@@ -983,7 +986,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         waveSessionId: null,
         recoveryRequestId: null,
         eventSequence: 0,
-        initialUsageRecorded: false,
+        initialUsageRecorded: activeWave.initialUsageRecorded,
         parts: activeWave.parts.map((part) => ({
           partIndex: part.partIndex,
           partBatchId: part.partBatchId,
@@ -1000,6 +1003,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           usageReportedCallCount: 0
         }))
       });
+      freshUsagePartIndexes = new Set(wave.parts.map(part => part.partIndex));
       waveSessionId = null;
       await this.clearStoredWaveParts(task, wave, waveCheckpoint.waveIndex);
       return true;
@@ -1021,6 +1025,12 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         waveSessionId = null;
       }
       const terminalParts = await terminalPartsFromCheckpoint();
+      if (activeWave.initialUsageRecorded) {
+        const reusedIndexes = new Set(terminalParts.map(part => part.partIndex));
+        freshUsagePartIndexes = new Set(wave.parts
+          .filter(part => !reusedIndexes.has(part.partIndex))
+          .map(part => part.partIndex));
+      }
       return this.options.agent.recoverMethodGenerationWaveStream(
         {
           recoveryRequestId,
@@ -1238,8 +1248,16 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       }
     }
     activeWave = await this.options.checkpoints.saveActiveMethodWave(task.id, activeWave);
-    if (!activeWave.initialUsageRecorded && turn.completion.modelCallCount > 0) {
-      await this.recordCompletionUsage(task.id, turn.completion);
+    const usagePartIndexes = freshUsagePartIndexes;
+    const freshParts = usagePartIndexes === null ? null : terminalParts
+      .filter(part => usagePartIndexes.has(part.partIndex));
+    const usageCompletion = freshParts === null ? turn.completion : {
+      aggregateUsage: mergeWaveCheckpointUsage(freshParts),
+      modelCallCount: freshParts.reduce((sum, part) => sum + (part.modelCallCount ?? 0), 0),
+      usageReportedCallCount: freshParts.reduce((sum, part) => sum + (part.usageReportedCallCount ?? 0), 0)
+    };
+    if (usageCompletion.modelCallCount > 0) {
+      await this.recordCompletionUsage(task.id, usageCompletion);
       activeWave = await this.options.checkpoints.saveActiveMethodWave(task.id, {
         ...activeWave,
         initialUsageRecorded: true
@@ -1360,7 +1378,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
             candidateId: null,
             isolatedFilePath: null,
             fileSha256: null,
-            failureReason: compactWaveFailure(error)
+            failureReason: compactWaveFailure(`GENERATED_TEST_INVALID: ${compactWaveFailure(error)}`)
           });
         }
       }
@@ -1375,7 +1393,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
           candidateId: null,
           isolatedFilePath: null,
           fileSha256: null,
-          failureReason: skippedPart.reason
+          failureReason: compactWaveFailure(`GENERATED_TEST_INVALID: ${skippedPart.reason}`)
         });
       }
     }
@@ -1387,9 +1405,14 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
     );
 
     if (!merged || merged.acceptedPartIndexes.length === 0) {
+      const diagnostics = activeWave.parts
+        .filter(part => part.failureReason)
+        .map(part => `Part ${part.partIndex}: ${part.failureReason}`)
+        .join('; ');
       const modelFailure: MethodGenerationFailure = {
         code: 'GENERATED_TEST_INVALID',
-        message: '生成的测试代码无效，没有可用的测试候选。',
+        message: sanitizePublicText(`生成的测试代码无效，没有可用的测试候选。${diagnostics}`)
+          .slice(0, 1_000),
         stage: 'generation'
       };
       activeWave = await this.options.checkpoints.saveActiveMethodWave(task.id, {
@@ -1711,8 +1734,8 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
       sessionTerminal = true;
       // A bounded output failure consumes this attempt. Rebuild from the last
       // accepted file, never from a rejected candidate or a terminal session.
-      if (!checkpoint.unlimitedRepair
-        && checkpoint.llmRepairAttemptsUsed < (checkpoint.repairAttemptLimit as number)) {
+      if (checkpoint.unlimitedRepair
+        || checkpoint.llmRepairAttemptsUsed < (checkpoint.repairAttemptLimit as number)) {
         return this.repairMergedWaveCandidate({
           ...input,
           candidate: {
@@ -1896,18 +1919,26 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
         try {
           let nextCandidate = resumed.candidate;
         while (true) {
-          validateCandidate(
-            nextCandidate,
-            page,
-            input.candidate.outputTestClassName,
-            input.waveIndex,
-            previousCandidateVersion,
-            input.task.unlimitedRepair ? null : input.task.repairAttemptLimit,
-            input.context.packageName,
-            this.structure
-          );
+          let outputRejection: CandidateChangeValidationResult | null = null;
+          try {
+            validateCandidate(
+              nextCandidate,
+              page,
+              input.candidate.outputTestClassName,
+              input.waveIndex,
+              previousCandidateVersion,
+              input.task.unlimitedRepair ? null : input.task.repairAttemptLimit,
+              input.context.packageName,
+              this.structure
+            );
+          } catch (error) {
+            if (!(error instanceof MethodGenerationRequestError)
+              || error.code !== 'GENERATED_TEST_INVALID') throw error;
+            outputRejection = { accepted: false, violationCodes: [error.code],
+              memberNames: [], message: error.message };
+          }
           previousCandidateVersion = nextCandidate.candidateVersion;
-          const codeWithAnalyzerImports = restoreReferencedAllowedTypeImports({
+          const codeWithAnalyzerImports = outputRejection ? nextCandidate.testCode : restoreReferencedAllowedTypeImports({
             candidateCode: nextCandidate.testCode,
             allowedImports: page.necessaryImports
           });
@@ -1919,7 +1950,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
             };
           }
 
-          if (!ragRepairAttempt && diagnostic && repairContext) {
+          if (!outputRejection && !ragRepairAttempt && diagnostic && repairContext) {
             const codeWithAcceptedWildcards = preserveAcceptedWildcardImports({
               acceptedCode: owned.code,
               candidateCode: nextCandidate.testCode,
@@ -1934,7 +1965,7 @@ export class SingleMethodGenerationService implements MethodExecutionPort {
             }
           }
 
-          const validation = this.candidateChanges.validateTestIdentityChanges({
+          const validation = outputRejection ?? this.candidateChanges.validateTestIdentityChanges({
             acceptedCode: owned.code,
             candidateCode: nextCandidate.testCode
           });
@@ -5054,6 +5085,14 @@ function compactWaveFailure(error: unknown): string {
     .slice(0, 1_000) || 'Wave Part failed.';
 }
 
+function isRetryableWavePartFailure(failureReason: string | null): boolean {
+  const reason = (failureReason ?? '').replace(/^(?:RECOVERED_PART_FAILED:\s*)+/u, '');
+  return /^(?:MODEL_[A-Z0-9_]{1,121}|GENERATED_TEST_INVALID|GENERATED_TEST_INCOMPLETE|GENERATED_TEST_TOO_LARGE):/u
+    .test(reason)
+    // Compatibility for checkpoints written before structural failures had a code.
+    || /^No structurally valid Wave Part can be merged\.(?:\s|$)/u.test(reason);
+}
+
 function waveCandidateFailurePath(task: ClassTaskSnapshot, candidateId: string, testClassName: string): string {
   return resolve(task.workspaceRoot, '.ai-unit-test', 'method-wave-failures',
     createHash('sha256').update(task.id, 'utf8').digest('hex').slice(0, 24),
@@ -5091,7 +5130,9 @@ function mergeWaveCheckpointUsage(
 function isRepairOutputRetryExhaustedError(error: unknown): boolean {
   return error instanceof MethodGenerationRequestError
     && (error.code === 'GENERATED_TEST_INVALID'
-      || error.code === 'GENERATED_TEST_INCOMPLETE');
+      || error.code === 'GENERATED_TEST_INCOMPLETE'
+      || error.code === 'GENERATED_TEST_TOO_LARGE'
+      || error.code === 'MODEL_OUTPUT_BUDGET_EXHAUSTED');
 }
 
 function preferredPartModelFailure(
@@ -5527,27 +5568,31 @@ function validateCandidate(
     || repairAttemptLimit !== null
     && candidate.repairAttempt > repairAttemptLimit
     || candidate.outputTestClassName !== outputTestClassName
-    || (candidate.repairAttempt === 0
-      ? candidate.ordinaryTestMethodCount !== page.plannedTestMethods
-      : candidate.ordinaryTestMethodCount > page.plannedTestMethods)
     || candidate.generatedCodeSha256 !== digest
   ) {
     throw new Error('Agent returned a candidate with inconsistent identity.');
   }
-  const methods = validateEffectiveCode(
-    candidate.testCode,
-    outputTestClassName,
-    packageName,
-    structure
-  );
-  if (methods.length !== candidate.ordinaryTestMethodCount) {
-    throw new Error('Agent candidate ordinary test method count is invalid.');
-  }
-  if ('methodSlices' in page) {
-    const prefixes = page.methodSlices.map((slice) => slice.testMethodNamePrefix);
-    if (methods.some((method) => !prefixes.some((prefix) => method.name.startsWith(prefix)))) {
-      throw new Error('Agent class-Wave candidate contains a test without a source-method prefix.');
+  try {
+    const methods = validateEffectiveCode(
+      candidate.testCode,
+      outputTestClassName,
+      packageName,
+      structure
+    );
+    if (methods.length !== candidate.ordinaryTestMethodCount
+      || (candidate.repairAttempt === 0
+        ? candidate.ordinaryTestMethodCount !== page.plannedTestMethods
+        : candidate.ordinaryTestMethodCount > page.plannedTestMethods)) {
+      throw new Error('Agent candidate ordinary test method count is invalid.');
     }
+    if ('methodSlices' in page) {
+      const prefixes = page.methodSlices.map((slice) => slice.testMethodNamePrefix);
+      if (methods.some((method) => !prefixes.some((prefix) => method.name.startsWith(prefix)))) {
+        throw new Error('Agent class-Wave candidate contains a test without a source-method prefix.');
+      }
+    }
+  } catch (error) {
+    throw new MethodGenerationRequestError('GENERATED_TEST_INVALID', compactWaveFailure(error));
   }
 }
 

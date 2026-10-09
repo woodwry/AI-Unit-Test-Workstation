@@ -164,6 +164,7 @@ export function validateStoredWorkspaceState(value: unknown): StoredWorkspaceSta
         : rawView.activityView === 'explorer'
           || rawView.activityView === 'search'
           || rawView.activityView === 'rag-knowledge'
+          || rawView.activityView === 'user-management'
           ? rawView.activityView
           : fail();
     const workbenchTabs = rawView.workbenchTabs === undefined
@@ -211,7 +212,7 @@ function normalizeViewState(viewState: WorkspaceViewState): WorkspaceViewState {
       !isStringArray(viewState.expandedPaths) || !isStringArray(viewState.openFilePaths) ||
       (viewState.activeFilePath !== undefined && !isNonEmptyString(viewState.activeFilePath)) ||
       (viewState.activityView !== undefined
-        && !['explorer', 'search', 'rag-knowledge'].includes(viewState.activityView)) ||
+        && !['explorer', 'search', 'rag-knowledge', 'user-management'].includes(viewState.activityView)) ||
       (viewState.activeWorkbenchTabId !== undefined && !isNonEmptyString(viewState.activeWorkbenchTabId))) {
     throw invalidWorkspaceStateError();
   }

@@ -184,7 +184,16 @@ export class FullSourceGenerationService {
           isolationFilePath: isolatedPath(candidate.candidateId), qualifiedTestClassName: qualifiedName, scope: 'method_candidate',
           excludedEnvironmentVariables: context.excludedEnvironmentVariables, onBatchStart: () => {},
           onPhaseStart: phaseStart, onPhaseComplete: phaseComplete, activate: () => move('PROJECT'), isolate: () => move('ISOLATED') });
-        if (queued.status === 'unproven') throw new Error('Maven 错误无法归属，已保留候选并停止。');
+        if (queued.status === 'unproven') {
+          const directory = dirname(isolatedPath(candidate.candidateId));
+          await mkdir(directory, { recursive: true });
+          const code = await loadSource();
+          await writeFile(join(directory, `${randomUUID()}.maven-unproven.json`), JSON.stringify({
+            taskId: task.id, candidateId: candidate.candidateId, capturedAt: new Date().toISOString(),
+            sourceCode: code, sourceSha256: sourceSha256(code), result: queued
+          }, null, 2) + '\n', { flag: 'wx' });
+          throw new Error('Maven 错误无法归属，已保留候选和实际 Maven 诊断并停止。');
+        }
         execution = { status: queued.status, mavenExecutions: queued.mavenExecutions,
           ...(queued.testReport ? { testReport: queued.testReport } : {}) };
       } else {
@@ -283,7 +292,11 @@ export class FullSourceGenerationService {
       await save({ ...cp, candidate: cp.lastValidCandidate, outputFailure: null });
     }
     if (cp.completion!.stopReason !== 'verified' && cp.candidate && cp.managedFile && !cp.execution) {
-      await executeMaven();
+      // A durable Stable replacement has cleared the previous execution. Its
+      // fresh validation must use the same pruned-candidate semantics on resume.
+      if (cp.stableRepair.phase !== 'NOT_STARTED') {
+        await o.moduleLock.runExclusive(task.moduleKey, () => executeMaven(true), signal);
+      } else await executeMaven();
     }
     if (cp.completion!.stopReason !== 'verified' && cp.candidate && cp.execution && cp.managedFile) {
       await o.moduleLock.runExclusive(task.moduleKey, async () => {

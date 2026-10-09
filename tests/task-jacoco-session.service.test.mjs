@@ -558,6 +558,14 @@ test('unhandled formal coverage retains the original XML across session cleanup 
   assert.deepEqual(await readFile(paths.current.branchSnapshotPath), originalSnapshot);
   assert.deepEqual(await readFile(paths.currentExecutionDataPath), originalExec);
   assert.deepEqual(events, []);
+  await assert.rejects(access(paths.versionsDirectory), { code: 'ENOENT' });
+  const nextVersion = await reopenedArtifacts.prepareTaskVersion(
+    context.moduleRoot, TASK_ID, VERSION_IDS[1]
+  );
+  assert.deepEqual(await readFile(nextVersion.executionDataPath), originalExec);
+  assert.deepEqual(await readFile(paths.current.reportPath), originalXml);
+  assert.deepEqual(await readFile(paths.current.branchSnapshotPath), originalSnapshot);
+  assert.deepEqual(await readFile(paths.currentExecutionDataPath), originalExec);
 });
 
 test('accepting coverage removes retained old XML only after the new baseline is committed', async (t) => {
@@ -578,6 +586,68 @@ test('accepting coverage removes retained old XML only after the new baseline is
   assert.deepEqual(await readFile(paths.current.reportPath), finalXml);
   assert.deepEqual(await readFile(paths.baseline.reportPath), finalXml);
   assert.equal((await artifacts.currentTaskPair(context.moduleRoot, TASK_ID)).pairId, refreshed.pair.pairId);
+  const retainedPaths = [
+    paths.baseline.reportPath, paths.baseline.branchSnapshotPath, paths.baselineExecutionDataPath,
+    paths.current.reportPath, paths.current.branchSnapshotPath, paths.currentExecutionDataPath
+  ];
+  const before = await Promise.all(retainedPaths.map(path => readFile(path)));
+  const nextVersion = await artifacts.prepareTaskVersion(
+    context.moduleRoot, TASK_ID, VERSION_IDS[1]
+  );
+  assert.deepEqual(await readFile(nextVersion.executionDataPath), before[5]);
+  assert.deepEqual(await Promise.all(retainedPaths.map(path => readFile(path))), before);
+});
+
+test('a duplicate task coverage version is rejected without deleting its evidence', async (t) => {
+  const { service, artifacts, context } = await harness(t);
+  await service.initialize(context);
+  const version = await artifacts.prepareTaskVersion(context.moduleRoot, TASK_ID, VERSION_IDS[0]);
+  const evidencePath = join(version.surefireReportsDirectory, 'TEST-retained.xml');
+  await writeFile(evidencePath, 'retained evidence');
+  const originalExec = await readFile(version.executionDataPath);
+  await assert.rejects(
+    artifacts.prepareTaskVersion(context.moduleRoot, TASK_ID, VERSION_IDS[0]),
+    { code: 'EEXIST' }
+  );
+  assert.deepEqual(await readFile(version.executionDataPath), originalExec);
+  assert.equal(await readFile(evidencePath, 'utf8'), 'retained evidence');
+});
+
+test('task coverage version preparation rejects a versions junction outside target before writing', async (t) => {
+  const { service, artifacts, context } = await harness(t);
+  await service.initialize(context);
+  const paths = artifacts.taskSessionPaths(context.moduleRoot, TASK_ID);
+  const outside = await mkdtemp(join(tmpdir(), 'task-jacoco-outside-'));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await rm(paths.versionsDirectory, { recursive: true });
+  await fs.symlink(outside, paths.versionsDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(
+    artifacts.prepareTaskVersion(context.moduleRoot, TASK_ID, VERSION_IDS[0]),
+    /target 目录之外/
+  );
+  assert.deepEqual(await readdir(outside), []);
+});
+
+test('a failed task coverage version copy removes only its newly created directory', async (t) => {
+  const copyError = Object.assign(new Error('fixture execution data copy failed'), { code: 'EIO' });
+  const { service, artifacts, context } = await harness(t, {
+    artifactsFactory: () => new JacocoArtifactsService({
+      ...fs,
+      async copyFile(source, destination, flags) {
+        if (destination.includes(VERSION_IDS[0])) throw copyError;
+        return fs.copyFile(source, destination, flags);
+      }
+    })
+  });
+  await service.initialize(context);
+  const paths = artifacts.taskSessionPaths(context.moduleRoot, TASK_ID);
+  const originalExec = await readFile(paths.currentExecutionDataPath);
+  await assert.rejects(
+    artifacts.prepareTaskVersion(context.moduleRoot, TASK_ID, VERSION_IDS[0]),
+    error => error === copyError
+  );
+  await assert.rejects(access(join(paths.versionsDirectory, VERSION_IDS[0])), { code: 'ENOENT' });
+  assert.deepEqual(await readFile(paths.currentExecutionDataPath), originalExec);
 });
 
 test('a corrupted retained XML cannot replace the current report or be silently discarded', async (t) => {
