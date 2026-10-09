@@ -119,7 +119,7 @@ test('rejects Windows drive-relative resource paths', async () => {
   }
 });
 
-test('pins the workstation Node toolchain and every direct dependency', async () => {
+test('pins the build toolchain and direct dependencies while allowing compatible npm clients', async () => {
   const [contract, manifest, lock, nodeVersion] = await Promise.all([
     readContract(),
     readJson(packageUrl),
@@ -155,12 +155,14 @@ test('pins the workstation Node toolchain and every direct dependency', async ()
     vite: '5.4.21'
   };
 
-  assert.deepEqual(manifest.engines, { node: '22.14.0', npm: '11.17.0' });
-  assert.equal(manifest.packageManager, 'npm@11.17.0');
-  assert.equal(nodeVersion.trim(), '22.14.0');
-  assert.equal(manifest.version, contract.product.version);
-  assert.equal(manifest.engines.node, contract.toolchain.node);
-  assert.equal(manifest.engines.npm, contract.toolchain.npm);
+  assert.deepEqual(manifest.engines, {
+    node: `>=${contract.toolchain.node}`,
+    npm: `>=${contract.toolchain.npm}`
+  });
+  // The npm package and the Windows installer template are versioned independently.
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
+  assert.equal(nodeVersion.trim(), contract.toolchain.node);
+  assert.equal(manifest.packageManager, `npm@${contract.toolchain.npm}`);
   assert.deepEqual(manifest.dependencies, exactDependencies);
   assert.deepEqual(manifest.devDependencies, exactDevDependencies);
 

@@ -29,7 +29,7 @@ AI Unit Test Workstation 是实验性的开发者预览软件，尚未经过完�
 
 ## 快速开始
 
-先安装 Node.js 22 或更高版本，然后运行：
+先安装 Node.js 22.14.0 或更高版本、npm 11.17.0 或更高版本，然后运行：
 
 ```sh
 npx @woodwry/ai-unit-test-workstation

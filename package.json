@@ -1,12 +1,12 @@
 {
   "name": "@woodwry/ai-unit-test-workstation",
-  "version": "0.1.20",
+  "version": "0.1.22",
   "description": "AI Unit Test Workstation desktop client for generating Java unit tests with remote backend services.",
   "main": "out/main/index.js",
   "type": "module",
   "engines": {
-    "node": "22.14.0",
-    "npm": "11.17.0"
+    "node": ">=22.14.0",
+    "npm": ">=11.17.0"
   },
   "packageManager": "npm@11.17.0",
   "scripts": {
